@@ -478,6 +478,28 @@ final class BlockingStateTests: XCTestCase {
         XCTAssertNil(Tension.mostTense(in: [state]), "过期窗口不许上菜单栏")
     }
 
+    func testBenignWarningStillShowsInMenuBar() {
+        var state = ProviderState(provider: ProviderCatalog.codex)
+        let envelope = ProbeEnvelope(
+            provider: "codex",
+            observedAt: Date(),
+            windows: [
+                ProbeWindow(
+                    id: "5h",
+                    label: "5 小时",
+                    usedPercent: 21,
+                    resetsAt: Date().addingTimeInterval(3600),
+                    basis: "server"
+                )
+            ],
+            warnings: ["日志超过 4MB，只读了最后一部分"]
+        )
+        state = ProviderReducer.apply(ProbeReport(provider: ProviderCatalog.codex, envelope: envelope), to: state)
+
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertEqual(Tension.mostTense(in: [state])?.compactLabel, "Codex 5h 21%")
+    }
+
     func testFreshWindowStillShowOnMenuBar() {
         let state = okState(percent: 21, resetsAt: Date().addingTimeInterval(3600))
         XCTAssertEqual(Tension.mostTense(in: [state])?.compactLabel, "Codex 5h 21%")
@@ -532,6 +554,68 @@ final class ProbeProcessDrainTests: XCTestCase {
         case .failedToStart(let message):
             XCTFail("探针启动失败：\(message)")
         }
+    }
+}
+
+final class ProbeProcessWatchdogTests: XCTestCase {
+    private func makeRoot() throws -> URL {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".cache/watchdog-tests", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("probes", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        return root
+    }
+
+    /// 探针 fork 的子进程持有管道：report() 必须 ~3s 内返回并判失败，不能等 20s。
+    func testChildHoldingPipeDoesNotHang() async throws {
+        let root = try makeRoot()
+        let script = root.appendingPathComponent("probes/leaky.py")
+        let json = #"{"schema":"usage-lens/probe@1","provider":"codex","windows":[{"id":"5h","used_percent":21,"basis":"server"}]}"#
+        let text = """
+        import subprocess, sys
+        subprocess.Popen(["sleep", "20"])  # 继承 stdout/stderr，退出后仍持有管道
+        sys.stdout.write('\(json)')
+        sys.stdout.flush()
+        sys.stderr.write("helper spawned\\n")
+        sys.stderr.flush()
+        """
+        try text.write(to: script, atomically: true, encoding: .utf8)
+
+        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/leaky.py")
+        let runner = ProbeRunner(root: root, timeout: 5)
+        let started = Date()
+        let report = await runner.report(for: provider)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 4.0, "不能等子进程退出")
+        XCTAssertNotNil(report.failure)
+        XCTAssertTrue(report.failure?.contains("未正常关闭") ?? false, report.failure ?? "nil")
+        XCTAssertNil(report.envelope)
+    }
+
+    /// 死循环输出：必须被 8MB/流上限拦住并 kill，不能把内存吃穿。
+    func testInfiniteOutputIsCapped() async throws {
+        let root = try makeRoot()
+        let script = root.appendingPathComponent("probes/flood.py")
+        let text = """
+        import sys
+        while True:
+            sys.stdout.write("x" * 65536)
+            sys.stdout.flush()
+        """
+        try text.write(to: script, atomically: true, encoding: .utf8)
+
+        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/flood.py")
+        let runner = ProbeRunner(root: root, timeout: 10)
+        let started = Date()
+        let report = await runner.report(for: provider)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 6.0, "超限必须立刻终止，不靠超时")
+        XCTAssertTrue(report.failure?.contains("输出超限") ?? false, report.failure ?? "nil")
+        XCTAssertNil(report.envelope)
     }
 }
 

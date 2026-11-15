@@ -125,7 +125,7 @@ enum Fixtures {
         )
     }
 
-    /// 契约 stale：数据源帧太旧，整块灰化 + 「数据来自 X 天前」。
+    /// 契约 stale 的真实可达组合：2 天前的帧、7d 窗口还活着（带倒计时）、5h 窗口已过期。
     static func staleCodexReport() -> ProbeReport {
         let now = Date()
         return ProbeReport(
@@ -134,7 +134,7 @@ enum Fixtures {
                 provider: "codex",
                 account: ProbeAccount(label: nil, plan: "plus"),
                 generatedAt: now,
-                observedAt: now.addingTimeInterval(-5 * 86_400),
+                observedAt: now.addingTimeInterval(-2 * 86_400),
                 stale: true,
                 windows: [
                     ProbeWindow(
@@ -142,10 +142,19 @@ enum Fixtures {
                         label: "5 小时",
                         usedPercent: 33,
                         windowSeconds: 18_000,
-                        resetsAt: now.addingTimeInterval(3600),
+                        resetsAt: now.addingTimeInterval(-3600),
+                        expired: true,
+                        basis: "server"
+                    ),
+                    ProbeWindow(
+                        id: "7d",
+                        label: "7 天",
+                        usedPercent: 18,
+                        windowSeconds: 604_800,
+                        resetsAt: now.addingTimeInterval(3 * 86_400),
                         expired: false,
                         basis: "server"
-                    )
+                    ),
                 ]
             ),
             finishedAt: now
@@ -315,6 +324,9 @@ final class PanelRenderTests: XCTestCase {
         let state = store.state(for: ProviderCatalog.codex)
         XCTAssertTrue(state.isDataStale)
         XCTAssertEqual(state.status, .warning)
+        XCTAssertEqual(state.windows.count, 2)
+        XCTAssertTrue(state.windows[0].isExpired())
+        XCTAssertFalse(state.windows[1].isExpired())
         XCTAssertNil(store.mostTense, "stale 数据不许上菜单栏")
 
         try render(PanelView(store: store), named: "08-codex-stale-data", background: windowBackground)

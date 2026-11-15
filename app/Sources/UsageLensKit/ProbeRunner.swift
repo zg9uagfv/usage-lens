@@ -133,8 +133,24 @@ public struct ProbeRunner: ProbeProviding {
         case .failedToStart(let message):
             return ProbeReport(provider: provider, failure: "探针无法启动：\(message)", finishedAt: Date(), duration: duration)
         case .output(let output):
+            if output.overflowed {
+                return ProbeReport(
+                    provider: provider,
+                    failure: "探针输出超限（>8MB/流），已终止",
+                    finishedAt: Date(),
+                    duration: duration
+                )
+            }
             if output.timedOut {
                 return ProbeReport(provider: provider, failure: "探针超时（>\(Int(timeout))s）", finishedAt: Date(), duration: duration)
+            }
+            if output.drainTimedOut {
+                return ProbeReport(
+                    provider: provider,
+                    failure: "探针输出未正常关闭（子进程仍持有管道），本次结果不可信",
+                    finishedAt: Date(),
+                    duration: duration
+                )
             }
             return decode(
                 provider: provider,
@@ -199,8 +215,16 @@ public struct ProbeRunner: ProbeProviding {
 
     // MARK: 进程
 
+    /// 每流输出上限：死循环输出不许把内存吃穿。
+    static let outputLimit = 8 * 1024 * 1024
+    /// 进程退出后等读端收尾的上限；到点直接停掉读取，主流程不再等。
+    static let drainTimeout: TimeInterval = 2
+
     /// 边跑边排空两条管道，再等进程退出 + 超时。
-    /// 关键点：绝不能先 `waitUntilExit()` 再读 —— 输出超过管道缓冲（~64KB）必死锁。
+    /// 关键点：
+    /// 1. 绝不能先 `waitUntilExit()` 再读（>64KB 会死锁）；
+    /// 2. 等 reader 的上限必须真的可超时，不能挂在不可取消的 continuation 上；
+    /// 3. 子进程继承管道时，到点直接停读（等价于关读端），别等它退出。
     func execute(probe: URL, workingDirectory: URL, timeout: TimeInterval) async -> ProbeProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -227,31 +251,45 @@ public struct ProbeRunner: ProbeProviding {
             return .failedToStart(error.localizedDescription)
         }
 
-        let stdoutBuffer = LockedOutputBuffer()
-        let stderrBuffer = LockedOutputBuffer()
+        let stdoutBuffer = LockedOutputBuffer(limit: Self.outputLimit)
+        let stderrBuffer = LockedOutputBuffer(limit: Self.outputLimit)
         let readers = DispatchGroup()
-        startReader(pipe: stdoutPipe, buffer: stdoutBuffer, group: readers)
-        startReader(pipe: stderrPipe, buffer: stderrBuffer, group: readers)
+        let stdoutDrainer = PipeDrainer(pipe: stdoutPipe, buffer: stdoutBuffer, group: readers)
+        let stderrDrainer = PipeDrainer(pipe: stderrPipe, buffer: stderrBuffer, group: readers)
+        stdoutDrainer.start()
+        stderrDrainer.start()
 
         let deadline = Date().addingTimeInterval(timeout)
+        var timedOut = false
+        var overflowed = false
+
         while process.isRunning && Date() < deadline {
+            if stdoutBuffer.overflows || stderrBuffer.overflows {
+                // 输出超限：立刻杀，不再等它自然结束。
+                overflowed = true
+                stdoutDrainer.stop()
+                stderrDrainer.stop()
+                Self.terminate(process)
+                break
+            }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
 
-        var timedOut = false
-        if process.isRunning {
+        if !overflowed && process.isRunning {
             timedOut = true
-            process.terminate()
-            for _ in 0..<25 where process.isRunning {
-                try? await Task.sleep(nanoseconds: 20_000_000)
-            }
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-            }
+            Self.terminate(process)
         }
 
-        // 超时 kill 之后也要把已经缓冲的内容读完；上限 2s 防止孙进程占着写端。
-        _ = await Self.waitForReaders(readers, timeout: 2)
+        // 等 reader 收尾：有上限，到点就停读，主流程立刻继续（不会挂 20s）。
+        var drainTimedOut = false
+        if !overflowed {
+            let drained = await Self.waitForReaders(readers, timeout: Self.drainTimeout)
+            if !drained {
+                drainTimedOut = true
+                stdoutDrainer.stop()
+                stderrDrainer.stop()
+            }
+        }
 
         if !process.isRunning {
             process.waitUntilExit()
@@ -262,45 +300,34 @@ public struct ProbeRunner: ProbeProviding {
                 stdout: stdoutBuffer.snapshot,
                 stderr: stderrBuffer.snapshot,
                 status: process.isRunning ? -1 : process.terminationStatus,
-                timedOut: timedOut
+                timedOut: timedOut,
+                overflowed: overflowed || stdoutBuffer.overflows || stderrBuffer.overflows,
+                drainTimedOut: drainTimedOut
             )
         )
     }
 
-    private func startReader(pipe: Pipe, buffer: LockedOutputBuffer, group: DispatchGroup) {
-        let handle = pipe.fileHandleForReading
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            while true {
-                let chunk: Data?
-                do {
-                    chunk = try handle.read(upToCount: 64 * 1024)
-                } catch {
-                    break
-                }
-                guard let chunk, !chunk.isEmpty else { break }
-                buffer.append(chunk)
-            }
-            group.leave()
+    /// terminate + 短暂等待 + SIGKILL；绝不阻塞超过 ~600ms。
+    private static func terminate(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let giveUp = Date().addingTimeInterval(0.5)
+        while process.isRunning && Date() < giveUp {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
         }
     }
 
+    /// 在后台线程上做 `group.wait(timeout:)`，主流程拿到结果就返回。
+    /// 不能用 `withTaskGroup` + continuation：group 退出时会等那个不可取消的 continuation。
     private static func waitForReaders(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
-        await withTaskGroup(of: Bool.self) { tasks in
-            tasks.addTask {
-                await withCheckedContinuation { continuation in
-                    group.notify(queue: .global(qos: .utility)) {
-                        continuation.resume(returning: true)
-                    }
-                }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let result = group.wait(timeout: .now() + timeout)
+                continuation.resume(returning: result == .success)
             }
-            tasks.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                return false
-            }
-            let drained = await tasks.next() ?? false
-            tasks.cancelAll()
-            return drained
         }
     }
 }
@@ -312,6 +339,8 @@ struct ProbeProcessOutput: Sendable {
     var stderr: Data
     var status: Int32
     var timedOut: Bool
+    var overflowed: Bool
+    var drainTimedOut: Bool
 }
 
 enum ProbeProcessResult: Sendable {
@@ -319,21 +348,89 @@ enum ProbeProcessResult: Sendable {
     case output(ProbeProcessOutput)
 }
 
-/// 两条管道各有一个后台读取线程，用锁把块拼起来。
+/// 两条管道各有一个读取器；用锁拼块，并带字节上限。
 private final class LockedOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
+    private let limit: Int
     private var storage = Data()
+    private var didOverflow = false
 
-    func append(_ chunk: Data) {
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    /// 返回 false 表示超限，调用方应停止读取。
+    func append(_ chunk: Data) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
+        guard !didOverflow else { return false }
+        if storage.count + chunk.count > limit {
+            didOverflow = true
+            return false
+        }
         storage.append(chunk)
-        lock.unlock()
+        return true
+    }
+
+    var overflows: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didOverflow
     }
 
     var snapshot: Data {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+}
+
+/// 用 readabilityHandler 读管道：回调只做非阻塞可用数据拷贝，停读时不会卡在阻塞 read 上。
+private final class PipeDrainer {
+    private let handle: FileHandle
+    private let buffer: LockedOutputBuffer
+    private let group: DispatchGroup
+    private let stateLock = NSLock()
+    private var finished = false
+
+    init(pipe: Pipe, buffer: LockedOutputBuffer, group: DispatchGroup) {
+        self.handle = pipe.fileHandleForReading
+        self.buffer = buffer
+        self.group = group
+        group.enter()
+    }
+
+    func start() {
+        handle.readabilityHandler = { [weak self] handle in
+            self?.consume(handle)
+        }
+    }
+
+    /// 停读：等价于关掉读端，强制 reader 不再等待（进程/孙进程是否活着都不影响）。
+    func stop() {
+        handle.readabilityHandler = nil
+        finish()
+    }
+
+    private func consume(_ handle: FileHandle) {
+        let chunk = handle.availableData
+        if chunk.isEmpty {
+            handle.readabilityHandler = nil
+            finish()
+            return
+        }
+        if !buffer.append(chunk) {
+            handle.readabilityHandler = nil
+            finish()
+        }
+    }
+
+    private func finish() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !finished else { return }
+        finished = true
+        group.leave()
     }
 }
 

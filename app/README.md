@@ -27,6 +27,10 @@ swift test                      # 单测 + 界面渲染测试（输出到 .previ
 open dist/UsageLens.app         # 菜单栏常驻，无 Dock 图标
 ```
 
+> 把 `.app` 装到 `/Applications` 时，App 找不到仓库里的 `probes/`（它会从 bundle 位置向上找）
+> → 面板全显示「无数据」。要么把 `probes/` 一起放进去，要么显式指路：
+> `open --env USAGE_LENS_ROOT=/path/to/usage-lens dist/UsageLens.app`。
+
 菜单栏标签取当前最紧张的窗口（例 `Codex 5h 21%`）；点开是 Codex / DeepSeek 两个 tab，
 底部有刷新按钮与「N 分钟前更新」。退出用面板右下角的电源按钮。
 

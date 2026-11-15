@@ -189,11 +189,15 @@ public struct TensionWindow: Sendable, Equatable {
 
 public enum Tension {
     /// 跨 provider 取已用百分比最高的窗口。
-    /// 只有「状态 ok 且未 stale、未 expired」的窗口才算数：失败保留的旧值、过期窗口不许上菜单栏，
-    /// 否则用户不点开面板就会把旧数据当真。没有任何合格窗口时返回 nil（菜单栏只留图标）。
+    /// 只挡这几类：stale（失败旧值 / 数据陈旧）、incompatible、failed、无数据、过期窗口。
+    /// 良性 warnings 不影响菜单栏出数（只在面板里显示）。
+    /// 没有任何合格窗口时返回 nil（菜单栏只留图标）。
     public static func mostTense(in states: [ProviderState], now: Date = Date()) -> TensionWindow? {
         var best: TensionWindow?
-        for state in states where state.status == .ok {
+        for state in states {
+            if state.isMissingProbe || state.isIncompatibleSchema { continue }
+            if state.isStale || state.isDataStale { continue }
+            if state.status == .failed { continue }
             for window in state.windows {
                 guard let used = window.usedPercent, used.isFinite else { continue }
                 guard !window.isExpired(now: now) else { continue }
