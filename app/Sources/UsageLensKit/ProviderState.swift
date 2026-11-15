@@ -72,6 +72,30 @@ public struct ProviderState: Sendable, Equatable {
         guard let plan = envelope?.account?.plan, !plan.isEmpty else { return nil }
         return plan
     }
+
+    /// 给 UI 用的 warning 列表：已有 spend 数据时，过滤掉「没有数据 / 花费为 0」这类自相矛盾的话。
+    public var visibleWarnings: [String] {
+        guard let spend = envelope?.spend, spend.today != nil || spend.window != nil else {
+            return warnings
+        }
+        return warnings.filter { !WarningFilter.conflictsWithSpend($0) }
+    }
+}
+
+/// 关键词匹配即可，不做语义分析：探针有时会同时给「估算花费」和「没有用量记录」。
+public enum WarningFilter {
+    static let spendConflictKeywords = [
+        "花费为 0",
+        "无本地用量记录",
+        "没有本地用量记录",
+        "没有 token 用量记录",
+        "无 token 用量记录",
+        "无法估算花费",
+    ]
+
+    public static func conflictsWithSpend(_ warning: String) -> Bool {
+        spendConflictKeywords.contains { warning.contains($0) }
+    }
 }
 
 // MARK: - 归约

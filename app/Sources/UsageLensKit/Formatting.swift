@@ -31,9 +31,14 @@ public enum UsageFormat {
         if seconds <= 0 { return "窗口已过期" }
         let minutes = max(1, Int((seconds / 60).rounded(.up)))
         if minutes < 60 { return "\(minutes) 分后重置" }
-        let hours = minutes / 60
-        let remainder = minutes % 60
-        return remainder == 0 ? "\(hours) 小时后重置" : "\(hours) 小时 \(remainder) 分后重置"
+        if minutes < 24 * 60 {
+            let hours = minutes / 60
+            let remainder = minutes % 60
+            return remainder == 0 ? "\(hours) 小时后重置" : "\(hours) 小时 \(remainder) 分后重置"
+        }
+        let days = minutes / (24 * 60)
+        let hours = (minutes % (24 * 60)) / 60
+        return "\(days) 天 \(hours) 小时后重置"
     }
 
     /// 窗口是否已经过了重置时间（真实数据里会出现：探针如实报最后一帧）。

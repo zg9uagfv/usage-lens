@@ -97,7 +97,7 @@ struct ProviderDetailView: View {
                 staleBanner(failure)
             }
 
-            if !state.warnings.isEmpty {
+            if !state.visibleWarnings.isEmpty {
                 warningsList
             }
         }
@@ -210,7 +210,7 @@ struct ProviderDetailView: View {
                 }
                 if spend.window != nil {
                     MetricTile(
-                        title: "窗口花费",
+                        title: "近 7 天花费",
                         value: UsageFormat.money(spend.window, currency: spend.currency) ?? "未知",
                         note: UsageFormat.sourceLabel(spend.source)
                     )
@@ -249,7 +249,7 @@ struct ProviderDetailView: View {
 
     private var warningsList: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(state.warnings, id: \.self) { warning in
+            ForEach(state.visibleWarnings, id: \.self) { warning in
                 HStack(alignment: .top, spacing: 5) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 9))
@@ -271,6 +271,20 @@ struct ProviderDetailView: View {
 struct WindowRowView: View {
     let window: ProbeWindow
 
+    /// 窗口过了重置时间：数值仍是最后一帧，但不能再画成「活跃」的高饱和色。
+    private var isExpired: Bool {
+        UsageFormat.isExpired(resetAt: window.resetsAt)
+    }
+
+    private var barTint: Color {
+        isExpired ? Color.orange.opacity(0.45) : Theme.tint(for: window.usedPercent)
+    }
+
+    private var percentTint: Color {
+        guard window.usedPercent != nil else { return .secondary }
+        return isExpired ? Color.orange.opacity(0.75) : Theme.tint(for: window.usedPercent)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -280,12 +294,12 @@ struct WindowRowView: View {
                 Text(UsageFormat.usedText(window.usedPercent))
                     .font(.system(size: 12, weight: .semibold))
                     .monospacedDigit()
-                    .foregroundStyle(window.usedPercent == nil ? Color.secondary : Theme.tint(for: window.usedPercent))
+                    .foregroundStyle(percentTint)
             }
 
             ProgressTrack(
                 fraction: UsageFormat.fraction(window.usedPercent),
-                tint: Theme.tint(for: window.usedPercent)
+                tint: barTint
             )
 
             HStack(spacing: 6) {

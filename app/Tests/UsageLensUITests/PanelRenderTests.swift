@@ -194,6 +194,8 @@ final class PanelRenderTests: XCTestCase {
         await store.refreshAll()
         XCTAssertEqual(store.state(for: ProviderCatalog.deepseek).status, .warning)
         XCTAssertTrue(store.state(for: ProviderCatalog.deepseek).windows.isEmpty)
+        // spend 有值时，矛盾的那条 warning 不展示（列表里只剩余额相关）。
+        XCTAssertEqual(store.state(for: ProviderCatalog.deepseek).visibleWarnings, ["余额需要 API key"])
 
         try render(PanelView(store: store), named: "02-deepseek", background: windowBackground)
     }

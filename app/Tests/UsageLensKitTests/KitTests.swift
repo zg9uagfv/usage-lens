@@ -115,6 +115,8 @@ final class FormattingTests: XCTestCase {
         XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: 30), now: now), "30 分后重置")
         XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: 90), now: now), "1 小时 30 分后重置")
         XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: 120), now: now), "2 小时后重置")
+        XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: 96 * 60), now: now), "4 天 0 小时后重置")
+        XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: 26 * 60 + 30), now: now), "1 天 2 小时后重置")
         XCTAssertEqual(UsageFormat.resetCountdown(until: at(minutes: -1), now: now), "窗口已过期")
         XCTAssertNil(UsageFormat.resetCountdown(until: nil, now: now))
     }
@@ -196,6 +198,32 @@ final class StateReducerTests: XCTestCase {
         XCTAssertEqual(state.status, .missing)
         XCTAssertNil(state.envelope)
         XCTAssertNil(state.lastDataAt)
+    }
+
+    func testSpendValueFiltersContradictoryWarnings() {
+        let envelope = ProbeEnvelope(
+            provider: "deepseek",
+            spend: ProbeSpend(today: 0.42, window: 3.18, currency: "CNY", source: "estimate"),
+            warnings: [
+                "余额需要 API key",
+                "DeepSeek 会话日志里没有 token 用量记录，无法估算花费",
+                "本地花费为 0，仅供参考",
+            ]
+        )
+        var state = ProviderState(provider: ProviderCatalog.deepseek)
+        state = ProviderReducer.apply(ProbeReport(provider: ProviderCatalog.deepseek, envelope: envelope), to: state)
+        XCTAssertEqual(state.warnings.count, 3, "原始 warnings 保留")
+        XCTAssertEqual(state.visibleWarnings, ["余额需要 API key"], "有 spend 值时过滤矛盾的 warning")
+    }
+
+    func testWarningsNotFilteredWithoutSpend() {
+        let envelope = ProbeEnvelope(
+            provider: "deepseek",
+            warnings: ["余额需要 API key", "没有 token 用量记录，无法估算花费"]
+        )
+        var state = ProviderState(provider: ProviderCatalog.deepseek)
+        state = ProviderReducer.apply(ProbeReport(provider: ProviderCatalog.deepseek, envelope: envelope), to: state)
+        XCTAssertEqual(state.visibleWarnings.count, 2, "没有 spend 时不该吞掉任何 warning")
     }
 
     func testWarningsOnlyIsWarningNotOk() {
