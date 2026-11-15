@@ -4,21 +4,32 @@
 DeepSeek 没有窗口配额，所以 windows 恒为空数组——不编百分比。
 能拿到的只有两样：
   1. 余额：$DEEPSEEK_API_KEY 存在时请求官方 GET /user/balance（3s 超时）
-  2. 花费估算：解压 ~/.dsh/sessions/**/session.v4.jsonl.zstd 里的 tokenUsage.totals
+  2. 花费估算（两个来源，主 → 次）：
+     a. ~/.dsh/storages/session_projcache/sessions/*.json 的 record.rows.tokenUsage.val.totals
+        真实结构（已实测）：camelCase 的 uncachedInputTokens / outputTokens / cacheReadTokens / cacheWriteTokens
+     b. 会话事件 data.usage（camelCase：inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens）
+        有事件时间就按天拆；没有就用文件 mtime 近似，并在 coverage.note 写明口径
 
-只读，不落盘，不打印 key。仅用标准库，兼容 Python 3.9。
+口径（依据 DSH 源码）：`uncachedInputTokens: usage.inputTokens`，
+`totalTokens = inputTokens + outputTokens + cacheRead + cacheWrite`。
+也就是说 inputTokens 不含缓存，不能拿它再减 cacheReadTokens（会漏算）。
+
+只读，不落盘，不打印 key；禁止跟随重定向（3xx 一律报错）。
+仅用标准库，兼容 Python 3.9。
 """
 
 from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import error as urlerror
@@ -29,20 +40,28 @@ PROVIDER = "deepseek"
 
 BALANCE_URL = "https://api.deepseek.com/user/balance"
 BALANCE_TIMEOUT_SECONDS = 3.0
+BALANCE_MAX_BYTES = 1024 * 1024
+OFFICIAL_HOST = "api.deepseek.com"
+OFFICIAL_SCHEME = "https"
 
-DSH_SESSIONS_DIR = Path.home() / ".dsh" / "sessions"
+DSH_HOME = Path.home() / ".dsh"
+PROJCACHE_DIR = DSH_HOME / "storages" / "session_projcache" / "sessions"
+SESSIONS_DIR = DSH_HOME / "sessions"
+
 ZSTD_BIN = "/opt/homebrew/bin/zstd"
 ZSTD_TIMEOUT_SECONDS = 10
+ZSTD_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 SPEND_SCAN_BUDGET_SECONDS = 3.0
 SPEND_MAX_FILES = 500
 
-# 只在 totals 里没有明确费用字段时才用这张牌价折算。
+# 只在本地记录只有 token 数、没有费用字段时用这张牌价折算。
 # 来源：DeepSeek 公开牌价（deepseek-chat），单位 CNY / 百万 tokens。牌价会变，仅作估算。
 PRICE_PER_MILLION_TOKENS_CNY = {
     "input_cache_miss": 2.0,
     "input_cache_hit": 0.2,
     "output": 3.0,
 }
+# DeepSeek 没有「缓存写入」单独计价，按未命中价计。
 DEFAULT_CURRENCY = "CNY"
 
 
@@ -51,7 +70,7 @@ def _log(message: str) -> None:
 
 
 _SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"sk-[A-Za-z0-9_\-]{5,}"),
     re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{40,}(?![A-Za-z0-9_\-])"),
 )
 
@@ -71,13 +90,98 @@ def _as_float(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        number = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+# ---------------------------------------------------------------- 余额
+
+
+class _RejectRedirect(urlrequest.HTTPRedirectHandler):
+    """任何 3xx 一律不跟随：否则 Authorization 会被带到重定向目标（审查 B3 实测洞）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urlrequest.build_opener(_RejectRedirect())
+
+
+def is_official_url(url: str) -> bool:
+    """只认 https + api.deepseek.com（默认端口）。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != OFFICIAL_SCHEME:
+        return False
+    if (parts.hostname or "") != OFFICIAL_HOST:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port in (None, 443)
+
+
+def _balance_error_message(exc: urlerror.HTTPError) -> str:
+    code = exc.code
+    if code in (301, 302, 303, 307, 308):
+        return "查询 DeepSeek 余额失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
+    if code == 401:
+        return "查询 DeepSeek 余额失败：API key 无效或已过期（HTTP 401）"
+    if code == 403:
+        return "查询 DeepSeek 余额失败：没有权限（HTTP 403）"
+    if code == 429:
+        return "查询 DeepSeek 余额失败：请求被限流（HTTP 429），请稍后重试"
+    if 500 <= code < 600:
+        return "查询 DeepSeek 余额失败：服务暂时不可用（HTTP %d），请稍后重试" % code
+    return "查询 DeepSeek 余额失败：HTTP %d" % code
+
+
+def _parse_balance_body(body: bytes) -> Tuple[Optional[dict], List[str]]:
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None, ["查询 DeepSeek 余额失败：返回不是合法 JSON"]
+
+    infos = data.get("balance_infos") if isinstance(data, dict) else None
+    if not isinstance(infos, list) or not infos:
+        return None, ["DeepSeek 余额接口没有返回余额明细"]
+
+    warnings: List[str] = []
+    usable = [item for item in infos if isinstance(item, dict)]
+    if not usable:
+        return None, ["DeepSeek 余额接口返回的明细格式不对"]
+
+    chosen = None
+    for item in usable:
+        if item.get("currency") == DEFAULT_CURRENCY:
+            chosen = item
+            break
+    if chosen is None:
+        chosen = usable[0]
+        if len(usable) > 1:
+            warnings.append("余额有多种币种，已展示 %s" % str(chosen.get("currency") or "未知币种"))
+
+    amount = _as_float(chosen.get("total_balance"))
+    if amount is None:
+        return None, ["DeepSeek 余额接口没有可读的余额数字"]
+
+    currency = chosen.get("currency")
+    if not isinstance(currency, str) or not currency:
+        currency = DEFAULT_CURRENCY
+
+    return {"amount": round(amount, 2), "currency": currency, "source": "official"}, warnings
 
 
 def fetch_balance(api_key: Optional[str]) -> Tuple[Optional[dict], List[str]]:
@@ -94,10 +198,20 @@ def fetch_balance(api_key: Optional[str]) -> Tuple[Optional[dict], List[str]]:
         method="GET",
     )
     try:
-        with urlrequest.urlopen(request, timeout=BALANCE_TIMEOUT_SECONDS) as response:
-            body = response.read()
+        with _OPENER.open(request, timeout=BALANCE_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            if not is_official_url(final_url):
+                return None, ["查询 DeepSeek 余额失败：响应最终地址不是官方域名，已拒绝使用"]
+            length = response.headers.get("Content-Length") if response.headers else None
+            if length is not None:
+                try:
+                    if int(length) > BALANCE_MAX_BYTES:
+                        return None, ["查询 DeepSeek 余额失败：响应体过大（%s 字节），已拒绝读取" % length]
+                except (TypeError, ValueError):
+                    pass
+            body = response.read(BALANCE_MAX_BYTES)
     except urlerror.HTTPError as exc:
-        return None, ["查询 DeepSeek 余额失败：HTTP %s" % exc.code]
+        return None, [_balance_error_message(exc)]
     except urlerror.URLError as exc:
         return None, ["查询 DeepSeek 余额失败：网络不可用（%s）" % exc.reason]
     except (TimeoutError, OSError) as exc:
@@ -105,114 +219,158 @@ def fetch_balance(api_key: Optional[str]) -> Tuple[Optional[dict], List[str]]:
     except Exception as exc:  # 兜底，绝不把异常抛给 App
         return None, ["查询 DeepSeek 余额失败：%s" % exc]
 
+    return _parse_balance_body(body)
+
+
+# ---------------------------------------------------------------- 花费
+
+
+def _num(mapping: dict, *keys: str) -> float:
+    for key in keys:
+        value = _as_float(mapping.get(key))
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _has_any_usage_field(mapping: dict) -> bool:
+    for key in (
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "reasoningTokens",
+        "totalTokens",
+        "uncachedInputTokens",
+    ):
+        if _as_float(mapping.get(key)) is not None:
+            return True
+    return False
+
+
+def buckets_from_projcache(totals: dict) -> Dict[str, float]:
+    """projcache totals：uncached 与 cache 分别记账，inputTokens 不是这里的键。"""
+    return {
+        "miss": _num(totals, "uncachedInputTokens") + _num(totals, "cacheWriteTokens"),
+        "hit": _num(totals, "cacheReadTokens"),
+        "out": _num(totals, "outputTokens"),
+    }
+
+
+def buckets_from_usage(usage: dict) -> Dict[str, float]:
+    """事件 data.usage：inputTokens 本来就不含缓存，不再减 cacheReadTokens。"""
+    return {
+        "miss": _num(usage, "inputTokens") + _num(usage, "cacheWriteTokens"),
+        "hit": _num(usage, "cacheReadTokens"),
+        "out": _num(usage, "outputTokens"),
+    }
+
+
+def _buckets_total(buckets: Dict[str, float]) -> float:
+    return buckets.get("miss", 0.0) + buckets.get("hit", 0.0) + buckets.get("out", 0.0)
+
+
+def estimate_cost(buckets: Dict[str, float]) -> float:
+    price = PRICE_PER_MILLION_TOKENS_CNY
+    return (
+        buckets.get("miss", 0.0) * price["input_cache_miss"]
+        + buckets.get("hit", 0.0) * price["input_cache_hit"]
+        + buckets.get("out", 0.0) * price["output"]
+    ) / 1_000_000.0
+
+
+def _local_date_from_ms(value: Any) -> Optional[datetime.date]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    if seconds > 1e11:  # 毫秒
+        seconds /= 1000.0
     try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except ValueError:
-        return None, ["查询 DeepSeek 余额失败：返回不是合法 JSON"]
-
-    infos = data.get("balance_infos") if isinstance(data, dict) else None
-    if not isinstance(infos, list) or not infos:
-        return None, ["DeepSeek 余额接口没有返回余额明细"]
-
-    first = infos[0]
-    if not isinstance(first, dict):
-        return None, ["DeepSeek 余额接口返回的明细格式不对"]
-
-    amount = _as_float(first.get("total_balance"))
-    if amount is None:
-        return None, ["DeepSeek 余额接口没有可读的余额数字"]
-
-    currency = first.get("currency")
-    if not isinstance(currency, str) or not currency:
-        currency = DEFAULT_CURRENCY
-
-    return {"amount": round(amount, 2), "currency": currency, "source": "official"}, []
-
-
-def _find_totals(node: Any) -> Optional[dict]:
-    """在一条事件里找 tokenUsage.totals（容忍 token_usage / data 包裹）。"""
-    if isinstance(node, dict):
-        for key in ("tokenUsage", "token_usage"):
-            usage = node.get(key)
-            if isinstance(usage, dict):
-                totals = usage.get("totals")
-                if isinstance(totals, dict):
-                    return totals
-    return None
-
-
-def _event_day(event: dict, path: Path) -> Optional[datetime.date]:
-    for key in ("time", "timestamp", "createdAt", "created_at"):
-        value = event.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            seconds = float(value)
-            if seconds > 1e11:  # 毫秒
-                seconds /= 1000.0
-            try:
-                return datetime.datetime.fromtimestamp(seconds).date()
-            except (OverflowError, OSError, ValueError):
-                continue
-        if isinstance(value, str):
-            text = value.replace("Z", "+00:00")
-            try:
-                return datetime.datetime.fromisoformat(text).astimezone().date()
-            except ValueError:
-                continue
-    try:
-        return datetime.datetime.fromtimestamp(path.stat().st_mtime).date()
-    except OSError:
+        return datetime.datetime.fromtimestamp(seconds).date()
+    except (OverflowError, OSError, ValueError):
         return None
 
 
-def _totals_to_usage(totals: dict) -> Tuple[Dict[str, float], Optional[float], Optional[str]]:
-    """把 totals 拆成 (token 桶, 显式费用, 币种)。"""
-    tokens: Dict[str, float] = {}
-    cost: Optional[float] = None
-    currency: Optional[str] = None
+def _local_date_from_iso(value: Any) -> Optional[datetime.date]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return moment.date()
+    return moment.astimezone().date()
 
-    for raw_key, raw_value in totals.items():
-        key = str(raw_key).lower().replace("_", "").replace("-", "")
-        value = _as_float(raw_value)
-        if value is None:
-            if key in ("currency",) and isinstance(raw_value, str) and raw_value:
-                currency = raw_value
+
+def _file_date(path: Path) -> datetime.date:
+    try:
+        return datetime.datetime.fromtimestamp(path.stat().st_mtime).date()
+    except OSError:
+        return datetime.date.today()
+
+
+def _read_projcache(path: Path) -> Optional[dict]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    record = data.get("record")
+    if not isinstance(record, dict):
+        return None
+    rows = record.get("rows")
+    if not isinstance(rows, dict):
+        return None
+    token_usage = rows.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    value = token_usage.get("val")
+    if not isinstance(value, dict):
+        return None
+    totals = value.get("totals")
+    if not isinstance(totals, dict):
+        return None
+    identity = record.get("identity")
+    created_at = identity.get("createdAt") if isinstance(identity, dict) else None
+    day = _local_date_from_ms(created_at)
+    return {"totals": totals, "day": day}
+
+
+def collect_projcache(projcache_dir: Path, warnings: List[str]) -> List[Tuple[datetime.date, Dict[str, float]]]:
+    """返回 [(日期, buckets)]；只统计有用量的会话。"""
+    if not projcache_dir.is_dir():
+        return []
+    try:
+        files = sorted(projcache_dir.glob("*.json"))
+    except OSError as exc:
+        warnings.append("读取 projcache 目录失败：%s" % exc)
+        return []
+
+    sessions: List[Tuple[datetime.date, Dict[str, float]]] = []
+    unreadable = 0
+    zero_sessions = 0
+    for path in files:
+        parsed = _read_projcache(path)
+        if parsed is None:
+            unreadable += 1
             continue
-        if key == "currency":
+        buckets = buckets_from_projcache(parsed["totals"])
+        if _buckets_total(buckets) <= 0:
+            zero_sessions += 1
             continue
-        if "cost" in key or "spend" in key or key in ("amount", "totalamount"):
-            cost = (cost or 0.0) + value
-        elif key.endswith("tokens") or key == "tokens":
-            tokens[key] = tokens.get(key, 0.0) + value
-    return tokens, cost, currency
+        day = parsed["day"] or _file_date(path)
+        sessions.append((day, buckets))
 
-
-def estimate_cost(tokens: Dict[str, float]) -> float:
-    """用公开牌价把 token 折算成 CNY 估算值。没有 token 时返回 0。"""
-    price = PRICE_PER_MILLION_TOKENS_CNY
-
-    def pick(*names: str) -> float:
-        for name in names:
-            if name in tokens:
-                return tokens[name]
-        return 0.0
-
-    input_tokens = pick("inputtokens")
-    cached_input = pick("cachedinputtokens", "cachehittokens", "cachedtokens")
-    output_tokens = pick("outputtokens")
-    total_tokens = pick("totaltokens")
-
-    # totals 可能只给 total，那就按「一半输入一半输出」粗折，宁可保守。
-    if not input_tokens and not output_tokens and total_tokens:
-        input_tokens = total_tokens / 2.0
-        output_tokens = total_tokens / 2.0
-
-    uncached_input = max(input_tokens - cached_input, 0.0)
-    cost = (
-        uncached_input * price["input_cache_miss"]
-        + cached_input * price["input_cache_hit"]
-        + output_tokens * price["output"]
-    ) / 1_000_000.0
-    return cost
+    if unreadable:
+        warnings.append("跳过 %d 个无法解析的 projcache 文件" % unreadable)
+    if zero_sessions and not sessions:
+        warnings.append("projcache 里的 token 用量为 0")
+    return sessions
 
 
 def _resolve_zstd() -> Optional[str]:
@@ -222,25 +380,51 @@ def _resolve_zstd() -> Optional[str]:
     return found
 
 
-def _read_zstd_lines(path: Path, zstd_bin: str) -> List[str]:
-    completed = subprocess.run(
+def _read_zstd_text(path: Path, zstd_bin: str) -> Tuple[str, bool]:
+    """解压到内存，但有上限。返回 (文本, 是否被截断)。"""
+    process = subprocess.Popen(
         [zstd_bin, "-dc", str(path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        timeout=ZSTD_TIMEOUT_SECONDS,
-        check=False,
     )
-    if completed.returncode != 0:
-        raise RuntimeError("zstd 解压失败（exit %d）" % completed.returncode)
-    return completed.stdout.decode("utf-8", "replace").splitlines()
+    try:
+        data = process.stdout.read(ZSTD_MAX_DECOMPRESSED_BYTES + 1) if process.stdout else b""
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    truncated = len(data) > ZSTD_MAX_DECOMPRESSED_BYTES
+    if truncated:
+        process.kill()
+    try:
+        process.wait(timeout=ZSTD_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise RuntimeError("zstd 解压超时")
+    if process.returncode not in (0, -9) and not truncated:
+        raise RuntimeError("zstd 解压失败（exit %d）" % process.returncode)
+    if truncated:
+        data = data[:ZSTD_MAX_DECOMPRESSED_BYTES]
+    return data.decode("utf-8", "replace"), truncated
 
 
-def collect_spend(sessions_dir: Path) -> Tuple[Optional[dict], Optional[dict], List[str]]:
-    """返回 (spend, coverage, warnings)。"""
-    warnings: List[str] = []
+def _find_usage(event: dict) -> Optional[dict]:
+    """事件里的用量：data.usage（真实形状），兼容顶层 usage。"""
+    data = event.get("data")
+    if isinstance(data, dict):
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            return usage
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    return None
 
+
+def collect_events(sessions_dir: Path, warnings: List[str]) -> Tuple[Dict[datetime.date, Dict[str, float]], int, bool, bool]:
+    """返回 (按天 buckets, 用到的文件数, 是否有未识别 usage, 是否有 mtime 近似归日)。"""
     if not sessions_dir.is_dir():
-        return None, None, ["未找到 ~/.dsh/sessions 目录，跳过花费估算"]
+        warnings.append("未找到 ~/.dsh/sessions 目录，跳过会话事件来源")
+        return {}, 0, False, False
 
     try:
         files = sorted(
@@ -249,35 +433,45 @@ def collect_spend(sessions_dir: Path) -> Tuple[Optional[dict], Optional[dict], L
             reverse=True,
         )
     except OSError as exc:
-        return None, None, ["读取 ~/.dsh/sessions 失败：%s" % exc]
+        warnings.append("读取 ~/.dsh/sessions 失败：%s" % exc)
+        return {}, 0, False, False
 
     if not files:
-        return None, None, ["~/.dsh/sessions 下没有可用的 DeepSeek 会话日志"]
+        warnings.append("~/.dsh/sessions 下没有可用的会话日志")
+        return {}, 0, False, False
 
     zstd_bin = _resolve_zstd()
     if zstd_bin is None:
-        return None, None, ["未找到 zstd，无法解压 DeepSeek 会话日志，跳过花费估算"]
+        warnings.append("未找到 zstd，无法解压会话日志，跳过花费估算")
+        return {}, 0, False, False
+
+    if len(files) > SPEND_MAX_FILES:
+        warnings.append("会话日志较多，花费估算只覆盖最近 %d 个" % SPEND_MAX_FILES)
+        files = files[:SPEND_MAX_FILES]
 
     started = time.time()
-    daily_tokens: Dict[datetime.date, Dict[str, float]] = {}
-    daily_cost: Dict[datetime.date, float] = {}
-    currency: Optional[str] = None
+    daily: Dict[datetime.date, Dict[str, float]] = {}
     used_files = 0
     skipped = 0
+    saw_unrecognized = False
+    approx_day = False
+    truncated_files = 0
 
-    for path in files[:SPEND_MAX_FILES]:
+    for path in files:
         if time.time() - started > SPEND_SCAN_BUDGET_SECONDS:
-            warnings.append("DeepSeek 会话日志较多，花费估算只覆盖最近一部分")
+            warnings.append("会话日志较多，花费估算只覆盖最近一部分")
             break
         try:
-            lines = _read_zstd_lines(path, zstd_bin)
+            text, truncated = _read_zstd_text(path, zstd_bin)
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             skipped += 1
             _log("跳过 %s：%s" % (path.name, exc))
             continue
+        if truncated:
+            truncated_files += 1
 
-        file_had_totals = False
-        for line in lines:
+        file_used = False
+        for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -287,60 +481,110 @@ def collect_spend(sessions_dir: Path) -> Tuple[Optional[dict], Optional[dict], L
                 continue
             if not isinstance(event, dict):
                 continue
-            totals = _find_totals(event)
-            if totals is None:
+            usage = _find_usage(event)
+            if usage is None:
                 continue
-            day = _event_day(event, path)
+            if not _has_any_usage_field(usage):
+                saw_unrecognized = True
+                continue
+            day = _local_date_from_ms(event.get("time"))
             if day is None:
+                day = _local_date_from_iso(event.get("timestamp")) or _local_date_from_iso(event.get("createdAt"))
+            if day is None:
+                day = _file_date(path)
+                approx_day = True
+            buckets = buckets_from_usage(usage)
+            if _buckets_total(buckets) <= 0:
                 continue
-            file_had_totals = True
-            tokens, cost, event_currency = _totals_to_usage(totals)
-            bucket = daily_tokens.setdefault(day, {})
-            for key, value in tokens.items():
-                bucket[key] = bucket.get(key, 0.0) + value
-            if cost is not None:
-                daily_cost[day] = daily_cost.get(day, 0.0) + cost
-                if event_currency:
-                    currency = event_currency
-        if file_had_totals:
+            bucket = daily.setdefault(day, {"miss": 0.0, "hit": 0.0, "out": 0.0})
+            for key, value in buckets.items():
+                bucket[key] += value
+            file_used = True
+        if file_used:
             used_files += 1
 
     if skipped:
         warnings.append("跳过 %d 个无法解压的会话日志" % skipped)
+    if truncated_files:
+        warnings.append("%d 个会话日志解压后过大，只统计了前 64MB" % truncated_files)
+    if saw_unrecognized:
+        warnings.append("会话日志有 usage 事件，但字段未识别（既不是 inputTokens 也不是 uncachedInputTokens 口径）")
+    if approx_day:
+        warnings.append("部分 usage 事件没有时间戳，已按文件修改时间归日（近似）")
+    return daily, used_files, saw_unrecognized, approx_day
 
-    if not used_files:
-        return None, None, warnings + ["DeepSeek 会话日志里没有 token 用量记录，无法估算花费"]
 
-    days = sorted(daily_tokens.keys())
-    total = 0.0
-    today = datetime.date.today()
-    today_cost = 0.0
-    used_prices = False
-    for day in days:
-        if day in daily_cost:
-            amount = daily_cost[day]
+def collect_spend(
+    projcache_dir: Path, sessions_dir: Path
+) -> Tuple[Optional[dict], Optional[dict], List[str]]:
+    """返回 (spend, coverage, warnings)。主源 projcache，次源会话事件。"""
+    warnings: List[str] = []
+
+    proj_sessions = collect_projcache(projcache_dir, warnings)
+    daily: Dict[datetime.date, Dict[str, float]] = {}
+    note = ""
+    source = ""
+
+    if proj_sessions:
+        source = "projcache"
+        for day, buckets in proj_sessions:
+            bucket = daily.setdefault(day, {"miss": 0.0, "hit": 0.0, "out": 0.0})
+            for key, value in buckets.items():
+                bucket[key] += value
+        note = "按会话聚合，日期为会话创建日期（本地时区），非官方账单"
+    else:
+        daily, used_files, _unrecognized, _approx = collect_events(sessions_dir, warnings)
+        if daily:
+            source = "events"
+            note = "按事件时间逐日聚合（本地时区），本地日志覆盖，非官方账单"
         else:
-            amount = estimate_cost(daily_tokens[day])
-            used_prices = True
+            if not proj_sessions:
+                warnings.append("本地没有可识别的 DeepSeek token 用量记录，无法估算花费")
+            return None, None, warnings
+
+    days = sorted(daily.keys())
+    today = datetime.date.today()
+    total = 0.0
+    today_cost = 0.0
+    for day in days:
+        amount = estimate_cost(daily[day])
         total += amount
         if day == today:
             today_cost += amount
 
-    if used_prices:
-        warnings.append("花费按本地 token 与公开牌价估算，非官方账单")
-
+    warnings.append("花费按 token 与公开牌价估算（%s），非官方账单" % source)
     spend = {
         "today": round(today_cost, 4),
         "window": round(total, 4),
-        "currency": currency or DEFAULT_CURRENCY,
+        "currency": DEFAULT_CURRENCY,
         "source": "estimate",
     }
     coverage = {
         "from": days[0].isoformat(),
         "to": days[-1].isoformat(),
-        "note": "本地日志覆盖，非官方账单",
+        "note": note,
     }
     return spend, coverage, warnings
+
+
+# ---------------------------------------------------------------- 输出
+
+
+def _empty_payload() -> dict:
+    return {
+        "schema": SCHEMA,
+        "provider": PROVIDER,
+        "account": {"label": None, "plan": None},
+        "generated_at": utc_iso_now(),
+        "observed_at": utc_iso_now(),
+        "stale": False,
+        "windows": [],
+        "balance": None,
+        "spend": None,
+        "coverage": None,
+        "warnings": [],
+        "error": None,
+    }
 
 
 def build_payload() -> dict:
@@ -349,7 +593,7 @@ def build_payload() -> dict:
     balance, balance_warnings = fetch_balance(os.environ.get("DEEPSEEK_API_KEY"))
     warnings.extend(balance_warnings)
 
-    spend, coverage, spend_warnings = collect_spend(DSH_SESSIONS_DIR)
+    spend, coverage, spend_warnings = collect_spend(PROJCACHE_DIR, SESSIONS_DIR)
     warnings.extend(spend_warnings)
 
     return {
@@ -357,6 +601,8 @@ def build_payload() -> dict:
         "provider": PROVIDER,
         "account": {"label": None, "plan": None},
         "generated_at": utc_iso_now(),
+        "observed_at": utc_iso_now(),
+        "stale": False,
         "windows": [],
         "balance": balance,
         "spend": spend,
@@ -366,24 +612,19 @@ def build_payload() -> dict:
     }
 
 
-def emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+def emit(payload: dict) -> bool:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except ValueError:
+        fallback = _empty_payload()
+        fallback["error"] = "输出包含非法数值，已中止本次结果"
+        sys.stdout.write(json.dumps(fallback, ensure_ascii=False, allow_nan=False) + "\n")
+        sys.stdout.flush()
+        _log(fallback["error"])
+        return False
+    sys.stdout.write(text + "\n")
     sys.stdout.flush()
-
-
-def _empty_payload() -> dict:
-    return {
-        "schema": SCHEMA,
-        "provider": PROVIDER,
-        "account": {"label": None, "plan": None},
-        "generated_at": utc_iso_now(),
-        "windows": [],
-        "balance": None,
-        "spend": None,
-        "coverage": None,
-        "warnings": [],
-        "error": None,
-    }
+    return True
 
 
 def main(argv: List[str]) -> int:
@@ -400,12 +641,10 @@ def main(argv: List[str]) -> int:
     except Exception as exc:  # 兜底：任何意外都给出 JSON
         payload = _empty_payload()
         payload["error"] = redact("生成 DeepSeek 用量失败：%s" % exc)
-        emit(payload)
-        _log(payload["error"])
-        return 1
 
-    emit(payload)
-    return 0
+    if not emit(payload):
+        return 1
+    return 0 if payload["error"] is None else 1
 
 
 if __name__ == "__main__":
