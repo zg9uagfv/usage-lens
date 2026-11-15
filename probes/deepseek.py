@@ -52,6 +52,8 @@ ZSTD_BIN = "/opt/homebrew/bin/zstd"
 ZSTD_TIMEOUT_SECONDS = 10
 ZSTD_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 SPEND_SCAN_BUDGET_SECONDS = 3.0
+# App 的「近 7 天花费」口径，用于 spend.window
+SPEND_WINDOW_DAYS = 7
 SPEND_MAX_FILES = 500
 
 # 只在本地记录只有 token 数、没有费用字段时用这张牌价折算。
@@ -373,6 +375,10 @@ def collect_projcache(projcache_dir: Path, warnings: List[str]) -> List[Tuple[da
     return sessions
 
 
+class ZstdTimeout(RuntimeError):
+    """解压超时：与普通解压失败分开提示，方便 UI 说人话。"""
+
+
 def _resolve_zstd() -> Optional[str]:
     if os.path.isfile(ZSTD_BIN) and os.access(ZSTD_BIN, os.X_OK):
         return ZSTD_BIN
@@ -381,29 +387,27 @@ def _resolve_zstd() -> Optional[str]:
 
 
 def _read_zstd_text(path: Path, zstd_bin: str) -> Tuple[str, bool]:
-    """解压到内存，但有上限。返回 (文本, 是否被截断)。"""
+    """解压到内存，带总时长上限。返回 (文本, 是否被截断)。
+
+    communicate(timeout) 管整条管道：zstd 卡住时 kill 掉并抛错，探针仍走降级路径，
+    不会把 App 拖到只能强杀。
+    """
     process = subprocess.Popen(
         [zstd_bin, "-dc", str(path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
     try:
-        data = process.stdout.read(ZSTD_MAX_DECOMPRESSED_BYTES + 1) if process.stdout else b""
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-    truncated = len(data) > ZSTD_MAX_DECOMPRESSED_BYTES
-    if truncated:
-        process.kill()
-    try:
-        process.wait(timeout=ZSTD_TIMEOUT_SECONDS)
+        data, _ = process.communicate(timeout=ZSTD_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         process.kill()
-        raise RuntimeError("zstd 解压超时")
-    if process.returncode not in (0, -9) and not truncated:
-        raise RuntimeError("zstd 解压失败（exit %d）" % process.returncode)
+        process.communicate()
+        raise ZstdTimeout("zstd 解压超时（超过 %d 秒）" % ZSTD_TIMEOUT_SECONDS)
+    truncated = len(data) > ZSTD_MAX_DECOMPRESSED_BYTES
     if truncated:
         data = data[:ZSTD_MAX_DECOMPRESSED_BYTES]
+    if process.returncode != 0 and not truncated:
+        raise RuntimeError("zstd 解压失败（exit %d）" % process.returncode)
     return data.decode("utf-8", "replace"), truncated
 
 
@@ -453,6 +457,7 @@ def collect_events(sessions_dir: Path, warnings: List[str]) -> Tuple[Dict[dateti
     daily: Dict[datetime.date, Dict[str, float]] = {}
     used_files = 0
     skipped = 0
+    timed_out = 0
     saw_unrecognized = False
     approx_day = False
     truncated_files = 0
@@ -463,6 +468,10 @@ def collect_events(sessions_dir: Path, warnings: List[str]) -> Tuple[Dict[dateti
             break
         try:
             text, truncated = _read_zstd_text(path, zstd_bin)
+        except ZstdTimeout as exc:
+            timed_out += 1
+            _log("跳过 %s：%s" % (path.name, exc))
+            continue
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             skipped += 1
             _log("跳过 %s：%s" % (path.name, exc))
@@ -505,6 +514,8 @@ def collect_events(sessions_dir: Path, warnings: List[str]) -> Tuple[Dict[dateti
 
     if skipped:
         warnings.append("跳过 %d 个无法解压的会话日志" % skipped)
+    if timed_out:
+        warnings.append("%d 个会话日志解压超时（超过 %d 秒），已跳过" % (timed_out, ZSTD_TIMEOUT_SECONDS))
     if truncated_files:
         warnings.append("%d 个会话日志解压后过大，只统计了前 64MB" % truncated_files)
     if saw_unrecognized:
@@ -544,25 +555,31 @@ def collect_spend(
 
     days = sorted(daily.keys())
     today = datetime.date.today()
-    total = 0.0
+    # App 上「近 7 天花费」= [today-7d, today]；更早的记录只进 total，不进 window。
+    window_start = today - datetime.timedelta(days=SPEND_WINDOW_DAYS)
     today_cost = 0.0
+    window_cost = 0.0
+    total_cost = 0.0
     for day in days:
         amount = estimate_cost(daily[day])
-        total += amount
+        total_cost += amount
         if day == today:
             today_cost += amount
+        if window_start <= day <= today:
+            window_cost += amount
 
     warnings.append("花费按 token 与公开牌价估算（%s），非官方账单" % source)
     spend = {
         "today": round(today_cost, 4),
-        "window": round(total, 4),
+        "window": round(window_cost, 4),
+        "total": round(total_cost, 4),
         "currency": DEFAULT_CURRENCY,
         "source": "estimate",
     }
     coverage = {
         "from": days[0].isoformat(),
         "to": days[-1].isoformat(),
-        "note": note,
+        "note": note + "；window=近 %d 天，total=全部可读记录" % SPEND_WINDOW_DAYS,
     }
     return spend, coverage, warnings
 

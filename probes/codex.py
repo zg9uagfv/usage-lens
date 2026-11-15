@@ -219,6 +219,8 @@ def find_latest_frame(sessions_dir: Path) -> Tuple[Optional[dict], List[str], in
             message += "（另有 %d 行日志无法解析）" % corrupt_lines
         warnings.append(message)
     if truncated:
+        # TODO(N6): 之后给这条 warning 带短标识（日志目录的日期，或对 UUID 文件名开白名单）。
+        # 本轮故意不带文件名：UUID 会被「长随机串」泄露断言命中，宁可给计数。
         warnings.append("有 %d 个会话日志超过 4MB，只回扫了末尾部分，可能漏掉更早的帧" % truncated)
     return best, warnings, scanned
 

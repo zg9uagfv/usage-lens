@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -186,6 +187,7 @@ class DeepSeekProbeTest(unittest.TestCase):
         # 1M 未命中 *2 + 0.5M 命中 *0.2 + 0.1M 输出 *3 = 2.4
         self.assertAlmostEqual(spend["today"], 2.4, places=4)
         self.assertAlmostEqual(spend["window"], 2.4, places=4)
+        self.assertAlmostEqual(spend["total"], 2.4, places=4)
         self.assertEqual(spend["currency"], "CNY")
         self.assertEqual(spend["source"], "estimate")
         self.assertIn("按会话聚合", payload["coverage"]["note"])
@@ -213,6 +215,7 @@ class DeepSeekProbeTest(unittest.TestCase):
         )
         payload, _ = self._build_offline()
         self.assertAlmostEqual(payload["spend"]["today"], 2.4, places=4)
+        self.assertAlmostEqual(payload["spend"]["total"], 2.4, places=4)
         self.assertIn("按事件时间", payload["coverage"]["note"])
         self.assertTrue(any("projcache 里的 token 用量为 0" in item for item in payload["warnings"]))
 
@@ -234,6 +237,7 @@ class DeepSeekProbeTest(unittest.TestCase):
         payload, _ = self._build_offline()
         # 事件侧会是 3.0；主源 projcache 的 2.4 必须胜出，且不许相加
         self.assertAlmostEqual(payload["spend"]["today"], 2.4, places=4)
+        self.assertAlmostEqual(payload["spend"]["total"], 2.4, places=4)
         self.assertIn("按会话聚合", payload["coverage"]["note"])
 
     # ---------- 花费：事件次源 ----------
@@ -251,6 +255,7 @@ class DeepSeekProbeTest(unittest.TestCase):
         payload, _ = self._build_offline()
         # inputTokens 不含 cache（DSH 源码口径），所以是 2.4 而不是 1.4
         self.assertAlmostEqual(payload["spend"]["today"], 2.4, places=4)
+        self.assertAlmostEqual(payload["spend"]["total"], 2.4, places=4)
         self.assertIn("按事件时间", payload["coverage"]["note"])
 
     def test_events_aggregate_multiple_days(self):
@@ -269,6 +274,7 @@ class DeepSeekProbeTest(unittest.TestCase):
         payload, _ = self._build_offline()
         self.assertAlmostEqual(payload["spend"]["today"], 2.0, places=4)
         self.assertAlmostEqual(payload["spend"]["window"], 5.0, places=4)
+        self.assertAlmostEqual(payload["spend"]["total"], 5.0, places=4)
         self.assertEqual(payload["coverage"]["from"], yesterday.date().isoformat())
         self.assertEqual(payload["coverage"]["to"], datetime.date.today().isoformat())
 
@@ -314,6 +320,70 @@ class DeepSeekProbeTest(unittest.TestCase):
             payload, _ = self._build_offline()
         self.assertIsNone(payload["spend"])
         self.assertTrue(any("zstd" in item for item in payload["warnings"]))
+
+    def test_spend_window_excludes_projcache_older_than_7_days(self):
+        eight_days_ago = datetime.datetime.now() - datetime.timedelta(days=8)
+        support.write_projcache(
+            self.home,
+            "session-old",
+            {"uncachedInputTokens": 1_000_000, "outputTokens": 0,
+             "cacheReadTokens": 0, "cacheWriteTokens": 0},
+            created_at_ms=int(eight_days_ago.timestamp() * 1000),
+        )
+        support.write_projcache(
+            self.home,
+            "session-new",
+            {"uncachedInputTokens": 0, "outputTokens": 1_000_000,
+             "cacheReadTokens": 0, "cacheWriteTokens": 0},
+            created_at_ms=today_ms(),
+        )
+        payload, _ = self._build_offline()
+        spend = payload["spend"]
+        self.assertAlmostEqual(spend["today"], 3.0, places=4)   # 今天：1M 输出 *3
+        self.assertAlmostEqual(spend["window"], 3.0, places=4)  # 近 7 天：不含 8 天前
+        self.assertAlmostEqual(spend["total"], 5.0, places=4)   # 全部：含 8 天前
+        self.assertEqual(payload["coverage"]["from"], eight_days_ago.date().isoformat())
+        self.assertIn("window=近 7 天", payload["coverage"]["note"])
+        self.assertIn("total=全部可读记录", payload["coverage"]["note"])
+
+    def test_spend_window_excludes_events_older_than_7_days(self):
+        if not support.zstd_available():
+            self.skipTest("需要 zstd")
+        now = datetime.datetime.now()
+        eight_days_ago = now - datetime.timedelta(days=8)
+        support.write_usage_archive(
+            self.home,
+            "session-window",
+            [
+                support.usage_event(int(eight_days_ago.timestamp() * 1000),
+                                    {"inputTokens": 1_000_000}),
+                support.usage_event(int(now.timestamp() * 1000), {"outputTokens": 1_000_000}),
+            ],
+        )
+        payload, _ = self._build_offline()
+        self.assertAlmostEqual(payload["spend"]["today"], 3.0, places=4)
+        self.assertAlmostEqual(payload["spend"]["window"], 3.0, places=4)
+        self.assertAlmostEqual(payload["spend"]["total"], 5.0, places=4)
+
+    def test_zstd_timeout_is_a_warning_not_a_hang(self):
+        workspace = self.sessions / "ws"
+        workspace.mkdir(parents=True)
+        (workspace / "session.v4.jsonl.zstd").write_bytes(b"placeholder")
+        script = self.tmp / "slow-zstd.sh"
+        script.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        with mock.patch.object(self.module, "ZSTD_BIN", str(script)), mock.patch.object(
+            self.module, "ZSTD_TIMEOUT_SECONDS", 1
+        ):
+            started = time.time()
+            payload, _ = self._build_offline()
+            elapsed = time.time() - started
+
+        self.assertLess(elapsed, 8.0, "解压超时没有生效：%.2fs" % elapsed)
+        self.assertIsNone(payload["spend"])
+        self.assertTrue(any("解压超时" in item for item in payload["warnings"]), payload["warnings"])
+        self.assertIsNone(payload["error"])
 
     # ---------- 余额 ----------
 

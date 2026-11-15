@@ -154,25 +154,39 @@ class CodexProbeTest(unittest.TestCase):
         self.assertTrue(payload["stale"])
         self.assertTrue(any("数据来自" in item for item in payload["warnings"]))
 
-    def test_same_mtime_picks_latest_frame_by_content(self):
+    def test_same_mtime_uses_content_timestamp_in_both_orders(self):
         base = int(now_utc().timestamp()) - 3600
         older_ts = iso_ms(datetime.datetime.fromtimestamp(base - 600, datetime.timezone.utc))
         newer_ts = iso_ms(datetime.datetime.fromtimestamp(base, datetime.timezone.utc))
-        # 文件名排序与内容新旧的顺序相反，验证不依赖目录枚举顺序
-        self._rollout(
-            "2026/11/10/rollout-a.jsonl",
-            [support.token_count_line(11.0, 3.0, base + 600, base + 7200, timestamp=older_ts)],
-            mtime=base,
-        )
-        self._rollout(
-            "2026/11/10/rollout-b.jsonl",
-            [support.token_count_line(22.0, 6.0, base + 600, base + 7200, timestamp=newer_ts)],
-            mtime=base,
-        )
-        for _ in range(2):
-            _, payload = self._run()
-            self.assertEqual(payload["observed_at"], newer_ts[:19] + "Z")
-            self.assertEqual(payload["windows"][0]["used_percent"], 22.0)
+
+        # 两种「扫描顺序 vs 内容新旧」组合都要对：
+        #   A: 旧内容的文件先被扫到 -> 只取第一个命中的实现会拿到 11.0，必须失败
+        #   B: 新内容的文件先被扫到 -> 只取第一个命中的实现碰巧能过
+        # 只有真去比帧时间戳的实现，两版都过。
+        scenarios = {
+            "A_枚举先旧后新": [
+                ("2026/11/10/rollout-z-old.jsonl", 11.0, older_ts),
+                ("2026/11/10/rollout-a-new.jsonl", 22.0, newer_ts),
+            ],
+            "B_枚举先新后旧": [
+                ("2026/11/11/rollout-a-old.jsonl", 11.0, older_ts),
+                ("2026/11/11/rollout-z-new.jsonl", 22.0, newer_ts),
+            ],
+        }
+        for label, files in scenarios.items():
+            with self.subTest(scenario=label):
+                shutil.rmtree(self.sessions)
+                for relpath, percent, timestamp in files:
+                    self._rollout(
+                        relpath,
+                        [support.token_count_line(percent, 3.0, base + 600, base + 7200,
+                                                  timestamp=timestamp)],
+                        mtime=base,
+                    )
+                for _ in range(2):
+                    _, payload = self._run()
+                    self.assertEqual(payload["observed_at"], newer_ts[:19] + "Z")
+                    self.assertEqual(payload["windows"][0]["used_percent"], 22.0)
 
     def test_skips_newest_file_without_rate_limits(self):
         moment = now_utc() - datetime.timedelta(seconds=30)
