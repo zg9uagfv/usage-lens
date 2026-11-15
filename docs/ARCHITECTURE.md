@@ -6,9 +6,10 @@
 ```
 probes/codex.py      → stdout: usage-lens/probe@1 JSON
 probes/deepseek.py   → stdout: usage-lens/probe@1 JSON
-probes/claude.*      → 待调研结论
 app/                 SwiftUI 菜单栏 App，定时调用探针并渲染
 ```
+
+provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径），**加 provider 只需加探针 + 加一行配置**，不改渲染逻辑。首版只有 codex、deepseek 两个。
 
 ## 1. 探针契约（强制）
 
@@ -72,7 +73,7 @@ app/                 SwiftUI 菜单栏 App，定时调用探针并渲染
 ## 3. App 行为
 
 - 菜单栏常驻图标 + 当前最紧张窗口的短标签（例 `Codex 5h 33%`）。
-- 点击弹 popover：三个 tab（Codex / DeepSeek / Claude），tab 头显示账号与状态点。
+- 点击弹 popover：两个 tab（Codex / DeepSeek），tab 头显示账号与状态点。
 - 每个 window 一行：标签、进度条、`已用 XX%`、`Xh Ym 后重置`。
 - 底部：`刷新` 按钮 + `N 分钟前更新`。
 - 自动刷新 60s；探针失败显示上一次成功值 + 灰化 + 警告文案。
@@ -85,5 +86,5 @@ app/                 SwiftUI 菜单栏 App，定时调用探针并渲染
 2. 伪造日志样本（无 rate_limits / 空目录 / 损坏行）下：探针仍 exit 0，给 `warnings`，`windows` 为空，不崩。
 3. `probes/deepseek.py` 在无 key 环境下 exit 0，`balance` 为 null 且有 warning；有 key 时 `balance.source == "official"`。
 4. 探针输出里 grep 不到任何形似 token 的字符串（长随机串 / `sk-` 前缀）。
-5. App `swift build` 通过；启动后菜单栏出现图标；三个 tab 可切；无数据 provider 显示「无数据」。
+5. App `swift build` 通过；启动后菜单栏出现图标；两个 tab 可切；无数据 provider 显示「无数据」。
 6. `pytest` / `unittest` 全绿，含上面 2、3 的用例。
