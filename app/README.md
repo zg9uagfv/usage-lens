@@ -32,7 +32,9 @@ open dist/UsageLens.app         # 菜单栏常驻，无 Dock 图标
 > `open --env USAGE_LENS_ROOT=/path/to/usage-lens dist/UsageLens.app`。
 
 菜单栏标签取当前最紧张的窗口（例 `Codex 5h 21%`）；点开是 Codex / DeepSeek 两个 tab，
-底部有刷新按钮与「N 分钟前更新」。退出用面板右下角的电源按钮。
+底部有刷新按钮与「N 分钟前更新」。Codex 还会显示从当天本地日志累计的「今日 tokens」
+（标记为“本地统计”，没有记录时不显示 0）。点击底部的人像时钟图标可开关“登录后启动”；
+它默认关闭，并使用 macOS 系统登录项服务。退出用面板右下角的电源按钮。
 
 > 沙箱环境提示：若 SwiftPM 报 `sandbox-exec: sandbox_apply: Operation not permitted`
 > （例如在受限沙箱里），用 `SWIFT_BUILD_FLAGS=--disable-sandbox ./Scripts/build-app.sh`

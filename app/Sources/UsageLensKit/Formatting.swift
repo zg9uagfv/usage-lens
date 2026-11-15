@@ -1,6 +1,11 @@
 import Foundation
 
 public enum UsageFormat {
+    public static func tokenCount(_ value: Int?) -> String {
+        guard let value else { return "未知" }
+        return value.formatted(.number.grouping(.automatic))
+    }
+
     /// 33%；nil 一律「未知」，绝不显示 0%。
     /// 有真实用量但不足 1% 时给一位小数，避免把「0.4%」说成「0%」。
     public static func percent(_ value: Double?) -> String {
@@ -94,11 +99,12 @@ public enum UsageFormat {
         }
     }
 
-    /// `official` → 官方；`estimate` → 估算。
+    /// `official` → 官方；`estimate` → 估算；`local` → 本地统计。
     public static func sourceLabel(_ source: String?) -> String? {
         switch source?.lowercased() {
         case "official": return "官方"
         case "estimate": return "估算"
+        case "local": return "本地统计"
         case .some(let raw) where !raw.isEmpty: return raw
         default: return nil
         }

@@ -37,6 +37,7 @@ HEADER_KEYS = {
     "windows",
     "balance",
     "spend",
+    "usage",
     "coverage",
     "warnings",
     "error",
@@ -157,6 +158,23 @@ def token_count_line(used_primary, used_secondary, resets_primary, resets_second
         {"timestamp": timestamp, "ordinal": 1, "type": "event_msg", "payload": payload},
         ensure_ascii=False,
     )
+
+
+def token_usage_record_line(total_tokens, timestamp, current_shape=False):
+    if current_shape:
+        return json.dumps({
+            "timestamp": timestamp,
+            "type": "token_usage_record",
+            "payload": {"usage": {"total_tokens": total_tokens}},
+        }, ensure_ascii=False)
+    return json.dumps({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_usage_record",
+            "usage": {"total_tokens": total_tokens},
+        },
+    }, ensure_ascii=False)
 
 
 def write_projcache(home: Path, session_id: str, totals: dict, created_at_ms: int) -> Path:

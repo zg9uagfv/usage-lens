@@ -20,6 +20,7 @@ final class ProbeContractTests: XCTestCase {
       ],
       "balance": null,
       "spend": null,
+      "usage": { "today_tokens": 123456, "source": "local" },
       "coverage": null,
       "warnings": [],
       "error": null
@@ -39,6 +40,8 @@ final class ProbeContractTests: XCTestCase {
         XCTAssertEqual(window.usedPercent, 33.0)
         XCTAssertEqual(window.basis, "server")
         XCTAssertNotNil(window.resetsAt)
+        XCTAssertEqual(envelope.usage?.todayTokens, 123_456)
+        XCTAssertEqual(envelope.usage?.source, "local")
         let expectedReset = try XCTUnwrap(ProbeDate.parse("2026-11-15T13:00:00Z"))
         XCTAssertEqual(window.resetsAt, expectedReset)
     }
@@ -214,6 +217,12 @@ final class FormattingTests: XCTestCase {
         XCTAssertEqual(UsageFormat.money(12.3, currency: "CNY"), "¥12.30")
         XCTAssertEqual(UsageFormat.money(0.42, currency: "USD"), "$0.42")
         XCTAssertNil(UsageFormat.money(nil, currency: "CNY"))
+    }
+
+    func testTokenCount() {
+        XCTAssertEqual(UsageFormat.tokenCount(123_456), "123,456")
+        XCTAssertEqual(UsageFormat.tokenCount(nil), "未知")
+        XCTAssertEqual(UsageFormat.sourceLabel("local"), "本地统计")
     }
 }
 

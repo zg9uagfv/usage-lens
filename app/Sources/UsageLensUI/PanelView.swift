@@ -108,7 +108,7 @@ struct ProviderDetailView: View {
     }
 
     private var hasMetrics: Bool {
-        state.envelope?.balance != nil || state.envelope?.spend != nil
+        state.envelope?.balance != nil || state.envelope?.spend != nil || state.envelope?.usage != nil
     }
 
     // 账号 + plan
@@ -239,6 +239,14 @@ struct ProviderDetailView: View {
                         note: UsageFormat.sourceLabel(spend.source)
                     )
                 }
+            }
+
+            if let usage = state.envelope?.usage, usage.todayTokens != nil {
+                MetricTile(
+                    title: "今日 tokens",
+                    value: UsageFormat.tokenCount(usage.todayTokens),
+                    note: UsageFormat.sourceLabel(usage.source)
+                )
             }
         }
     }
@@ -419,6 +427,7 @@ struct MetricTile: View {
 
 struct FooterBar: View {
     @ObservedObject var store: UsageStore
+    @StateObject private var launchAtLogin = LaunchAtLoginManager()
 
     var body: some View {
         HStack(spacing: 10) {
@@ -428,10 +437,34 @@ struct FooterBar: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+            launchAtLoginButton
             quitButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var launchAtLoginButton: some View {
+        Button {
+            launchAtLogin.toggle()
+        } label: {
+            Image(systemName: launchAtLogin.isEnabled ? "person.badge.clock.fill" : "person.badge.clock")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(launchAtLogin.isEnabled ? Color.accentColor : Color.secondary)
+                .padding(5)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(launchAtLogin.isEnabled ? "已启用登录后启动；点此关闭" : "登录后启动 usage-lens")
+        .accessibilityLabel(launchAtLogin.isEnabled ? "关闭登录后启动" : "启用登录后启动")
+        .alert("登录后启动", isPresented: Binding(
+            get: { launchAtLogin.errorMessage != nil },
+            set: { if !$0 { launchAtLogin.dismissError() } }
+        )) {
+            Button("好", role: .cancel) { launchAtLogin.dismissError() }
+        } message: {
+            Text(launchAtLogin.errorMessage ?? "")
+        }
     }
 
     private var refreshButton: some View {
