@@ -5,9 +5,17 @@ import UsageLensKit
 /// UI 的入口视图：provider tab + 当前 provider 详情 + 底部刷新。
 public struct PanelView: View {
     @ObservedObject private var store: UsageStore
+    @StateObject private var launchAtLogin: LaunchAtLoginManager
+    private let showSettings: () -> Void
 
-    public init(store: UsageStore) {
+    @MainActor public init(
+        store: UsageStore,
+        launchAtLogin: LaunchAtLoginManager? = nil,
+        showSettings: @escaping () -> Void = {}
+    ) {
         self.store = store
+        _launchAtLogin = StateObject(wrappedValue: launchAtLogin ?? LaunchAtLoginManager())
+        self.showSettings = showSettings
     }
 
     public var body: some View {
@@ -19,7 +27,7 @@ public struct PanelView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 14)
             Divider().opacity(0.35)
-            FooterBar(store: store)
+            FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings)
         }
         .frame(width: Theme.panelWidth)
     }
@@ -108,7 +116,7 @@ struct ProviderDetailView: View {
     }
 
     private var hasMetrics: Bool {
-        state.envelope?.balance != nil || state.envelope?.spend != nil
+        state.envelope?.balance != nil || state.envelope?.spend != nil || state.envelope?.usage != nil
     }
 
     // 账号 + plan
@@ -239,6 +247,14 @@ struct ProviderDetailView: View {
                         note: UsageFormat.sourceLabel(spend.source)
                     )
                 }
+            }
+
+            if let usage = state.envelope?.usage, usage.todayTokens != nil {
+                MetricTile(
+                    title: "今日 tokens",
+                    value: UsageFormat.tokenCount(usage.todayTokens),
+                    note: UsageFormat.sourceLabel(usage.source)
+                )
             }
         }
     }
@@ -419,6 +435,8 @@ struct MetricTile: View {
 
 struct FooterBar: View {
     @ObservedObject var store: UsageStore
+    @ObservedObject var launchAtLogin: LaunchAtLoginManager
+    let showSettings: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -428,10 +446,26 @@ struct FooterBar: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+            settingsButton
             quitButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var settingsButton: some View {
+        Button {
+            showSettings()
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(5)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("配置")
+        .accessibilityLabel("配置")
     }
 
     private var refreshButton: some View {

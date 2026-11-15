@@ -72,7 +72,7 @@ public struct ProviderState: Sendable, Equatable {
             // 有旧值 → 灰化保留；没有旧值 → 明确报错，而不是伪装成「空的」。
             return envelope == nil ? .failed : .stale
         }
-        if !hasWindows && envelope?.balance == nil && envelope?.spend == nil {
+        if !hasWindows && envelope?.balance == nil && envelope?.spend == nil && envelope?.usage == nil {
             return (warnings.isEmpty && !isDataStale) ? .empty : .warning
         }
         return (warnings.isEmpty && !isDataStale) ? .ok : .warning

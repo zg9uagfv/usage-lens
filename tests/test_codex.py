@@ -120,6 +120,22 @@ class CodexProbeTest(unittest.TestCase):
         self.assertEqual(payload["coverage"]["to"], payload["observed_at"][:10])
         self.assertEqual(payload["warnings"], [])
 
+    def test_today_tokens_are_locally_aggregated(self):
+        moment = now_utc() - datetime.timedelta(seconds=30)
+        resets = int(now_utc().timestamp()) + 3600
+        self._rollout(
+            "2026/11/15/rollout-tokens.jsonl",
+            [
+                support.token_usage_record_line(120, iso_ms(moment - datetime.timedelta(minutes=2))),
+                support.token_usage_record_line(80, iso_ms(moment), current_shape=True),
+                support.token_usage_record_line(999, iso_ms(moment - datetime.timedelta(days=1))),
+                support.token_count_line(21, 18, resets, resets + 86400, timestamp=iso_ms(moment)),
+            ],
+            mtime=moment.timestamp(),
+        )
+        _, payload = self._run()
+        self.assertEqual(payload["usage"], {"today_tokens": 200, "source": "local"})
+
     def test_expired_windows_get_flag_and_warning(self):
         moment = now_utc() - datetime.timedelta(days=4)
         resets_primary = int(moment.timestamp()) + 7200

@@ -8,7 +8,7 @@
 
 | Provider | 展示内容 | 数据来源 | 状态 |
 |---|---|---|---|
-| Codex | 5h / 7d 已用百分比、重置时间、plan | 本地日志 `event_msg.token_count.rate_limits` | 可做，已实测 |
+| Codex | 5h / 7d 已用百分比、重置时间、plan、今日 tokens | 本地日志 `event_msg.token_count.rate_limits` / `token_usage_record` | 可做，已实测 |
 | DeepSeek | 余额（需 key）+ 今日/窗口花费估算；**无窗口百分比** | `/user/balance` + 本地 `tokenUsage.totals` | 可做，余额需 key |
 Antigravity / Grok / Claude：首版不做（用户明确排除）。
 
@@ -35,13 +35,9 @@ Claude 排除原因（2026-11-15 决定）：接口非官方、需读钥匙串�
 - 每个窗口：名称、进度条、`已用 XX%`、`X 小时 Y 分后重置`
 - 底部 `刷新` + `N 分钟前更新`
 - 自动刷新 60 秒；失败保留上次值并灰化提示
+- 可选登录后启动，默认关闭
 - 深浅色跟随系统；字体和留白要有水准，截图能直接拿给别人看
 
 ## 验收
 
 按 `docs/ARCHITECTURE.md` 第 4 节六条执行，逐条比对。合入前必须有代码审查员的书面意见 + 我逐条验收。
-
-## 仍待拍板
-
-1. Codex 探针要不要顺带显示"今日 tokens"（成本很低，但会多一行）
-2. 是否要开机自启（首版可先手动启动）

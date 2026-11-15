@@ -15,6 +15,7 @@ public enum ProbeKey: String, CodingKey {
     case windows
     case balance
     case spend
+    case usage
     case coverage
     case warnings
     case error
@@ -31,6 +32,7 @@ public enum ProbeKey: String, CodingKey {
     case currency
     case source
     case today
+    case todayTokens = "today_tokens"
     case window
     case from
     case to
@@ -219,6 +221,23 @@ public struct ProbeSpend: Decodable, Sendable, Equatable {
     }
 }
 
+/// 本地日志推导的非货币用量。没有记录时为 nil，绝不把它显示为 0。
+public struct ProbeUsage: Decodable, Sendable, Equatable {
+    public var todayTokens: Int?
+    public var source: String?
+
+    public init(todayTokens: Int? = nil, source: String? = nil) {
+        self.todayTokens = todayTokens
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        todayTokens = container.optionalInt(.todayTokens)
+        source = container.optionalString(.source)
+    }
+}
+
 public struct ProbeCoverage: Decodable, Sendable, Equatable {
     public var from: String?
     public var to: String?
@@ -250,6 +269,7 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
     public var windows: [ProbeWindow]
     public var balance: ProbeBalance?
     public var spend: ProbeSpend?
+    public var usage: ProbeUsage?
     public var coverage: ProbeCoverage?
     /// 人话警告，直接进 UI。
     public var warnings: [String]
@@ -266,6 +286,7 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         windows: [ProbeWindow] = [],
         balance: ProbeBalance? = nil,
         spend: ProbeSpend? = nil,
+        usage: ProbeUsage? = nil,
         coverage: ProbeCoverage? = nil,
         warnings: [String] = [],
         error: String? = nil
@@ -279,6 +300,7 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         self.windows = windows
         self.balance = balance
         self.spend = spend
+        self.usage = usage
         self.coverage = coverage
         self.warnings = warnings
         self.error = error
@@ -295,6 +317,7 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         windows = container.optional(.windows, as: [ProbeWindow].self) ?? []
         balance = container.optional(.balance, as: ProbeBalance.self)
         spend = container.optional(.spend, as: ProbeSpend.self)
+        usage = container.optional(.usage, as: ProbeUsage.self)
         coverage = container.optional(.coverage, as: ProbeCoverage.self)
         error = container.optionalString(.error)
 

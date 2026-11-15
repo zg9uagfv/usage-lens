@@ -7,8 +7,7 @@ import XCTest
 // MARK: - 假探针
 
 /// 测试用探针：按 provider 依次吐出预设结果，用完则报「未安装」。
-final class SequencedProbeProvider: ProbeProviding, @unchecked Sendable {
-    private let lock = NSLock()
+actor SequencedProbeProvider: ProbeProviding {
     private var queue: [Provider: [ProbeReport]]
 
     init(_ queue: [Provider: [ProbeReport]] = [:]) {
@@ -16,8 +15,6 @@ final class SequencedProbeProvider: ProbeProviding, @unchecked Sendable {
     }
 
     func report(for provider: Provider) async -> ProbeReport {
-        lock.lock()
-        defer { lock.unlock() }
         if var reports = queue[provider], !reports.isEmpty {
             let next = reports.removeFirst()
             queue[provider] = reports
@@ -59,7 +56,8 @@ enum Fixtures {
                         resetsAt: now.addingTimeInterval(4 * 86_400),
                         basis: "server"
                     ),
-                ]
+                ],
+                usage: ProbeUsage(todayTokens: 123_456, source: "local")
             ),
             finishedAt: now
         )

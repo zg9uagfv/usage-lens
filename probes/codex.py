@@ -5,7 +5,8 @@
 契约见 docs/ARCHITECTURE.md 第 1 节。
 
 数据来源：~/.codex/sessions/**/rollout-*.jsonl
-每条 event_msg/token_count 里的 rate_limits 是服务端给的窗口状态。
+每条 event_msg/token_count 里的 rate_limits 是服务端给的窗口状态；
+当天 token_usage_record.usage.total_tokens 是本地的「今日 tokens」统计。
 
 选帧规则（可复核）：在所有候选日志里取「事件时间戳最大」的 rate_limits 帧。
 文件按 mtime 倒序扫，一旦已命中帧且某文件 mtime 早于该帧时间，就不必再往后看。
@@ -37,6 +38,10 @@ TAIL_CHUNK_BYTES = 256 * 1024
 MAX_SCAN_BYTES = 4 * 1024 * 1024
 # 最多检查多少个候选文件；仍然从最新往旧扫。
 MAX_CANDIDATE_FILES = 50
+
+# 「今日 tokens」只扫描当天有修改的日志，并沿用每个文件 4MB 的尾扫上限。
+# 这是本地估算：日志被截断或稍后才落盘时，宁可提示不完整也不编造精确值。
+TODAY_TOKEN_SCAN_FILES = 50
 
 # 契约固定：primary = 5 小时，secondary = 7 天。
 # 日志里的 window_minutes 优先（换算成秒），缺失时才用这里的兜底值。
@@ -133,6 +138,77 @@ def _parse_frame(raw: bytes) -> Tuple[Optional[dict], bool]:
         "timestamp": event.get("timestamp"),
         "epoch": event_time,
     }, False
+
+
+def _today_token_record(raw: bytes, today: datetime.date) -> Tuple[Optional[int], bool]:
+    """从一行 token_usage_record 取 total_tokens；返回 (tokens, 是否损坏)。"""
+    try:
+        event = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None, True
+    if not isinstance(event, dict):
+        return None, True
+
+    payload = event.get("payload")
+    payload_type = payload.get("type") if isinstance(payload, dict) else None
+    if event.get("type") != "token_usage_record" and payload_type != "token_usage_record":
+        return None, False
+
+    epoch = parse_iso_epoch(event.get("timestamp"))
+    if epoch is None:
+        return None, False
+    if datetime.datetime.fromtimestamp(epoch).date() != today:
+        return None, False
+
+    # 当前 Codex 日志把 type 放在事件顶层、usage 放在 payload；早期封装则两者都在 payload。
+    usage = payload.get("usage") if isinstance(payload, dict) else event.get("usage")
+    if not isinstance(usage, dict):
+        return None, False
+    value = usage.get("total_tokens")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, False
+    if not math.isfinite(float(value)) or value < 0:
+        return None, False
+    return int(value), False
+
+
+def find_today_tokens(sessions_dir: Path, today: datetime.date) -> Tuple[Optional[int], List[str]]:
+    """累计当天的 token_usage_record；只读日志，不把未知值当作 0。"""
+    if not sessions_dir.is_dir():
+        return None, []
+    try:
+        candidates = [path for path in sessions_dir.rglob("rollout-*.jsonl") if path.is_file()]
+    except OSError:
+        return None, ["无法读取 Codex 日志，未能统计今日 tokens"]
+
+    try:
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        candidates.sort(key=lambda path: str(path), reverse=True)
+    candidates = candidates[:TODAY_TOKEN_SCAN_FILES]
+
+    total = 0
+    found = False
+    truncated = 0
+    for path in candidates:
+        try:
+            # 日志 mtime 早于今天时，后续更旧文件不可能包含正常写入的当天记录。
+            if datetime.datetime.fromtimestamp(path.stat().st_mtime).date() < today:
+                break
+            for raw in _iter_lines_reverse(path):
+                value, _ = _today_token_record(raw, today)
+                if value is not None:
+                    total += value
+                    found = True
+            if path.stat().st_size > MAX_SCAN_BYTES:
+                truncated += 1
+        except OSError:
+            continue
+
+    warnings: List[str] = []
+    if truncated:
+        warnings.append("今日 tokens 仅扫描了 %d 个大日志的末尾 4MB，统计可能不完整" % truncated)
+    return (total if found else None), warnings
 
 
 def _last_frame_in_file(path: Path) -> Tuple[Optional[dict], int]:
@@ -304,6 +380,8 @@ def build_payload() -> dict:
     plan = None
     coverage = None
     stale = False
+    today_tokens, token_warnings = find_today_tokens(SESSIONS_DIR, now.date())
+    warnings.extend(token_warnings)
 
     if frame is not None:
         rate_limits = frame["rate_limits"]
@@ -342,6 +420,10 @@ def build_payload() -> dict:
         "windows": windows,
         "balance": None,
         "spend": None,
+        "usage": (
+            {"today_tokens": today_tokens, "source": "local"}
+            if today_tokens is not None else None
+        ),
         "coverage": coverage,
         "warnings": warnings,
         "error": None,
@@ -361,6 +443,7 @@ def _empty_payload() -> dict:
         "windows": [],
         "balance": None,
         "spend": None,
+        "usage": None,
         "coverage": None,
         "warnings": [],
         "error": None,
