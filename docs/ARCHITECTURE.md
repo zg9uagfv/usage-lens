@@ -28,6 +28,8 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
   "provider": "codex",
   "account": { "label": "user@example.com", "plan": "plus" },
   "generated_at": "2026-11-15T10:20:00Z",
+  "observed_at": "2026-11-11T01:25:26Z",
+  "stale": false,
   "windows": [
     {
       "id": "5h",
@@ -35,6 +37,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
       "used_percent": 33.0,
       "window_seconds": 18000,
       "resets_at": "2026-11-15T13:00:00Z",
+      "expired": false,
       "basis": "server"
     }
   ],
@@ -51,7 +54,10 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 | 字段 | 规则 |
 |---|---|
 | `windows` | 配额窗口数组。**没有窗口概念的服务必须给空数组**，不许编百分比 |
-| `used_percent` | 0–100 浮点；拿不到就 `null`，不许填 0 |
+| `used_percent` | 0–100 浮点；拿不到就 `null`，不许填 0；**越界（<0 或 >100）或 NaN 一律 `null` + warning** |
+| `expired` | `resets_at` 已早于 `generated_at` → `true`。App 必须显示「窗口已过期」，不许显示负倒计时 |
+| `observed_at` | 数据源那一帧的时间（日志帧时间戳）；拿不到填 `generated_at` |
+| `stale` | `observed_at` 距 `generated_at` 超过该窗口长度 → `true`，App 灰化并显示「数据来自 X 前」 |
 | `basis` | `server` = 服务端返回；`local` = 本地推导。App 上要能看出区别 |
 | `resets_at` | UTC ISO8601，或 `null` |
 | `balance` | `{ "amount": 12.34, "currency": "CNY", "source": "official" }` 或 `null` |
@@ -68,7 +74,14 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 - `turn_context`：`model`、`cwd`
 - 取**最后一条**含 `rate_limits` 的记录即当前窗口状态；`account.label` 可从 `~/.codex/auth.json` 的 token 声明里取邮箱，取不到就留 `null`（**不许解析或打印 token 本身**）。
 
-**DeepSeek** —— 无窗口配额，只有余额：官方 `GET https://api.deepseek.com/user/balance`（Bearer key）。花费只能从 `~/.dsh/sessions/**/session.v4.jsonl.zstd` 的 `tokenUsage.totals` 本地估算（需要 `zstd` 解压，本机在 `/opt/homebrew/bin/zstd`）。没有 key 时：`balance: null` + warning「余额需要 API key」，`spend` 照常给估算值。
+**DeepSeek** —— 无窗口配额，只有余额：官方 `GET https://api.deepseek.com/user/balance`（Bearer key）。花费只能从本地会话记录估算，**两个来源都要支持**：
+1. `~/.dsh/storages/session_projcache/sessions/*.json` 的 `record.rows.tokenUsage.val.totals`，键名是 **camelCase**：`uncachedInputTokens` / `outputTokens` / `cacheReadTokens` / `cacheWriteTokens`（已实测确认存在此结构）
+2. 会话事件里的 `data.usage`（同样是 camelCase），用于按天拆分；拿不到就按会话聚合，日期用文件 mtime 近似，并在 `coverage.note` 里写明口径
+
+> 注意：`tokenUsage.totals` **不在** session jsonl 的顶层，早期探针按顶层找是错的。
+> 需要 `zstd` 解压，本机在 `/opt/homebrew/bin/zstd`。没有 key 时：`balance: null` + warning「余额需要 API key」，`spend` 照常给估算值。
+
+**网络请求硬规则**：只允许请求 `https://api.deepseek.com`。**必须禁止自动重定向**（或校验最终 `geturl()` 的 host 与 scheme），否则 302 会把 `Authorization` 头带到第三方域名——审查已实测复现。
 
 ## 3. App 行为
 
@@ -77,6 +90,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 - 每个 window 一行：标签、进度条、`已用 XX%`、`Xh Ym 后重置`。
 - 底部：`刷新` 按钮 + `N 分钟前更新`。
 - 自动刷新 60s；探针失败显示上一次成功值 + 灰化 + 警告文案。
+- `expired: true` 的窗口显示「窗口已过期（数据 X 天前）」，不显示倒计时；`stale: true` 的整块灰化。
 - 深浅色跟随系统；窗口无数据时显示「无数据」，**绝不显示 0%**。
 - 不读取、不落盘、不打印任何凭据。
 
@@ -88,3 +102,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 4. 探针输出里 grep 不到任何形似 token 的字符串（长随机串 / `sk-` 前缀）。
 5. App `swift build` 通过；启动后菜单栏出现图标；两个 tab 可切；无数据 provider 显示「无数据」。
 6. `pytest` / `unittest` 全绿，含上面 2、3 的用例。
+7. **过期数据**：`resets_at` 已过去的窗口 → `expired: true` + warning；`observed_at` 早于窗口长度 → `stale: true`；两者都不许静默当成当前值。
+8. **越界与 NaN**：`used_percent` 为 150 / -5 / NaN → 输出 `null` + warning，且输出必须是严格合法 JSON（`NaN` 不算）。
+9. **重定向安全**：302 到非 `api.deepseek.com` 的域名时，探针不得发出 `Authorization`；最终 URL 不是 https + 官方域名就报错。
+10. **无 key 不发请求**：没有 `DEEPSEEK_API_KEY` 时，探针不得产生任何网络连接。
