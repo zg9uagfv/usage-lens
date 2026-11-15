@@ -7,3 +7,6 @@ data/*.sqlite
 data/*.db
 .env
 .DS_Store
+.build/
+.cache/
+.preview/

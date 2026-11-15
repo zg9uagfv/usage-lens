@@ -1,0 +1,288 @@
+import Foundation
+
+/// 契约版本。App 只认这个 schema；不符就按「探针输出非法」处理，不猜。
+public let probeSchema = "usage-lens/probe@1"
+
+/// 所有字段名集中在一处，解码时共用。
+public enum ProbeKey: String, CodingKey {
+    case schema
+    case provider
+    case account
+    case generatedAt = "generated_at"
+    case windows
+    case balance
+    case spend
+    case coverage
+    case warnings
+    case error
+
+    case id
+    case label
+    case plan
+    case usedPercent = "used_percent"
+    case windowSeconds = "window_seconds"
+    case resetsAt = "resets_at"
+    case basis
+
+    case amount
+    case currency
+    case source
+    case today
+    case window
+    case from
+    case to
+    case note
+}
+
+// MARK: - 容错解码辅助
+
+// 探针是人写的脚本，字段偶尔会缺、会是 null、偶尔会是字符串化的数字。
+// 这里统一「拿不到就是 nil」，绝不因为一个怪字段让整个 provider 变成崩溃或 0%。
+extension KeyedDecodingContainer where Key == ProbeKey {
+    func optionalString(_ key: ProbeKey) -> String? {
+        (try? decode(String.self, forKey: key)) ?? nil
+    }
+
+    func optionalDouble(_ key: ProbeKey) -> Double? {
+        if let value = try? decode(Double.self, forKey: key) { return value }
+        if let value = try? decode(Int.self, forKey: key) { return Double(value) }
+        if let raw = try? decode(String.self, forKey: key) { return Double(raw) }
+        return nil
+    }
+
+    func optionalInt(_ key: ProbeKey) -> Int? {
+        guard let value = optionalDouble(key) else { return nil }
+        return Int(value.rounded())
+    }
+
+    func optionalDate(_ key: ProbeKey) -> Date? {
+        if let raw = try? decode(String.self, forKey: key) { return ProbeDate.parse(raw) }
+        if let seconds = try? decode(Double.self, forKey: key) {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        return nil
+    }
+
+    func optional<T: Decodable>(_ key: ProbeKey, as type: T.Type) -> T? {
+        (try? decode(type, forKey: key)) ?? nil
+    }
+}
+
+/// 宽松 ISO8601：接受带/不带毫秒、epoch 秒、纯日期。
+public enum ProbeDate {
+    private static let withFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let plain: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static let dayOnly: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    public static func parse(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let date = withFractional.date(from: trimmed) { return date }
+        if let date = plain.date(from: trimmed) { return date }
+        if let date = dayOnly.date(from: trimmed) { return date }
+        if let seconds = Double(trimmed) { return Date(timeIntervalSince1970: seconds) }
+        return nil
+    }
+}
+
+// MARK: - 契约结构
+
+public struct ProbeAccount: Decodable, Sendable, Equatable {
+    public var label: String?
+    public var plan: String?
+
+    public init(label: String? = nil, plan: String? = nil) {
+        self.label = label
+        self.plan = plan
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        label = container.optionalString(.label)
+        plan = container.optionalString(.plan)
+    }
+}
+
+public struct ProbeWindow: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var label: String?
+    /// 契约要求 0–100 或 null。null = 未知，绝不当成 0。
+    public var usedPercent: Double?
+    public var windowSeconds: Int?
+    public var resetsAt: Date?
+    /// `server` = 服务端返回；`local` = 本地推导。
+    public var basis: String?
+
+    public init(
+        id: String,
+        label: String? = nil,
+        usedPercent: Double? = nil,
+        windowSeconds: Int? = nil,
+        resetsAt: Date? = nil,
+        basis: String? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.usedPercent = usedPercent
+        self.windowSeconds = windowSeconds
+        self.resetsAt = resetsAt
+        self.basis = basis
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        let position = decoder.codingPath.last?.intValue ?? 0
+        if let rawID = container.optionalString(.id), !rawID.isEmpty {
+            id = rawID
+        } else {
+            id = "window-\(position)"
+        }
+        label = container.optionalString(.label)
+        usedPercent = container.optionalDouble(.usedPercent)
+        windowSeconds = container.optionalInt(.windowSeconds)
+        resetsAt = container.optionalDate(.resetsAt)
+        basis = container.optionalString(.basis)
+    }
+}
+
+public struct ProbeBalance: Decodable, Sendable, Equatable {
+    public var amount: Double?
+    public var currency: String?
+    public var source: String?
+
+    public init(amount: Double? = nil, currency: String? = nil, source: String? = nil) {
+        self.amount = amount
+        self.currency = currency
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        amount = container.optionalDouble(.amount)
+        currency = container.optionalString(.currency)
+        source = container.optionalString(.source)
+    }
+}
+
+public struct ProbeSpend: Decodable, Sendable, Equatable {
+    public var today: Double?
+    public var window: Double?
+    public var currency: String?
+    public var source: String?
+
+    public init(today: Double? = nil, window: Double? = nil, currency: String? = nil, source: String? = nil) {
+        self.today = today
+        self.window = window
+        self.currency = currency
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        today = container.optionalDouble(.today)
+        window = container.optionalDouble(.window)
+        currency = container.optionalString(.currency)
+        source = container.optionalString(.source)
+    }
+}
+
+public struct ProbeCoverage: Decodable, Sendable, Equatable {
+    public var from: String?
+    public var to: String?
+    public var note: String?
+
+    public init(from: String? = nil, to: String? = nil, note: String? = nil) {
+        self.from = from
+        self.to = to
+        self.note = note
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        from = container.optionalString(.from)
+        to = container.optionalString(.to)
+        note = container.optionalString(.note)
+    }
+}
+
+public struct ProbeEnvelope: Decodable, Sendable, Equatable {
+    public var schema: String
+    public var provider: String?
+    public var account: ProbeAccount?
+    public var generatedAt: Date?
+    public var windows: [ProbeWindow]
+    public var balance: ProbeBalance?
+    public var spend: ProbeSpend?
+    public var coverage: ProbeCoverage?
+    /// 人话警告，直接进 UI。
+    public var warnings: [String]
+    /// 非空 = 探针自己报告的致命错误。
+    public var error: String?
+
+    public init(
+        schema: String = probeSchema,
+        provider: String? = nil,
+        account: ProbeAccount? = nil,
+        generatedAt: Date? = nil,
+        windows: [ProbeWindow] = [],
+        balance: ProbeBalance? = nil,
+        spend: ProbeSpend? = nil,
+        coverage: ProbeCoverage? = nil,
+        warnings: [String] = [],
+        error: String? = nil
+    ) {
+        self.schema = schema
+        self.provider = provider
+        self.account = account
+        self.generatedAt = generatedAt
+        self.windows = windows
+        self.balance = balance
+        self.spend = spend
+        self.coverage = coverage
+        self.warnings = warnings
+        self.error = error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ProbeKey.self)
+        schema = container.optionalString(.schema) ?? ""
+        provider = container.optionalString(.provider)
+        account = container.optional(.account, as: ProbeAccount.self)
+        generatedAt = container.optionalDate(.generatedAt)
+        windows = container.optional(.windows, as: [ProbeWindow].self) ?? []
+        balance = container.optional(.balance, as: ProbeBalance.self)
+        spend = container.optional(.spend, as: ProbeSpend.self)
+        coverage = container.optional(.coverage, as: ProbeCoverage.self)
+        error = container.optionalString(.error)
+
+        if let list = container.optional(.warnings, as: [String].self) {
+            warnings = list
+        } else if let single = container.optionalString(.warnings) {
+            warnings = [single]
+        } else {
+            warnings = []
+        }
+    }
+
+    /// schema 不符时的说明；nil 表示合规。
+    public var schemaMismatch: String? {
+        guard schema != probeSchema else { return nil }
+        return schema.isEmpty ? "缺少 schema 字段" : "schema 不符：\(schema)"
+    }
+}
