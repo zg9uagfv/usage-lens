@@ -9,6 +9,9 @@ public enum ProbeKey: String, CodingKey {
     case provider
     case account
     case generatedAt = "generated_at"
+    case observedAt = "observed_at"
+    case stale
+    case expired
     case windows
     case balance
     case spend
@@ -53,6 +56,15 @@ extension KeyedDecodingContainer where Key == ProbeKey {
     func optionalInt(_ key: ProbeKey) -> Int? {
         guard let value = optionalDouble(key) else { return nil }
         return Int(value.rounded())
+    }
+
+    func optionalBool(_ key: ProbeKey) -> Bool? {
+        if let value = try? decode(Bool.self, forKey: key) { return value }
+        if let value = try? decode(Int.self, forKey: key) { return value != 0 }
+        if let raw = try? decode(String.self, forKey: key) {
+            return ["true", "1", "yes"].contains(raw.lowercased())
+        }
+        return nil
     }
 
     func optionalDate(_ key: ProbeKey) -> Date? {
@@ -126,6 +138,8 @@ public struct ProbeWindow: Decodable, Sendable, Equatable, Identifiable {
     public var usedPercent: Double?
     public var windowSeconds: Int?
     public var resetsAt: Date?
+    /// 探针基于 `resets_at < generated_at` 给出的判断；缺失时 App 用 resets_at 兜底。
+    public var expired: Bool?
     /// `server` = 服务端返回；`local` = 本地推导。
     public var basis: String?
 
@@ -135,6 +149,7 @@ public struct ProbeWindow: Decodable, Sendable, Equatable, Identifiable {
         usedPercent: Double? = nil,
         windowSeconds: Int? = nil,
         resetsAt: Date? = nil,
+        expired: Bool? = nil,
         basis: String? = nil
     ) {
         self.id = id
@@ -142,6 +157,7 @@ public struct ProbeWindow: Decodable, Sendable, Equatable, Identifiable {
         self.usedPercent = usedPercent
         self.windowSeconds = windowSeconds
         self.resetsAt = resetsAt
+        self.expired = expired
         self.basis = basis
     }
 
@@ -157,6 +173,7 @@ public struct ProbeWindow: Decodable, Sendable, Equatable, Identifiable {
         usedPercent = container.optionalDouble(.usedPercent)
         windowSeconds = container.optionalInt(.windowSeconds)
         resetsAt = container.optionalDate(.resetsAt)
+        expired = container.optionalBool(.expired)
         basis = container.optionalString(.basis)
     }
 }
@@ -226,6 +243,10 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
     public var provider: String?
     public var account: ProbeAccount?
     public var generatedAt: Date?
+    /// 数据源那一帧的时间；缺失时由 `effectiveObservedAt` 退回 generated_at。
+    public var observedAt: Date?
+    /// 数据源帧早于窗口长度 → 探针置 true，App 整块灰化并显示「数据来自 X 前」。
+    public var stale: Bool?
     public var windows: [ProbeWindow]
     public var balance: ProbeBalance?
     public var spend: ProbeSpend?
@@ -240,6 +261,8 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         provider: String? = nil,
         account: ProbeAccount? = nil,
         generatedAt: Date? = nil,
+        observedAt: Date? = nil,
+        stale: Bool? = nil,
         windows: [ProbeWindow] = [],
         balance: ProbeBalance? = nil,
         spend: ProbeSpend? = nil,
@@ -251,6 +274,8 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         self.provider = provider
         self.account = account
         self.generatedAt = generatedAt
+        self.observedAt = observedAt
+        self.stale = stale
         self.windows = windows
         self.balance = balance
         self.spend = spend
@@ -265,6 +290,8 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         provider = container.optionalString(.provider)
         account = container.optional(.account, as: ProbeAccount.self)
         generatedAt = container.optionalDate(.generatedAt)
+        observedAt = container.optionalDate(.observedAt)
+        stale = container.optionalBool(.stale)
         windows = container.optional(.windows, as: [ProbeWindow].self) ?? []
         balance = container.optional(.balance, as: ProbeBalance.self)
         spend = container.optional(.spend, as: ProbeSpend.self)
@@ -285,4 +312,24 @@ public struct ProbeEnvelope: Decodable, Sendable, Equatable {
         guard schema != probeSchema else { return nil }
         return schema.isEmpty ? "缺少 schema 字段" : "schema 不符：\(schema)"
     }
+}
+
+
+// MARK: - 过期与陈旧语义
+
+public extension ProbeWindow {
+    /// 契约的 `expired` 是权威；字段缺失时按 resets_at 是否已过去兜底。
+    func isExpired(now: Date = Date()) -> Bool {
+        if let expired { return expired }
+        guard let resetsAt else { return false }
+        return resetsAt <= now
+    }
+}
+
+public extension ProbeEnvelope {
+    /// 显示「数据 X 天前」时用的时间：observed_at 优先，缺失退回 generated_at。
+    var effectiveObservedAt: Date? { observedAt ?? generatedAt }
+
+    /// 契约的 stale：数据源帧太旧，整块灰化。
+    var dataIsStale: Bool { stale ?? false }
 }

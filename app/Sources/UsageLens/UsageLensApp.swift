@@ -6,7 +6,7 @@ import UsageLensUI
 @main
 struct UsageLensApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var store = UsageStore()
+    @StateObject private var store = UsageStore(refreshInterval: UsageStore.environmentRefreshInterval)
 
     var body: some Scene {
         MenuBarExtra {

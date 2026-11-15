@@ -89,20 +89,25 @@ enum Fixtures {
     }
 
     /// 复刻真实探针（feat/probes @ 96b9a97）在本机跑出的形状：
-    /// account.label 为 null、两个窗口的 resets_at 都是过去时间。
+    /// account.label 为 null、两个窗口都已过期，observed_at 是几天前。
     static func expiredCodexReport() -> ProbeReport {
-        ProbeReport(
+        let now = Date()
+        return ProbeReport(
             provider: ProviderCatalog.codex,
             envelope: ProbeEnvelope(
                 provider: "codex",
                 account: ProbeAccount(label: nil, plan: "plus"),
+                generatedAt: now,
+                observedAt: now.addingTimeInterval(-3 * 86_400),
+                stale: false,
                 windows: [
                     ProbeWindow(
                         id: "5h",
                         label: "5 小时",
                         usedPercent: 21,
                         windowSeconds: 18_000,
-                        resetsAt: ProbeDate.parse("2026-11-11T05:28:56Z"),
+                        resetsAt: now.addingTimeInterval(-4 * 86_400),
+                        expired: true,
                         basis: "server"
                     ),
                     ProbeWindow(
@@ -110,12 +115,49 @@ enum Fixtures {
                         label: "7 天",
                         usedPercent: 18,
                         windowSeconds: 604_800,
-                        resetsAt: ProbeDate.parse("2026-11-12T12:55:31Z"),
+                        resetsAt: now.addingTimeInterval(-3 * 86_400),
+                        expired: true,
                         basis: "server"
                     ),
                 ]
             ),
-            finishedAt: Date()
+            finishedAt: now
+        )
+    }
+
+    /// 契约 stale：数据源帧太旧，整块灰化 + 「数据来自 X 天前」。
+    static func staleCodexReport() -> ProbeReport {
+        let now = Date()
+        return ProbeReport(
+            provider: ProviderCatalog.codex,
+            envelope: ProbeEnvelope(
+                provider: "codex",
+                account: ProbeAccount(label: nil, plan: "plus"),
+                generatedAt: now,
+                observedAt: now.addingTimeInterval(-5 * 86_400),
+                stale: true,
+                windows: [
+                    ProbeWindow(
+                        id: "5h",
+                        label: "5 小时",
+                        usedPercent: 33,
+                        windowSeconds: 18_000,
+                        resetsAt: now.addingTimeInterval(3600),
+                        expired: false,
+                        basis: "server"
+                    )
+                ]
+            ),
+            finishedAt: now
+        )
+    }
+
+    static func incompatibleSchemaReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.codex,
+            failure: "探针输出格式不兼容（schema 不符：usage-lens/probe@9）",
+            finishedAt: Date(),
+            isIncompatibleSchema: true
         )
     }
 
@@ -245,7 +287,7 @@ final class PanelRenderTests: XCTestCase {
         for window in state.windows {
             XCTAssertEqual(UsageFormat.resetCountdown(until: window.resetsAt), "窗口已过期")
         }
-        XCTAssertEqual(store.mostTense?.compactLabel, "Codex 5h 21%")
+        XCTAssertNil(store.mostTense, "过期窗口不许上菜单栏")
 
         try render(PanelView(store: store), named: "07-codex-expired-windows", background: windowBackground)
     }
@@ -263,6 +305,33 @@ final class PanelRenderTests: XCTestCase {
         XCTAssertFalse(line.contains("abc.def-123"))
         XCTAssertFalse(line.contains("sk-abc123DEF456ghi789"))
         XCTAssertTrue(line.contains("codex=failed"))
+    }
+
+    func testStaleDataRendersDimmed() async throws {
+        let provider = SequencedProbeProvider([ProviderCatalog.codex: [Fixtures.staleCodexReport()]])
+        let store = makeStore(provider)
+        await store.refreshAll()
+
+        let state = store.state(for: ProviderCatalog.codex)
+        XCTAssertTrue(state.isDataStale)
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertNil(store.mostTense, "stale 数据不许上菜单栏")
+
+        try render(PanelView(store: store), named: "08-codex-stale-data", background: windowBackground)
+    }
+
+    func testIncompatibleSchemaShowsNoNumbers() async throws {
+        let provider = SequencedProbeProvider([ProviderCatalog.codex: [Fixtures.incompatibleSchemaReport()]])
+        let store = makeStore(provider)
+        await store.refreshAll()
+
+        let state = store.state(for: ProviderCatalog.codex)
+        XCTAssertEqual(state.status, .incompatible)
+        XCTAssertTrue(state.windows.isEmpty, "schema 不符时不许渲染任何数字")
+        XCTAssertNil(state.envelope)
+        XCTAssertNil(store.mostTense)
+
+        try render(PanelView(store: store), named: "09-codex-incompatible-schema", background: windowBackground)
     }
 
     func testMenuBarLabelUsesMostTenseWindow() async throws {

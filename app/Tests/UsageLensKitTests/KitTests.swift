@@ -90,6 +90,49 @@ final class ProbeContractTests: XCTestCase {
     }
 }
 
+final class ContractV2Tests: XCTestCase {
+    func testDecodesObservedAtStaleAndExpired() throws {
+        let json = """
+        {"schema":"usage-lens/probe@1","provider":"codex",
+         "generated_at":"2026-11-15T10:20:00Z",
+         "observed_at":"2026-11-11T01:25:26Z",
+         "stale":true,
+         "windows":[{"id":"5h","used_percent":21,"resets_at":"2026-11-11T05:28:56Z","expired":true}]}
+        """
+        let envelope = try XCTUnwrap(ProbeJSON.decode(json))
+        XCTAssertEqual(envelope.observedAt, ProbeDate.parse("2026-11-11T01:25:26Z"))
+        XCTAssertEqual(envelope.effectiveObservedAt, envelope.observedAt)
+        XCTAssertTrue(envelope.dataIsStale)
+        let window = try XCTUnwrap(envelope.windows.first)
+        XCTAssertEqual(window.expired, true)
+        XCTAssertTrue(window.isExpired())
+    }
+
+    func testStaleDefaultsToFalseAndFallsBackToGeneratedAt() throws {
+        let json = #"{"schema":"usage-lens/probe@1","provider":"codex","generated_at":"2026-11-15T10:20:00Z","windows":[]}"#
+        let envelope = try XCTUnwrap(ProbeJSON.decode(json))
+        XCTAssertFalse(envelope.dataIsStale)
+        XCTAssertEqual(envelope.effectiveObservedAt, envelope.generatedAt)
+        XCTAssertNil(envelope.windows.first)
+    }
+
+    func testSchemaMismatchIsTreatedAsIncompatible() throws {
+        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let json = #"{"schema":"usage-lens/probe@9","provider":"codex","windows":[{"id":"5h","used_percent":88}]}"#
+        let report = runner.decode(
+            provider: ProviderCatalog.codex,
+            stdout: json,
+            stderr: "",
+            status: 0,
+            finishedAt: Date(),
+            duration: 0.01
+        )
+        XCTAssertTrue(report.isIncompatibleSchema)
+        XCTAssertNil(report.envelope, "schema 不符时不许保留任何数字")
+        XCTAssertTrue(report.failure?.contains("探针输出格式不兼容") ?? false)
+    }
+}
+
 final class FormattingTests: XCTestCase {
     func testPercent() {
         XCTAssertEqual(UsageFormat.percent(33), "33%")
@@ -121,11 +164,30 @@ final class FormattingTests: XCTestCase {
         XCTAssertNil(UsageFormat.resetCountdown(until: nil, now: now))
     }
 
-    func testIsExpired() {
+    func testWindowExpiredFlagAndFallback() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        XCTAssertTrue(UsageFormat.isExpired(resetAt: now.addingTimeInterval(-1), now: now))
-        XCTAssertFalse(UsageFormat.isExpired(resetAt: now.addingTimeInterval(60), now: now))
-        XCTAssertFalse(UsageFormat.isExpired(resetAt: nil, now: now))
+        // 契约字段优先
+        XCTAssertTrue(ProbeWindow(id: "5h", resetsAt: now.addingTimeInterval(3600), expired: true).isExpired(now: now))
+        XCTAssertFalse(ProbeWindow(id: "5h", resetsAt: now.addingTimeInterval(-60), expired: false).isExpired(now: now))
+        // 缺失时按 resets_at 兜底
+        XCTAssertTrue(ProbeWindow(id: "5h", resetsAt: now.addingTimeInterval(-1)).isExpired(now: now))
+        XCTAssertFalse(ProbeWindow(id: "5h", resetsAt: now.addingTimeInterval(60)).isExpired(now: now))
+        XCTAssertFalse(ProbeWindow(id: "5h").isExpired(now: now))
+    }
+
+    func testDataAgeAndExpiredMessages() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(UsageFormat.dataAgeText(from: now.addingTimeInterval(-30), now: now), "刚刚")
+        XCTAssertEqual(UsageFormat.dataAgeText(from: now.addingTimeInterval(-3 * 3600), now: now), "3 小时前")
+        XCTAssertEqual(UsageFormat.dataAgeText(from: now.addingTimeInterval(-5 * 86_400), now: now), "5 天前")
+        XCTAssertNil(UsageFormat.dataAgeText(from: nil, now: now))
+        XCTAssertEqual(
+            UsageFormat.expiredMessage(observedAt: now.addingTimeInterval(-3 * 86_400), now: now),
+            "窗口已过期（数据 3 天前）"
+        )
+        XCTAssertEqual(UsageFormat.expiredMessage(observedAt: nil, now: now), "窗口已过期")
+        XCTAssertEqual(UsageFormat.staleMessage(observedAt: now.addingTimeInterval(-5 * 86_400), now: now), "数据来自 5 天前")
+        XCTAssertEqual(UsageFormat.staleMessage(observedAt: nil, now: now), "数据时间未知")
     }
 
     func testUpdatedText() {
@@ -366,6 +428,110 @@ final class StateReducerTests: XCTestCase {
             to: state
         )
         XCTAssertNil(Tension.mostTense(in: [state]))
+    }
+}
+
+final class BlockingStateTests: XCTestCase {
+    private func okState(percent: Double, resetsAt: Date? = nil, stale: Bool? = nil) -> ProviderState {
+        var state = ProviderState(provider: ProviderCatalog.codex)
+        let envelope = ProbeEnvelope(
+            provider: "codex",
+            observedAt: Date(),
+            stale: stale,
+            windows: [ProbeWindow(id: "5h", label: "5 小时", usedPercent: percent, resetsAt: resetsAt, basis: "server")]
+        )
+        state = ProviderReducer.apply(ProbeReport(provider: ProviderCatalog.codex, envelope: envelope), to: state)
+        return state
+    }
+
+    func testIncompatibleSchemaClearsPreviousValues() {
+        var state = okState(percent: 77)
+        XCTAssertEqual(state.status, .ok)
+
+        state = ProviderReducer.apply(
+            ProbeReport(
+                provider: ProviderCatalog.codex,
+                failure: "探针输出格式不兼容（schema 不符：usage-lens/probe@9）",
+                isIncompatibleSchema: true
+            ),
+            to: state
+        )
+
+        XCTAssertEqual(state.status, .incompatible)
+        XCTAssertNil(state.envelope)
+        XCTAssertNil(state.lastDataAt)
+        XCTAssertTrue(state.windows.isEmpty)
+        XCTAssertFalse(state.isStale, "schema 非法时不许出现「上次成功值」")
+        XCTAssertNil(Tension.mostTense(in: [state]))
+    }
+
+    func testDataStaleIsWarningAndExcludedFromMenuBar() {
+        let state = okState(percent: 21, resetsAt: Date().addingTimeInterval(3600), stale: true)
+        XCTAssertTrue(state.isDataStale)
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertNil(Tension.mostTense(in: [state]))
+    }
+
+    func testExpiredWindowExcludedFromMenuBar() {
+        let state = okState(percent: 21, resetsAt: Date().addingTimeInterval(-60))
+        XCTAssertEqual(state.status, .ok)
+        XCTAssertNil(Tension.mostTense(in: [state]), "过期窗口不许上菜单栏")
+    }
+
+    func testFreshWindowStillShowOnMenuBar() {
+        let state = okState(percent: 21, resetsAt: Date().addingTimeInterval(3600))
+        XCTAssertEqual(Tension.mostTense(in: [state])?.compactLabel, "Codex 5h 21%")
+    }
+
+    func testFailedStaleValuesExcludedFromMenuBar() {
+        var state = okState(percent: 77, resetsAt: Date().addingTimeInterval(3600))
+        state = ProviderReducer.apply(
+            ProbeReport(provider: ProviderCatalog.codex, failure: "探针超时（>6s）"),
+            to: state
+        )
+        XCTAssertEqual(state.status, .stale)
+        XCTAssertNil(Tension.mostTense(in: [state]), "失败保留的旧值不许上菜单栏")
+    }
+}
+
+final class ProbeProcessDrainTests: XCTestCase {
+    /// 审查实测：200KB stderr 会在旧实现里死锁。这里跑 1MB stdout + 200KB stderr。
+    func testLargeOutputIsFullyDrainedWithoutTimeout() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".cache/process-tests", isDirectory: true)
+        let probes = root.appendingPathComponent("probes", isDirectory: true)
+        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
+
+        let script = probes.appendingPathComponent("big.py")
+        let json = #"{"schema": "usage-lens/probe@1", "provider": "codex", "windows": [{"id": "5h", "used_percent": 21, "window_seconds": 18000, "resets_at": "2099-01-01T00:00:00Z", "basis": "server"}]}"#
+        let scriptText = """
+        import sys
+        sys.stdout.write('\(json)' + ' ' * (1024 * 1024))
+        sys.stdout.flush()
+        sys.stderr.write('E' * (200 * 1024))
+        sys.stderr.flush()
+        """
+        try scriptText.write(to: script, atomically: true, encoding: .utf8)
+
+        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/big.py")
+        let runner = ProbeRunner(root: root, timeout: 5)
+
+        let started = Date()
+        let report = await runner.report(for: provider)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertNil(report.failure)
+        XCTAssertEqual(report.envelope?.windows.first?.usedPercent, 21)
+        XCTAssertLessThan(elapsed, 4.0, "大输出不该走到超时")
+
+        switch await runner.execute(probe: script, workingDirectory: root, timeout: 5) {
+        case .output(let output):
+            XCTAssertFalse(output.timedOut)
+            XCTAssertGreaterThanOrEqual(output.stdout.count, 1024 * 1024, "stdout 必须读完整")
+            XCTAssertGreaterThanOrEqual(output.stderr.count, 200 * 1024, "stderr 必须读完整")
+        case .failedToStart(let message):
+            XCTFail("探针启动失败：\(message)")
+        }
     }
 }
 

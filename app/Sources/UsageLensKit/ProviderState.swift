@@ -17,6 +17,8 @@ public enum ProviderStatus: Sendable, Equatable {
     case missing
     /// 探针失败且没有任何可显示的数据。
     case failed
+    /// schema 不符：输出整份作废，不展示任何数字。
+    case incompatible
 }
 
 public struct ProviderState: Sendable, Equatable {
@@ -29,6 +31,7 @@ public struct ProviderState: Sendable, Equatable {
     public var failureReason: String?
     public var warnings: [String]
     public var isMissingProbe: Bool
+    public var isIncompatibleSchema: Bool
     public var hasLoaded: Bool
     public var isRefreshing: Bool
 
@@ -40,6 +43,7 @@ public struct ProviderState: Sendable, Equatable {
         self.failureReason = nil
         self.warnings = []
         self.isMissingProbe = false
+        self.isIncompatibleSchema = false
         self.hasLoaded = false
         self.isRefreshing = false
     }
@@ -50,17 +54,28 @@ public struct ProviderState: Sendable, Equatable {
     /// 失败但还有旧值可显示 = 灰化态。
     public var isStale: Bool { failureReason != nil && envelope != nil && !isMissingProbe }
 
+    /// 契约的 stale：数据源帧太旧（探针明确置位，不靠 warnings 兜底）。
+    public var isDataStale: Bool { envelope?.dataIsStale ?? false }
+
+    /// 需要灰化展示的条件：失败保留的旧值，或探针明确标记的数据陈旧。
+    public var isDimmed: Bool { isStale || isDataStale }
+
+    /// 「数据 X 天前」用的时间：只认探针给的 observed_at。
+    /// 缺失时不编造「刚刚」，宁可不写天数（老探针联调时就是这种情况）。
+    public var observedAt: Date? { envelope?.observedAt }
+
     public var status: ProviderStatus {
         if isMissingProbe { return .missing }
         guard hasLoaded else { return .loading }
+        if isIncompatibleSchema { return .incompatible }
         if failureReason != nil {
             // 有旧值 → 灰化保留；没有旧值 → 明确报错，而不是伪装成「空的」。
             return envelope == nil ? .failed : .stale
         }
         if !hasWindows && envelope?.balance == nil && envelope?.spend == nil {
-            return warnings.isEmpty ? .empty : .warning
+            return (warnings.isEmpty && !isDataStale) ? .empty : .warning
         }
-        return warnings.isEmpty ? .ok : .warning
+        return (warnings.isEmpty && !isDataStale) ? .ok : .warning
     }
 
     public var accountLabel: String? {
@@ -112,13 +127,25 @@ public enum ProviderReducer {
 
         if report.isMissingProbe {
             next.isMissingProbe = true
+            next.isIncompatibleSchema = false
             next.envelope = nil
             next.failureReason = report.failure
             next.lastDataAt = nil
             return next
         }
 
+        if report.isIncompatibleSchema {
+            // 整份作废：不保留旧值，也不出现「上次成功值」。
+            next.isMissingProbe = false
+            next.isIncompatibleSchema = true
+            next.envelope = nil
+            next.failureReason = report.failure ?? "探针输出格式不兼容"
+            next.lastDataAt = nil
+            return next
+        }
+
         next.isMissingProbe = false
+        next.isIncompatibleSchema = false
 
         if let envelope = report.envelope {
             next.envelope = envelope
@@ -161,12 +188,15 @@ public struct TensionWindow: Sendable, Equatable {
 }
 
 public enum Tension {
-    /// 跨 provider 取已用百分比最高的窗口；全是 null / 没数据时返回 nil（菜单栏只留图标）。
-    public static func mostTense(in states: [ProviderState]) -> TensionWindow? {
+    /// 跨 provider 取已用百分比最高的窗口。
+    /// 只有「状态 ok 且未 stale、未 expired」的窗口才算数：失败保留的旧值、过期窗口不许上菜单栏，
+    /// 否则用户不点开面板就会把旧数据当真。没有任何合格窗口时返回 nil（菜单栏只留图标）。
+    public static func mostTense(in states: [ProviderState], now: Date = Date()) -> TensionWindow? {
         var best: TensionWindow?
-        for state in states {
+        for state in states where state.status == .ok {
             for window in state.windows {
                 guard let used = window.usedPercent, used.isFinite else { continue }
+                guard !window.isExpired(now: now) else { continue }
                 let clamped = min(max(used, 0), 100)
                 if let current = best, current.percent >= clamped { continue }
                 best = TensionWindow(provider: state.provider, window: window, percent: clamped)

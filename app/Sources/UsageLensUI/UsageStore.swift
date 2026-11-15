@@ -37,6 +37,15 @@ public final class UsageStore: ObservableObject {
         loop?.cancel()
     }
 
+    /// 开发/验收用：USAGE_LENS_REFRESH_SECONDS 覆盖默认 60s 轮询间隔。
+    public static var environmentRefreshInterval: TimeInterval {
+        guard let raw = ProcessInfo.processInfo.environment["USAGE_LENS_REFRESH_SECONDS"],
+              let value = Double(raw),
+              value >= 1
+        else { return 60 }
+        return value
+    }
+
     public func state(for provider: Provider) -> ProviderState {
         states[provider] ?? ProviderState(provider: provider)
     }
@@ -128,6 +137,7 @@ public final class UsageStore: ObservableObject {
         case .empty: return "empty"
         case .missing: return "missing"
         case .failed: return "failed"
+        case .incompatible: return "incompatible"
         }
     }
 }

@@ -69,11 +69,15 @@ struct ProviderTabBar: View {
 struct ProviderDetailView: View {
     let state: ProviderState
 
-    private var isDimmed: Bool { state.isStale }
+    private var isDimmed: Bool { state.isDimmed }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+
+            if state.isDataStale {
+                staleDataNote
+            }
 
             if !state.hasLoaded {
                 loadingRow
@@ -128,6 +132,17 @@ struct ProviderDetailView: View {
         }
     }
 
+    private var staleDataNote: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "clock")
+                .font(.system(size: 10, weight: .medium))
+            Text(UsageFormat.staleMessage(observedAt: state.observedAt))
+                .font(.system(size: 10.5, weight: .medium))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+    }
+
     private var loadingRow: some View {
         HStack(spacing: 7) {
             ProgressView().controlSize(.small)
@@ -140,7 +155,7 @@ struct ProviderDetailView: View {
     private var windowsSection: some View {
         VStack(spacing: 8) {
             ForEach(state.windows) { window in
-                WindowRowView(window: window)
+                WindowRowView(window: window, observedAt: state.observedAt)
             }
         }
     }
@@ -160,7 +175,7 @@ struct ProviderDetailView: View {
             Image(systemName: "chart.bar.xaxis")
                 .font(.system(size: 18, weight: .regular))
                 .foregroundStyle(.tertiary)
-            Text("无数据")
+            Text(emptyTitle)
                 .font(.system(size: 12.5, weight: .semibold))
                 .foregroundStyle(.secondary)
             if let reason = emptyReason {
@@ -177,7 +192,16 @@ struct ProviderDetailView: View {
         .cardBackground(opacity: 0.04)
     }
 
+    private var emptyTitle: String {
+        state.status == .incompatible ? "探针输出格式不兼容" : "无数据"
+    }
+
     private var emptyReason: String? {
+        if state.status == .incompatible {
+            return state.failureReason?
+                .replacingOccurrences(of: "探针输出格式不兼容（", with: "")
+                .replacingOccurrences(of: "）", with: "")
+        }
         if state.isMissingProbe {
             return "未安装探针 \(state.provider.probeRelativePath)"
         }
@@ -270,10 +294,12 @@ struct ProviderDetailView: View {
 
 struct WindowRowView: View {
     let window: ProbeWindow
+    /// 数据源时间，用来写「窗口已过期（数据 3 天前）」。
+    let observedAt: Date?
 
     /// 窗口过了重置时间：数值仍是最后一帧，但不能再画成「活跃」的高饱和色。
     private var isExpired: Bool {
-        UsageFormat.isExpired(resetAt: window.resetsAt)
+        window.isExpired()
     }
 
     private var barTint: Color {
@@ -303,9 +329,12 @@ struct WindowRowView: View {
             )
 
             HStack(spacing: 6) {
-                if let reset = UsageFormat.resetCountdown(until: window.resetsAt) {
+                if isExpired {
+                    // 过期窗口不显示倒计时，只说数据有多旧。
+                    Text(UsageFormat.expiredMessage(observedAt: observedAt))
+                        .foregroundStyle(.orange)
+                } else if let reset = UsageFormat.resetCountdown(until: window.resetsAt) {
                     Text(reset)
-                        .foregroundStyle(UsageFormat.isExpired(resetAt: window.resetsAt) ? Color.orange : Color.secondary)
                 } else {
                     Text("重置时间未知").foregroundStyle(.tertiary)
                 }

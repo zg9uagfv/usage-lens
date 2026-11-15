@@ -41,10 +41,25 @@ public enum UsageFormat {
         return "\(days) 天 \(hours) 小时后重置"
     }
 
-    /// 窗口是否已经过了重置时间（真实数据里会出现：探针如实报最后一帧）。
-    public static func isExpired(resetAt date: Date?, now: Date = Date()) -> Bool {
-        guard let date else { return false }
-        return date.timeIntervalSince(now) <= 0
+    /// 「刚刚」/「3 小时前」/「5 天前」；nil = 不知道数据时间。
+    public static func dataAgeText(from date: Date?, now: Date = Date()) -> String? {
+        guard let date else { return nil }
+        let seconds = Int(max(0, now.timeIntervalSince(date)))
+        if seconds < 3600 { return "刚刚" }
+        if seconds < 86_400 { return "\(seconds / 3600) 小时前" }
+        return "\(seconds / 86_400) 天前"
+    }
+
+    /// expired 窗口的说明文案：不显示倒计时，只说明数据有多旧。
+    public static func expiredMessage(observedAt: Date?, now: Date = Date()) -> String {
+        guard let age = dataAgeText(from: observedAt, now: now) else { return "窗口已过期" }
+        return "窗口已过期（数据 \(age)）"
+    }
+
+    /// stale 数据的说明文案。
+    public static func staleMessage(observedAt: Date?, now: Date = Date()) -> String {
+        guard let age = dataAgeText(from: observedAt, now: now) else { return "数据时间未知" }
+        return "数据来自 \(age)"
     }
 
     /// 「刚刚更新」/「3 分钟前更新」/「2 小时前更新」。

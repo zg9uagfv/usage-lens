@@ -12,6 +12,8 @@ public struct ProbeReport: Sendable {
     public var finishedAt: Date
     /// 探针脚本本身不存在 —— 按「无数据」处理，不算错误。
     public var isMissingProbe: Bool
+    /// schema 不是 usage-lens/probe@1：整份输出作废，不展示任何数字。
+    public var isIncompatibleSchema: Bool
     public var duration: TimeInterval
 
     public init(
@@ -21,7 +23,8 @@ public struct ProbeReport: Sendable {
         warnings: [String] = [],
         finishedAt: Date = Date(),
         isMissingProbe: Bool = false,
-        duration: TimeInterval = 0
+        duration: TimeInterval = 0,
+        isIncompatibleSchema: Bool = false
     ) {
         self.provider = provider
         self.envelope = envelope
@@ -32,6 +35,7 @@ public struct ProbeReport: Sendable {
         self.warnings = rawWarnings.map(SecretRedactor.redact)
         self.finishedAt = finishedAt
         self.isMissingProbe = isMissingProbe
+        self.isIncompatibleSchema = isIncompatibleSchema
         self.duration = duration
     }
 }
@@ -128,14 +132,15 @@ public struct ProbeRunner: ProbeProviding {
         switch execution {
         case .failedToStart(let message):
             return ProbeReport(provider: provider, failure: "探针无法启动：\(message)", finishedAt: Date(), duration: duration)
-        case .timedOut:
-            return ProbeReport(provider: provider, failure: "探针超时（>\(Int(timeout))s）", finishedAt: Date(), duration: duration)
-        case .finished(let stdout, let stderr, let status):
+        case .output(let output):
+            if output.timedOut {
+                return ProbeReport(provider: provider, failure: "探针超时（>\(Int(timeout))s）", finishedAt: Date(), duration: duration)
+            }
             return decode(
                 provider: provider,
-                stdout: stdout,
-                stderr: stderr,
-                status: status,
+                stdout: String(decoding: output.stdout, as: UTF8.self),
+                stderr: String(decoding: output.stderr, as: UTF8.self),
+                status: output.status,
                 finishedAt: Date(),
                 duration: duration
             )
@@ -169,14 +174,20 @@ public struct ProbeRunner: ProbeProviding {
             return ProbeReport(provider: provider, failure: failure, finishedAt: finishedAt, duration: duration)
         }
 
+        // schema 不符 = 整份输出非法：不保留任何数字，也不当成「上次成功值」。
+        if let mismatch = envelope.schemaMismatch {
+            return ProbeReport(
+                provider: provider,
+                failure: "探针输出格式不兼容（\(mismatch)）",
+                finishedAt: finishedAt,
+                duration: duration,
+                isIncompatibleSchema: true
+            )
+        }
+
         // 探针的失败信息以 JSON 里的 `error` / `warnings` 为准。
         // exit code 只在拿不到 JSON 时作为补充线索，避免把「exit 非 0 但给了数据」误判成无数据。
-        var failure: String?
-        if let mismatch = envelope.schemaMismatch {
-            failure = mismatch
-        } else if let error = envelope.error, !error.isEmpty {
-            failure = error
-        }
+        let failure = envelope.error.flatMap { $0.isEmpty ? nil : $0 }
         return ProbeReport(
             provider: provider,
             envelope: envelope,
@@ -188,13 +199,9 @@ public struct ProbeRunner: ProbeProviding {
 
     // MARK: 进程
 
-    private enum Execution: Sendable {
-        case failedToStart(String)
-        case timedOut
-        case finished(stdout: String, stderr: String, status: Int32)
-    }
-
-    private func execute(probe: URL, workingDirectory: URL, timeout: TimeInterval) async -> Execution {
+    /// 边跑边排空两条管道，再等进程退出 + 超时。
+    /// 关键点：绝不能先 `waitUntilExit()` 再读 —— 输出超过管道缓冲（~64KB）必死锁。
+    func execute(probe: URL, workingDirectory: URL, timeout: TimeInterval) async -> ProbeProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", probe.path]
@@ -220,6 +227,12 @@ public struct ProbeRunner: ProbeProviding {
             return .failedToStart(error.localizedDescription)
         }
 
+        let stdoutBuffer = LockedOutputBuffer()
+        let stderrBuffer = LockedOutputBuffer()
+        let readers = DispatchGroup()
+        startReader(pipe: stdoutPipe, buffer: stdoutBuffer, group: readers)
+        startReader(pipe: stderrPipe, buffer: stderrBuffer, group: readers)
+
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
             try? await Task.sleep(nanoseconds: 50_000_000)
@@ -229,7 +242,7 @@ public struct ProbeRunner: ProbeProviding {
         if process.isRunning {
             timedOut = true
             process.terminate()
-            for _ in 0..<20 where process.isRunning {
+            for _ in 0..<25 where process.isRunning {
                 try? await Task.sleep(nanoseconds: 20_000_000)
             }
             if process.isRunning {
@@ -237,37 +250,90 @@ public struct ProbeRunner: ProbeProviding {
             }
         }
 
-        // 子进程结束后管道写端关闭；加一个上限，避免探针遗留孙进程时读数卡死。
-        async let stdoutTask = readAll(stdoutPipe.fileHandleForReading, limit: 2)
-        async let stderrTask = readAll(stderrPipe.fileHandleForReading, limit: 2)
-        let stdoutData = await stdoutTask
-        let stderrData = await stderrTask
+        // 超时 kill 之后也要把已经缓冲的内容读完；上限 2s 防止孙进程占着写端。
+        _ = await Self.waitForReaders(readers, timeout: 2)
 
-        process.waitUntilExit()
-
-        if timedOut {
-            return .timedOut
+        if !process.isRunning {
+            process.waitUntilExit()
         }
-        return .finished(
-            stdout: String(decoding: stdoutData, as: UTF8.self),
-            stderr: String(decoding: stderrData, as: UTF8.self),
-            status: process.terminationStatus
+
+        return .output(
+            ProbeProcessOutput(
+                stdout: stdoutBuffer.snapshot,
+                stderr: stderrBuffer.snapshot,
+                status: process.isRunning ? -1 : process.terminationStatus,
+                timedOut: timedOut
+            )
         )
     }
 
-    private func readAll(_ handle: FileHandle, limit: TimeInterval) async -> Data {
-        await withTaskGroup(of: Data?.self) { group in
-            group.addTask {
-                handle.readDataToEndOfFile()
+    private func startReader(pipe: Pipe, buffer: LockedOutputBuffer, group: DispatchGroup) {
+        let handle = pipe.fileHandleForReading
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                let chunk: Data?
+                do {
+                    chunk = try handle.read(upToCount: 64 * 1024)
+                } catch {
+                    break
+                }
+                guard let chunk, !chunk.isEmpty else { break }
+                buffer.append(chunk)
             }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first ?? Data()
+            group.leave()
         }
+    }
+
+    private static func waitForReaders(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
+        await withTaskGroup(of: Bool.self) { tasks in
+            tasks.addTask {
+                await withCheckedContinuation { continuation in
+                    group.notify(queue: .global(qos: .utility)) {
+                        continuation.resume(returning: true)
+                    }
+                }
+            }
+            tasks.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            let drained = await tasks.next() ?? false
+            tasks.cancelAll()
+            return drained
+        }
+    }
+}
+
+// MARK: - 进程输出
+
+struct ProbeProcessOutput: Sendable {
+    var stdout: Data
+    var stderr: Data
+    var status: Int32
+    var timedOut: Bool
+}
+
+enum ProbeProcessResult: Sendable {
+    case failedToStart(String)
+    case output(ProbeProcessOutput)
+}
+
+/// 两条管道各有一个后台读取线程，用锁把块拼起来。
+private final class LockedOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        storage.append(chunk)
+        lock.unlock()
+    }
+
+    var snapshot: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }
 

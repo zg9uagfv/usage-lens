@@ -57,5 +57,8 @@ Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/codex.py"
 - 没有数据（含探针不存在）→「无数据」，绝不显示 0%。
 - `used_percent: null` →「未知」，进度条只画虚线轨道。
 - 探针失败 → 保留上次成功值、灰化，并显示失败原因与 warnings。
-- `resets_at` 已过去 →「窗口已过期」，不显示负倒计时。
+- `expired: true`（或 `resets_at` 已过去）→「窗口已过期（数据 X 天前）」，不显示倒计时。
+- `stale: true` → 整块灰化 + 「数据来自 X 天前」，且不上菜单栏。
+- `schema` 不是 `usage-lens/probe@1` → 整份输出作废：不渲染任何数字，显示「探针输出格式不兼容」。
+- 菜单栏只显示 `ok` 且未 stale、未 expired 的窗口；否则退回纯图标。
 - DeepSeek 没有窗口概念 → 不画百分比，只显示余额/花费与 warnings。

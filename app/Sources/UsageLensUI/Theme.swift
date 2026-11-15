@@ -25,7 +25,7 @@ enum Theme {
             return .yellow
         case .stale:
             return .orange
-        case .failed:
+        case .failed, .incompatible:
             return .red
         case .empty, .missing:
             return Color(nsColor: .tertiaryLabelColor)
