@@ -5,9 +5,17 @@ import UsageLensKit
 /// UI 的入口视图：provider tab + 当前 provider 详情 + 底部刷新。
 public struct PanelView: View {
     @ObservedObject private var store: UsageStore
+    @StateObject private var launchAtLogin: LaunchAtLoginManager
+    private let showSettings: () -> Void
 
-    public init(store: UsageStore) {
+    @MainActor public init(
+        store: UsageStore,
+        launchAtLogin: LaunchAtLoginManager? = nil,
+        showSettings: @escaping () -> Void = {}
+    ) {
         self.store = store
+        _launchAtLogin = StateObject(wrappedValue: launchAtLogin ?? LaunchAtLoginManager())
+        self.showSettings = showSettings
     }
 
     public var body: some View {
@@ -19,7 +27,7 @@ public struct PanelView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 14)
             Divider().opacity(0.35)
-            FooterBar(store: store)
+            FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings)
         }
         .frame(width: Theme.panelWidth)
     }
@@ -427,7 +435,8 @@ struct MetricTile: View {
 
 struct FooterBar: View {
     @ObservedObject var store: UsageStore
-    @StateObject private var launchAtLogin = LaunchAtLoginManager()
+    @ObservedObject var launchAtLogin: LaunchAtLoginManager
+    let showSettings: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -437,34 +446,26 @@ struct FooterBar: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
-            launchAtLoginButton
+            settingsButton
             quitButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
 
-    private var launchAtLoginButton: some View {
+    private var settingsButton: some View {
         Button {
-            launchAtLogin.toggle()
+            showSettings()
         } label: {
-            Image(systemName: launchAtLogin.isEnabled ? "person.badge.clock.fill" : "person.badge.clock")
+            Image(systemName: "gearshape")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(launchAtLogin.isEnabled ? Color.accentColor : Color.secondary)
+                .foregroundStyle(.secondary)
                 .padding(5)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(launchAtLogin.isEnabled ? "已启用登录后启动；点此关闭" : "登录后启动 usage-lens")
-        .accessibilityLabel(launchAtLogin.isEnabled ? "关闭登录后启动" : "启用登录后启动")
-        .alert("登录后启动", isPresented: Binding(
-            get: { launchAtLogin.errorMessage != nil },
-            set: { if !$0 { launchAtLogin.dismissError() } }
-        )) {
-            Button("好", role: .cancel) { launchAtLogin.dismissError() }
-        } message: {
-            Text(launchAtLogin.errorMessage ?? "")
-        }
+        .help("配置")
+        .accessibilityLabel("配置")
     }
 
     private var refreshButton: some View {

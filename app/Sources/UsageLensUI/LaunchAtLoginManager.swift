@@ -27,6 +27,11 @@ public final class LaunchAtLoginManager: ObservableObject {
         }
     }
 
+    public func setEnabled(_ enabled: Bool) {
+        guard enabled != isEnabled else { return }
+        toggle()
+    }
+
     public func dismissError() {
         errorMessage = nil
     }

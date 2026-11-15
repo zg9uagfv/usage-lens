@@ -31,9 +31,9 @@ open dist/UsageLens.app         # 菜单栏常驻，无 Dock 图标
 > → 面板全显示「无数据」。要么把 `probes/` 一起放进去，要么显式指路：
 > `open --env USAGE_LENS_ROOT=/path/to/usage-lens dist/UsageLens.app`。
 
-菜单栏标签取当前最紧张的窗口（例 `Codex 5h 21%`）；点开是 Codex / DeepSeek 两个 tab，
-底部有刷新按钮与「N 分钟前更新」。Codex 还会显示从当天本地日志累计的「今日 tokens」
-（标记为“本地统计”，没有记录时不显示 0）。点击底部的人像时钟图标可开关“登录后启动”；
+菜单栏使用紧凑的“用量透镜”图标（悬停可查看当前最紧张窗口）；点开是 Codex / DeepSeek 两个 tab，
+底部有刷新按钮与「N 分钟前更新」及齿轮配置按钮。Codex 还会显示从当天本地日志累计的「今日 tokens」
+（标记为“本地统计”，没有记录时不显示 0）。齿轮配置页可开关“登录后启动”；
 它默认关闭，并使用 macOS 系统登录项服务。退出用面板右下角的电源按钮。
 
 > 沙箱环境提示：若 SwiftPM 报 `sandbox-exec: sandbox_apply: Operation not permitted`
@@ -57,6 +57,7 @@ Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/codex.py"
 | `USAGE_LENS_ROOT` | 指定仓库根（找 `probes/`），用于测试假探针或别的 worktree |
 | `USAGE_LENS_REFRESH_SECONDS` | 改轮询间隔，默认 60 |
 | `USAGE_LENS_DEBUG_SUMMARY` | `1` 时每轮把状态打到 stderr，便于验收/排障 |
+| `USAGE_LENS_SHOW_PANEL` | `1` 时额外打开普通窗口，便于菜单栏被隐藏时验收；正常使用不设置 |
 
 ## 状态约定
 
