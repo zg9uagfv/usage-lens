@@ -250,6 +250,21 @@ final class PanelRenderTests: XCTestCase {
         try render(PanelView(store: store), named: "07-codex-expired-windows", background: windowBackground)
     }
 
+    func testDebugSummaryRedactsSecrets() async throws {
+        let leaked = ProbeReport(
+            provider: ProviderCatalog.codex,
+            failure: "probe crash: Authorization: Bearer abc.def-123 / sk-abc123DEF456ghi789"
+        )
+        let store = makeStore(SequencedProbeProvider([ProviderCatalog.codex: [leaked]]))
+        await store.refreshAll()
+
+        let line = store.debugSummaryLine()
+        XCTAssertTrue(line.contains("***"))
+        XCTAssertFalse(line.contains("abc.def-123"))
+        XCTAssertFalse(line.contains("sk-abc123DEF456ghi789"))
+        XCTAssertTrue(line.contains("codex=failed"))
+    }
+
     func testMenuBarLabelUsesMostTenseWindow() async throws {
         let provider = SequencedProbeProvider([
             ProviderCatalog.codex: [Fixtures.codexReport()],

@@ -94,21 +94,29 @@ public final class UsageStore: ObservableObject {
         debugSummaryIfRequested()
     }
 
+    /// DEBUG_SUMMARY 的一行文案：只有 provider / 状态 / 百分比 / 失败原因，且统一脱敏。
+    /// 不输出环境变量，也不输出探针原始 stderr。
+    func debugSummaryLine() -> String {
+        let details = ProviderCatalog.all.map { provider -> String in
+            let state = state(for: provider)
+            let used = state.windows
+                .compactMap { $0.usedPercent.map { UsageFormat.percent($0) } }
+                .joined(separator: ",")
+            var detail = "\(provider.id)=\(statusName(state.status))[used=\(used.isEmpty ? "-" : used)]"
+            if let failure = state.failureReason {
+                detail += "[err=\(failure)]"
+            }
+            return detail
+        }.joined(separator: " ")
+        let label = mostTense?.compactLabel ?? "(无数据，仅图标)"
+        return SecretRedactor.redact("[usage-lens] menubar=\"\(label)\" \(details)")
+    }
+
     /// 仅用于验收/排障：把本轮状态打到 stderr（不落盘、不影响正常使用）。
     private func debugSummaryIfRequested() {
         guard ProcessInfo.processInfo.environment["USAGE_LENS_DEBUG_SUMMARY"] == "1" else { return }
-        let details = ProviderCatalog.all.map { provider in
-            let status = state(for: provider).status
-            let used = state(for: provider).windows
-                .compactMap { $0.usedPercent.map { UsageFormat.percent($0) } }
-                .joined(separator: ",")
-            return "\(provider.id)=\(statusName(status))[used=\(used.isEmpty ? "-" : used)]"
-        }.joined(separator: " ")
-        let label = mostTense?.compactLabel ?? "(无数据，仅图标)"
-        let line = "[usage-lens] menubar=\"\(label)\" \(details)\n"
-        if let data = line.data(using: .utf8) {
-            try? FileHandle.standardError.write(contentsOf: data)
-        }
+        guard let data = (debugSummaryLine() + "\n").data(using: .utf8) else { return }
+        try? FileHandle.standardError.write(contentsOf: data)
     }
 
     private func statusName(_ status: ProviderStatus) -> String {

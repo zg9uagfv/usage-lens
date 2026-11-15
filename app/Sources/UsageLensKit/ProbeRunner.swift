@@ -25,9 +25,11 @@ public struct ProbeReport: Sendable {
     ) {
         self.provider = provider
         self.envelope = envelope
-        self.failure = failure
+        // 进 UI 的失败文案与 warnings 统一在这里脱敏（stderr 也经由 failure 进来）。
+        self.failure = failure.map(SecretRedactor.redact)
         // 没显式给 warnings 时沿用 JSON 里的，避免调用方漏传。
-        self.warnings = warnings.isEmpty ? (envelope?.warnings ?? []) : warnings
+        let rawWarnings = warnings.isEmpty ? (envelope?.warnings ?? []) : warnings
+        self.warnings = rawWarnings.map(SecretRedactor.redact)
         self.finishedAt = finishedAt
         self.isMissingProbe = isMissingProbe
         self.duration = duration
@@ -150,40 +152,38 @@ public struct ProbeRunner: ProbeProviding {
         finishedAt: Date,
         duration: TimeInterval
     ) -> ProbeReport {
-        var report = ProbeReport(provider: provider, finishedAt: finishedAt, duration: duration)
-
         guard let envelope = ProbeJSON.decode(stdout) else {
             let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             let detail = trimmed.isEmpty
                 ? "探针没有输出内容"
                 : "探针输出无法解析为 JSON"
             let stderrLine = ProbeJSON.firstMeaningfulLine(stderr)
+            let failure: String
             if let stderrLine {
-                report.failure = "\(detail)（\(stderrLine)）"
+                failure = "\(detail)（\(stderrLine)）"
             } else if status != 0 {
-                report.failure = "\(detail)（退出码 \(status)）"
+                failure = "\(detail)（退出码 \(status)）"
             } else {
-                report.failure = detail
+                failure = detail
             }
-            return report
-        }
-
-        report.envelope = envelope
-        report.warnings = envelope.warnings
-
-        if let mismatch = envelope.schemaMismatch {
-            report.failure = mismatch
-            return report
-        }
-
-        if let error = envelope.error, !error.isEmpty {
-            report.failure = error
-            return report
+            return ProbeReport(provider: provider, failure: failure, finishedAt: finishedAt, duration: duration)
         }
 
         // 探针的失败信息以 JSON 里的 `error` / `warnings` 为准。
         // exit code 只在拿不到 JSON 时作为补充线索，避免把「exit 非 0 但给了数据」误判成无数据。
-        return report
+        var failure: String?
+        if let mismatch = envelope.schemaMismatch {
+            failure = mismatch
+        } else if let error = envelope.error, !error.isEmpty {
+            failure = error
+        }
+        return ProbeReport(
+            provider: provider,
+            envelope: envelope,
+            failure: failure,
+            finishedAt: finishedAt,
+            duration: duration
+        )
     }
 
     // MARK: 进程

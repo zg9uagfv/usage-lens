@@ -155,6 +155,68 @@ final class FormattingTests: XCTestCase {
     }
 }
 
+final class SecretRedactorTests: XCTestCase {
+    func testRedactsOpenAIKey() {
+        let output = SecretRedactor.redact("调用失败 sk-abc123DEF456ghi789，请重试")
+        XCTAssertTrue(output.contains("***"))
+        XCTAssertFalse(output.contains("sk-abc123"))
+        XCTAssertTrue(output.contains("请重试"))
+    }
+
+    func testRedactsBearerToken() {
+        let output = SecretRedactor.redact("header Authorization: Bearer abc.def-123 sent")
+        XCTAssertTrue(output.contains("***"))
+        XCTAssertFalse(output.contains("abc.def-123"))
+        XCTAssertTrue(output.contains("header"))
+    }
+
+    func testRedactsKeyValueInURL() {
+        let output = SecretRedactor.redact("GET https://api.example.com/user/balance?key=supersecret123 failed")
+        XCTAssertTrue(output.contains("***"))
+        XCTAssertFalse(output.contains("supersecret123"))
+        XCTAssertTrue(output.contains("https://api.example.com"))
+    }
+
+    func testRedactsLongRandomRun() {
+        let run = String(repeating: "A1b2C3d4", count: 4) // 32 字符
+        let output = SecretRedactor.redact("payload \(run) end")
+        XCTAssertTrue(output.contains("***"))
+        XCTAssertFalse(output.contains(run))
+        XCTAssertTrue(output.contains("payload"))
+    }
+
+    func testKeepsNormalChineseText() {
+        XCTAssertEqual(SecretRedactor.redact("探针超时（>6s）"), "探针超时（>6s）")
+        XCTAssertEqual(SecretRedactor.redact("日志目录不存在，请检查 ~/.codex"), "日志目录不存在，请检查 ~/.codex")
+        XCTAssertEqual(SecretRedactor.redact("schema 不符：usage-lens/probe@0"), "schema 不符：usage-lens/probe@0")
+    }
+
+    func testStderrReachingUIIsRedacted() {
+        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let report = runner.decode(
+            provider: ProviderCatalog.codex,
+            stdout: "",
+            stderr: "boom sk-abcdefgh12345 Bearer token.value\nline two",
+            status: 1,
+            finishedAt: Date(),
+            duration: 0.01
+        )
+        let failure = report.failure ?? ""
+        XCTAssertTrue(failure.contains("***"))
+        XCTAssertFalse(failure.contains("sk-abcdefgh12345"))
+        XCTAssertFalse(failure.contains("token.value"))
+        XCTAssertTrue(failure.contains("boom"))
+    }
+
+    func testWarningsAreRedactedToo() {
+        let report = ProbeReport(
+            provider: ProviderCatalog.deepseek,
+            envelope: ProbeEnvelope(provider: "deepseek", warnings: ["余额查询失败 key=abc123secret"])
+        )
+        XCTAssertEqual(report.warnings, ["余额查询失败 ***"])
+    }
+}
+
 final class StateReducerTests: XCTestCase {
     private func envelope(percent: Double?) -> ProbeEnvelope {
         ProbeEnvelope(
