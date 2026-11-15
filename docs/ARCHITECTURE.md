@@ -61,7 +61,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 | `basis` | `server` = 服务端返回；`local` = 本地推导。App 上要能看出区别 |
 | `resets_at` | UTC ISO8601，或 `null` |
 | `balance` | `{ "amount": 12.34, "currency": "CNY", "source": "official" }` 或 `null` |
-| `spend` | `{ "today": 0.5, "window": 3.2, "currency": "CNY", "source": "estimate" }` 或 `null` |
+| `spend` | `{ "today": 0.5, "window": 3.2, "total": 9.1, "currency": "CNY", "source": "estimate" }` 或 `null`。`window` 固定为**近 7 天**（含今天，按事件日/会话创建日过滤），`total` 为全部可读记录，`today` 为当天；`coverage.note` 必须写明「window=近 7 天，total=全部可读记录」 |
 | `coverage` | 数据实际覆盖区间；无数据时如实写 |
 | `warnings` | 人话，直接进 UI。例："余额需要 API key" |
 | `error` | 致命错误的人话描述；非空时 App 显示错误态而非 0 |
