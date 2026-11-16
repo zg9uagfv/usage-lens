@@ -1,13 +1,12 @@
 import SwiftUI
 import UsageLensKit
 
-/// 配置页：外观主题、自定义模型名称与登录后启动选项。
+/// 配置页：外观主题、模型厂商与登录后启动选项。
 public struct SettingsPanelView: View {
     @ObservedObject public var launchAtLogin: LaunchAtLoginManager
     @Environment(\.colorScheme) private var systemColorScheme
-    @AppStorage("usageLens.customModels") private var storedModels = ""
+    @AppStorage("usageLens.providers") private var storedProviderIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
-    @State private var modelDraft = ""
     @State private var apiKeyDraft = ""
     @State private var hasSavedAPIKey = DeepSeekAPIKeyStore.hasSavedKey
     @State private var apiKeyStatus: String?
@@ -109,43 +108,45 @@ public struct SettingsPanelView: View {
 
             Divider()
 
-            Text("自定义模型")
+            Text("模型厂商")
                 .font(.system(size: 13, weight: .semibold))
 
-            HStack(spacing: 6) {
-                TextField("例如 gpt-5-codex", text: $modelDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addModel)
-                Button("添加", action: addModel)
-                    .disabled(normalizedDraft.isEmpty || models.contains(normalizedDraft))
-            }
-
-            if models.isEmpty {
-                Text("还没有自定义模型。")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(spacing: 5) {
-                    ForEach(models, id: \.self) { model in
-                        HStack {
-                            Text(model)
-                                .font(.system(size: 11))
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            Button {
-                                storedModels = models.filter { $0 != model }.joined(separator: "\n")
+            VStack(spacing: 5) {
+                ForEach(activeProviders) { provider in
+                    HStack(spacing: 8) {
+                        Image(systemName: "building.2.crop.circle")
+                            .foregroundStyle(UsageLensTheme.current.accent)
+                        Text(provider.displayName)
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer(minLength: 4)
+                        if provider.id != ProviderCatalog.codex.id {
+                            Button(role: .destructive) {
+                                setProviderEnabled(provider, enabled: false)
                             } label: {
                                 Image(systemName: "minus.circle")
                                     .foregroundStyle(.secondary)
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("删除模型 \(model)")
+                            .accessibilityLabel("删除模型厂商 \(provider.displayName)")
                         }
                     }
+                    .padding(.vertical, 3)
                 }
             }
 
-            Text("模型名称保存在本机配置中。")
+            Menu {
+                ForEach(addableProviders) { provider in
+                    Button("添加 \(provider.displayName)") {
+                        setProviderEnabled(provider, enabled: true)
+                    }
+                }
+            } label: {
+                Label("添加模型厂商", systemImage: "plus.circle")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .disabled(addableProviders.isEmpty)
+
+            Text("管理要显示的模型厂商。模型用量来自各厂商的本地记录或探针。")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
           }
@@ -157,12 +158,25 @@ public struct SettingsPanelView: View {
         .preferredColorScheme(UsageLensTheme.current.colorScheme)
     }
 
-    private var models: [String] {
-        storedModels.split(separator: "\n").map(String.init)
+    private var activeProviders: [Provider] {
+        let ids = Set(storedProviderIDs.split(separator: ",").map(String.init))
+        let providers = ProviderCatalog.available.filter { ids.contains($0.id) }
+        return providers.isEmpty ? [ProviderCatalog.codex] : providers
     }
 
-    private var normalizedDraft: String {
-        modelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    private var addableProviders: [Provider] {
+        let activeIDs = Set(activeProviders.map(\.id))
+        return ProviderCatalog.available.filter { !activeIDs.contains($0.id) }
+    }
+
+    private func setProviderEnabled(_ provider: Provider, enabled: Bool) {
+        var ids = activeProviders.map(\.id)
+        if enabled, !ids.contains(provider.id) {
+            ids.append(provider.id)
+        } else if !enabled, provider.id != ProviderCatalog.codex.id {
+            ids.removeAll { $0 == provider.id }
+        }
+        storedProviderIDs = ids.joined(separator: ",")
     }
 
     private var trimmedAPIKey: String {
@@ -193,10 +207,4 @@ public struct SettingsPanelView: View {
         }
     }
 
-    private func addModel() {
-        let model = normalizedDraft
-        guard !model.isEmpty, !models.contains(model) else { return }
-        storedModels = (models + [model]).joined(separator: "\n")
-        modelDraft = ""
-    }
 }

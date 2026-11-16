@@ -3,7 +3,7 @@ import Combine
 import Foundation
 import UsageLensKit
 
-/// UI 的唯一数据源：定时跑三个探针，把结果归约成每个 provider 的状态。
+/// UI 的唯一数据源：定时跑已启用的探针，把结果归约成每个 provider 的状态。
 @MainActor
 public final class UsageStore: ObservableObject {
     @Published public private(set) var states: [Provider: ProviderState]
@@ -52,7 +52,7 @@ public final class UsageStore: ObservableObject {
 
     /// 菜单栏标签取的数据：跨 provider 最紧张的窗口。
     public var mostTense: TensionWindow? {
-        Tension.mostTense(in: ProviderCatalog.all.map(state(for:)))
+        Tension.mostTense(in: ProviderCatalog.active.map(state(for:)))
     }
 
     public func refresh() {
@@ -81,13 +81,13 @@ public final class UsageStore: ObservableObject {
     public func refreshAll() async {
         guard !isRefreshing else { return }
         isRefreshing = true
-        for provider in ProviderCatalog.all {
+        for provider in ProviderCatalog.active {
             states[provider]?.isRefreshing = true
         }
 
         let probe = self.provider
         let reports = await withTaskGroup(of: ProbeReport.self, returning: [ProbeReport].self) { group in
-            for provider in ProviderCatalog.all {
+            for provider in ProviderCatalog.active {
                 group.addTask { await probe.report(for: provider) }
             }
             var collected: [ProbeReport] = []
@@ -106,7 +106,7 @@ public final class UsageStore: ObservableObject {
     /// DEBUG_SUMMARY 的一行文案：只有 provider / 状态 / 百分比 / 失败原因，且统一脱敏。
     /// 不输出环境变量，也不输出探针原始 stderr。
     func debugSummaryLine() -> String {
-        let details = ProviderCatalog.all.map { provider -> String in
+        let details = ProviderCatalog.active.map { provider -> String in
             let state = state(for: provider)
             let used = state.windows
                 .compactMap { $0.usedPercent.map { UsageFormat.percent($0) } }
