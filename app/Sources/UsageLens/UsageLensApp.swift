@@ -12,7 +12,12 @@ struct UsageLensApp: App {
     var body: some Scene {
         // 状态栏和弹窗由 AppDelegate 创建。SwiftUI 的 MenuBarExtra 在某些 ad-hoc
         // bundle 上会运行但不现身；直接注册 NSStatusItem 更可靠。
+        // 配置由 AppDelegate 的自定义 NSWindow 承载，禁用 SwiftUI 自动附带的
+        // 「usage-lens 设置」窗口，避免关闭配置时又弹出一个空的大窗口。
         Settings { EmptyView() }
+            .commands {
+                CommandGroup(replacing: .appSettings) { }
+            }
     }
 }
 
@@ -32,12 +37,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 菜单栏常驻，不占 Dock。
         NSApp.setActivationPolicy(.accessory)
+        closeRestoredSwiftUISettingsWindow()
+        // SwiftUI 的 Settings scene 可能在 didFinish 后才被窗口恢复机制创建。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.closeRestoredSwiftUISettingsWindow()
+        }
 
         popover.behavior = .transient
         popover.contentSize = NSSize(width: 340, height: 560)
         popover.contentViewController = NSHostingController(rootView: panelView)
 
-        // 固定为紧凑图标。可变长度的「Codex 5h 45%」在菜单栏拥挤时会被系统挤出。
         let item = NSStatusBar.system.statusItem(withLength: 32)
         item.button?.target = self
         item.button?.action = #selector(togglePopover(_:))
@@ -66,6 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openEyesTimer?.invalidate()
         openEyesTimer = nil
         statusItem?.button?.layer?.removeAnimation(forKey: "usageLens.criticalPulse")
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        closeRestoredSwiftUISettingsWindow()
     }
 
     @objc private func blink() {
@@ -165,5 +178,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         settingsPanel = panel
+    }
+
+    private func closeRestoredSwiftUISettingsWindow() {
+        for window in NSApp.windows where window.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" {
+            window.isRestorable = false
+            window.orderOut(nil)
+            window.close()
+        }
     }
 }
