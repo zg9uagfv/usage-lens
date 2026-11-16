@@ -7,6 +7,7 @@ public struct PanelView: View {
     @ObservedObject private var store: UsageStore
     @StateObject private var launchAtLogin: LaunchAtLoginManager
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
+    @AppStorage("usageLens.providers") private var providerIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
     private let showSettings: () -> Void
 
     @MainActor public init(
@@ -35,6 +36,13 @@ public struct PanelView: View {
         .background(selectedTheme.panelBackground)
         .tint(selectedTheme.accent)
         .preferredColorScheme(selectedTheme.colorScheme)
+        .onChange(of: providerIDs) { _, _ in
+            let active = ProviderCatalog.active
+            if !active.contains(store.selected) {
+                store.selected = active.first ?? ProviderCatalog.codex
+            }
+            store.refresh()
+        }
     }
 }
 
@@ -45,7 +53,7 @@ struct ProviderTabBar: View {
 
     var body: some View {
         HStack(spacing: 3) {
-            ForEach(ProviderCatalog.all) { provider in
+            ForEach(ProviderCatalog.active) { provider in
                 let isSelected = store.selected == provider
                 Button {
                     store.selected = provider
