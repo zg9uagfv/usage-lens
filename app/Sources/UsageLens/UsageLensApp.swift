@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 import SwiftUI
 import UsageLensKit
 import UsageLensUI
@@ -24,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stateSubscription: AnyCancellable?
     private var blinkTimer: Timer?
     private var openEyesTimer: Timer?
+    private var isCriticalUsage = false
     private var developmentPanel: NSPanel?
     private var settingsPanel: NSWindow?
 
@@ -41,7 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.action = #selector(togglePopover(_:))
         item.button?.sendAction(on: [.leftMouseUp])
         item.button?.imagePosition = .imageOnly
-        item.button?.image = MenuBarIcon.make()
+        item.button?.wantsLayer = true
+        updateIcon()
         statusItem = item
         blinkTimer = Timer.scheduledTimer(timeInterval: 3.2, target: self, selector: #selector(blink), userInfo: nil, repeats: true)
 
@@ -62,16 +65,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         blinkTimer = nil
         openEyesTimer?.invalidate()
         openEyesTimer = nil
+        statusItem?.button?.layer?.removeAnimation(forKey: "usageLens.criticalPulse")
     }
 
     @objc private func blink() {
-        statusItem?.button?.image = MenuBarIcon.make(blinking: true)
+        updateIcon(blinking: true)
         openEyesTimer?.invalidate()
         openEyesTimer = Timer.scheduledTimer(timeInterval: 0.16, target: self, selector: #selector(openEyes), userInfo: nil, repeats: false)
     }
 
     @objc private func openEyes() {
-        statusItem?.button?.image = MenuBarIcon.make()
+        updateIcon()
     }
 
     @objc private func togglePopover(_ sender: Any?) {
@@ -87,7 +91,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusLabel() {
         guard let button = statusItem?.button else { return }
         button.title = ""
-        button.toolTip = "usage-lens"
+        let shouldAlert = store.hasCriticalUsage
+        if isCriticalUsage != shouldAlert {
+            isCriticalUsage = shouldAlert
+            updateIcon()
+            updateCriticalPulse()
+        }
+        button.toolTip = shouldAlert ? "usage-lens：用量已达 90%" : "usage-lens"
+    }
+
+    private func updateIcon(blinking: Bool = false) {
+        statusItem?.button?.image = MenuBarIcon.make(blinking: blinking, alert: isCriticalUsage)
+    }
+
+    private func updateCriticalPulse() {
+        guard let layer = statusItem?.button?.layer else { return }
+        layer.removeAnimation(forKey: "usageLens.criticalPulse")
+        guard isCriticalUsage, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+
+        let pulse = CABasicAnimation(keyPath: "transform.scale")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.84
+        pulse.duration = 0.62
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(pulse, forKey: "usageLens.criticalPulse")
     }
 
     private func showDevelopmentPanel() {
