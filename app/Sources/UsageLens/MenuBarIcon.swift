@@ -1,32 +1,29 @@
 import AppKit
 
-/// 状态栏专用的单色模板图标：透镜代表“查看”，柱条代表“用量”。
+/// 两只简洁的菜单栏眼睛；眨眼时将眼睛画成短弧线。
 enum MenuBarIcon {
-    static func make() -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18))
+    static func make(blinking: Bool = false) -> NSImage {
+        let image = NSImage(size: NSSize(width: 24, height: 20))
         image.lockFocus()
         NSColor.black.setStroke()
+        NSColor.black.setFill()
 
-        let lens = NSBezierPath(ovalIn: NSRect(x: 2, y: 5, width: 9, height: 9))
-        lens.lineWidth = 1.5
-        lens.stroke()
-
-        let handle = NSBezierPath()
-        handle.move(to: NSPoint(x: 9.5, y: 6.5))
-        handle.line(to: NSPoint(x: 15, y: 1.5))
-        handle.lineWidth = 1.8
-        handle.lineCapStyle = .round
-        handle.stroke()
-
-        // 透镜内的三根柱条，保持 1px 级别，适合 macOS 菜单栏的紧凑尺寸。
-        for (x, height) in [(4.5, 2.0), (6.5, 4.0), (8.5, 6.0)] {
-            let bar = NSBezierPath()
-            bar.move(to: NSPoint(x: x, y: 6.5))
-            bar.line(to: NSPoint(x: x, y: 6.5 + height))
-            bar.lineWidth = 1.2
-            bar.lineCapStyle = .round
-            bar.stroke()
+        for centerX in [7.0, 17.0] {
+            if blinking {
+                let lid = NSBezierPath()
+                lid.move(to: NSPoint(x: centerX - 3.7, y: 10))
+                lid.curve(to: NSPoint(x: centerX + 3.7, y: 10), controlPoint1: NSPoint(x: centerX - 1.8, y: 13), controlPoint2: NSPoint(x: centerX + 1.8, y: 13))
+                lid.lineWidth = 1.9
+                lid.lineCapStyle = .round
+                lid.stroke()
+            } else {
+                let eye = NSBezierPath(ovalIn: NSRect(x: centerX - 3.7, y: 5, width: 7.4, height: 10))
+                eye.lineWidth = 1.7
+                eye.stroke()
+                NSBezierPath(ovalIn: NSRect(x: centerX - 1.1, y: 8.1, width: 2.2, height: 2.5)).fill()
+            }
         }
+
         image.unlockFocus()
         image.isTemplate = true
         return image

@@ -6,6 +6,7 @@ import UsageLensKit
 public struct PanelView: View {
     @ObservedObject private var store: UsageStore
     @StateObject private var launchAtLogin: LaunchAtLoginManager
+    @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
     private let showSettings: () -> Void
 
     @MainActor public init(
@@ -30,6 +31,9 @@ public struct PanelView: View {
             FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings)
         }
         .frame(width: Theme.panelWidth)
+        .background(UsageLensTheme.current.panelBackground)
+        .tint(UsageLensTheme.current.accent)
+        .preferredColorScheme(UsageLensTheme.current.colorScheme)
     }
 }
 

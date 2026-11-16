@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var stateSubscription: AnyCancellable?
+    private var blinkTimer: Timer?
+    private var openEyesTimer: Timer?
     private var developmentPanel: NSPanel?
     private var settingsPanel: NSPanel?
 
@@ -34,13 +36,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(rootView: panelView)
 
         // 固定为紧凑图标。可变长度的「Codex 5h 45%」在菜单栏拥挤时会被系统挤出。
-        let item = NSStatusBar.system.statusItem(withLength: 26)
+        let item = NSStatusBar.system.statusItem(withLength: 32)
         item.button?.target = self
         item.button?.action = #selector(togglePopover(_:))
         item.button?.sendAction(on: [.leftMouseUp])
         item.button?.imagePosition = .imageOnly
         item.button?.image = MenuBarIcon.make()
         statusItem = item
+        blinkTimer = Timer.scheduledTimer(timeInterval: 3.2, target: self, selector: #selector(blink), userInfo: nil, repeats: true)
 
         stateSubscription = store.objectWillChange.sink { [weak self] _ in
             // objectWillChange 在属性更新前发出，下一轮主队列再读取才能得到新标签。
@@ -52,6 +55,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["USAGE_LENS_SHOW_PANEL"] == "1" {
             showDevelopmentPanel()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        openEyesTimer?.invalidate()
+        openEyesTimer = nil
+    }
+
+    @objc private func blink() {
+        statusItem?.button?.image = MenuBarIcon.make(blinking: true)
+        openEyesTimer?.invalidate()
+        openEyesTimer = Timer.scheduledTimer(timeInterval: 0.16, target: self, selector: #selector(openEyes), userInfo: nil, repeats: false)
+    }
+
+    @objc private func openEyes() {
+        statusItem?.button?.image = MenuBarIcon.make()
     }
 
     @objc private func togglePopover(_ sender: Any?) {
@@ -103,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 190),
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 460),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
