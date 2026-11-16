@@ -9,7 +9,7 @@
 | Provider | 展示内容 | 数据来源 | 状态 |
 |---|---|---|---|
 | Codex | 5h / 7d 已用百分比、重置时间、plan、今日 tokens | 本地日志 `event_msg.token_count.rate_limits` / `token_usage_record` | 可做，已实测 |
-| DeepSeek | 余额（需 key）+ 今日/窗口花费估算；**无窗口百分比** | `/user/balance` + 本地 `tokenUsage.totals` | 可做，余额需 key |
+| DeepSeek | 余额（配置页可存 API key）+ 今日/窗口花费估算；**无窗口百分比** | `/user/balance` + 本地 `tokenUsage.totals` | 可做，余额需 key |
 Antigravity / Grok / Claude：首版不做（用户明确排除）。
 
 Claude 排除原因（2026-11-15 决定）：接口非官方、需读钥匙串凭据，而"只读不刷新"又会在 token 过期时长期显示陈旧值，收益不抵复杂度。调研结论留档在 `docs/RESEARCH_claude-usage.md`，将来要做时可直接接探针架构，App 侧不用改。

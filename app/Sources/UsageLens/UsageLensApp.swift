@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 520),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -131,7 +131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.title = "UsageLens 配置"
         panel.isReleasedWhenClosed = false
         panel.contentViewController = NSHostingController(
-            rootView: SettingsPanelView(launchAtLogin: launchAtLogin)
+            rootView: SettingsPanelView(launchAtLogin: launchAtLogin) { [weak self] in
+                self?.store.refresh()
+            }
         )
         panel.center()
         panel.makeKeyAndOrderFront(nil)

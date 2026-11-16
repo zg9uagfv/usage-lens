@@ -93,7 +93,7 @@ public enum RepoLocator {
 
 // MARK: - 执行探针
 
-/// 只做三件事：定位脚本、跑它、解析 stdout。不碰凭据、不写文件、不发网络请求。
+/// 定位脚本、运行并解析 stdout。DeepSeek 凭据只从钥匙串传给 DeepSeek 探针子进程。
 public struct ProbeRunner: ProbeProviding {
     public var root: URL?
     public var timeout: TimeInterval
@@ -126,7 +126,12 @@ public struct ProbeRunner: ProbeProviding {
             )
         }
 
-        let execution = await execute(probe: probeURL, workingDirectory: resolvedRoot, timeout: timeout)
+        let execution = await execute(
+            probe: probeURL,
+            workingDirectory: resolvedRoot,
+            timeout: timeout,
+            provider: provider
+        )
         let duration = Date().timeIntervalSince(started)
 
         switch execution {
@@ -225,7 +230,12 @@ public struct ProbeRunner: ProbeProviding {
     /// 1. 绝不能先 `waitUntilExit()` 再读（>64KB 会死锁）；
     /// 2. 等 reader 的上限必须真的可超时，不能挂在不可取消的 continuation 上；
     /// 3. 子进程继承管道时，到点直接停读（等价于关读端），别等它退出。
-    func execute(probe: URL, workingDirectory: URL, timeout: TimeInterval) async -> ProbeProcessResult {
+    func execute(
+        probe: URL,
+        workingDirectory: URL,
+        timeout: TimeInterval,
+        provider: Provider? = nil
+    ) async -> ProbeProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", probe.path]
@@ -238,6 +248,11 @@ public struct ProbeRunner: ProbeProviding {
         // 契约要求 stdout 无颜色码；这里兜底，免得解析被 ANSI 污染。
         environment["NO_COLOR"] = "1"
         environment["TERM"] = "dumb"
+        if provider?.id == ProviderCatalog.deepseek.id,
+           let key = DeepSeekAPIKeyStore.load() {
+            // 仅注入 DeepSeek 探针；不会传给 Codex 或写入日志 / 文件。
+            environment["DEEPSEEK_API_KEY"] = key
+        }
         process.environment = environment
 
         let stdoutPipe = Pipe()

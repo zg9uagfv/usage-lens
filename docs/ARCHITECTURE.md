@@ -1,7 +1,7 @@
 # usage-lens 架构与探针契约 v1
 
-决定：**provider 适配全部做成独立命令行探针，App 只读 JSON。**
-好处是每个 provider 可以单独开发、单独验收、单独替换；App 不需要碰任何凭据或日志格式。
+决定：**provider 的数据读取全部做成独立命令行探针，App 负责 JSON 契约与展示。**
+每个 provider 可以单独开发、单独验收、单独替换；App 不解析会话日志。DeepSeek API Key 是例外：用户在配置页输入后存入 macOS 钥匙串，由 App 仅传给 DeepSeek 探针进程。
 
 ```
 probes/codex.py      → stdout: usage-lens/probe@1 JSON
@@ -17,7 +17,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 - 成功：exit 0，stdout 只有一个 JSON 对象；stdout 不许有日志、颜色码、进度提示。
 - 失败：stderr 写原因，stdout 仍输出 JSON（见 `error` 字段），exit code 非 0。
 - 探针耗时目标 < 400ms（只读本地文件）；网络探针（DeepSeek 余额）超时上限 3s。
-- **禁止**输出任何 token / key / 密码明文，禁止写入文件，禁止修改任何应用配置或登录态。
+- **禁止**输出任何 token / key / 密码明文，禁止探针写入文件或修改任何应用配置 / 登录态。DeepSeek API Key 存在 macOS 钥匙串，不进入普通配置文件；App 只在启动 DeepSeek 探针时读取并通过子进程环境变量传递。
 - 走网络时必须只请求官方域名。
 
 ### 1.1 JSON 结构
@@ -95,7 +95,7 @@ provider 列表由 App 侧一张配置表决定（id / 显示名 / 探针路径�
 - 自动刷新 60s；探针失败显示上一次成功值 + 灰化 + 警告文案。
 - `expired: true` 的窗口显示「窗口已过期（数据 X 天前）」，不显示倒计时；`stale: true` 的整块灰化。
 - 深浅色跟随系统；窗口无数据时显示「无数据」，**绝不显示 0%**。
-- 不读取、不落盘、不打印任何凭据。
+- 凭据只保存在 macOS 钥匙串；只传给需要它的 DeepSeek 探针，不写普通文件或日志。
 
 ## 4. 验收口径
 
