@@ -5,11 +5,13 @@ public struct Provider: Identifiable, Hashable, Sendable {
     public let id: String
     public let displayName: String
     public let probeRelativePath: String
+    public let requiresAPIKey: Bool
 
-    public init(id: String, displayName: String, probeRelativePath: String) {
+    public init(id: String, displayName: String, probeRelativePath: String, requiresAPIKey: Bool = false) {
         self.id = id
         self.displayName = displayName
         self.probeRelativePath = probeRelativePath
+        self.requiresAPIKey = requiresAPIKey
     }
 
     public var probeFileName: String {
@@ -27,7 +29,8 @@ public enum ProviderCatalog {
     public static let deepseek = Provider(
         id: "deepseek",
         displayName: "DeepSeek",
-        probeRelativePath: "probes/deepseek.py"
+        probeRelativePath: "probes/deepseek.py",
+        requiresAPIKey: true
     )
 
     public static let gemini = Provider(
