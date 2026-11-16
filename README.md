@@ -37,7 +37,7 @@ UsageLens 是一个 SwiftUI macOS 菜单栏用量看板。它从本机 Codex 与
 | **Codex** | 5 小时与 7 天配额、重置倒计时、计划类型、今日 tokens | `~/.codex/sessions/` 本地会话日志 |
 | **DeepSeek** | 账户余额、今日与近 7 天花费估算 | 官方余额接口 + 本地 DeepSeek 会话记录 |
 
-DeepSeek 余额查询需要设置 `DEEPSEEK_API_KEY`。UsageLens 只向 `https://api.deepseek.com` 查询余额；缺少 key 时仍会尝试展示本地花费估算。花费是根据本地 token 记录和公开牌价计算的估值，不等同于官方账单。
+DeepSeek 余额查询需要 API Key，可在面板的齿轮配置页添加；密钥保存在 macOS 钥匙串，并只传给 DeepSeek 探针。也支持 `DEEPSEEK_API_KEY` 环境变量用于开发。UsageLens 只向 `https://api.deepseek.com` 查询余额；缺少 key 时仍会尝试展示本地花费估算。花费是根据本地 token 记录和公开牌价计算的估值，不等同于官方账单。
 
 ### 界面主题
 
@@ -62,7 +62,7 @@ open dist/UsageLens.app
 open --env USAGE_LENS_ROOT=/path/to/usage-lens app/dist/UsageLens.app
 ```
 
-DeepSeek 余额查询示例：
+开发时也可以通过环境变量提供 DeepSeek API Key：
 
 ```bash
 export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
@@ -80,7 +80,7 @@ swift test
 ## 隐私与数据口径
 
 - Codex 与 DeepSeek 的会话记录只在本机读取；UsageLens 不提供云同步或遥测。
-- DeepSeek 余额请求会把 API key 发送给 DeepSeek 官方 API，以便验证账户并读取余额。应用不会输出或保存 key，也拒绝跟随重定向。
+- DeepSeek API Key 保存于 macOS 登录钥匙串，不写入普通配置文件或日志；查询余额时会发送给 DeepSeek 官方 API。应用拒绝跟随重定向。
 - 没有数据时显示“无数据”，不会把未知值伪装成 `0`；读取失败会显示原因，并在适用时保留上次成功值。
 - DeepSeek 没有窗口配额，因此不绘制百分比进度条；本地花费估算会标明来源。
 - 配置页里的“自定义模型”目前只保存模型名称，不会生成按模型拆分的用量统计。

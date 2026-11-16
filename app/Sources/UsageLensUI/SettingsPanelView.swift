@@ -1,4 +1,5 @@
 import SwiftUI
+import UsageLensKit
 
 /// 配置页：外观主题、自定义模型名称与登录后启动选项。
 public struct SettingsPanelView: View {
@@ -7,9 +8,18 @@ public struct SettingsPanelView: View {
     @AppStorage("usageLens.customModels") private var storedModels = ""
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
     @State private var modelDraft = ""
+    @State private var apiKeyDraft = ""
+    @State private var hasSavedAPIKey = DeepSeekAPIKeyStore.hasSavedKey
+    @State private var apiKeyStatus: String?
 
-    public init(launchAtLogin: LaunchAtLoginManager) {
+    private let onAPIKeyChange: () -> Void
+
+    public init(
+        launchAtLogin: LaunchAtLoginManager,
+        onAPIKeyChange: @escaping () -> Void = {}
+    ) {
         self.launchAtLogin = launchAtLogin
+        self.onAPIKeyChange = onAPIKeyChange
     }
 
     public var body: some View {
@@ -67,6 +77,38 @@ public struct SettingsPanelView: View {
 
             Divider()
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("DeepSeek API Key")
+                    .font(.system(size: 13, weight: .semibold))
+
+                SecureField("粘贴 DeepSeek API Key", text: $apiKeyDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(saveAPIKey)
+
+                HStack(spacing: 8) {
+                    Button("保存到钥匙串", action: saveAPIKey)
+                        .disabled(trimmedAPIKey.isEmpty)
+                    if hasSavedAPIKey {
+                        Button("删除", role: .destructive, action: deleteAPIKey)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                Text(hasSavedAPIKey ? "已安全保存在本机钥匙串。" : "尚未设置；本地花费估算仍可使用，余额查询需要 API Key。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let apiKeyStatus {
+                    Text(apiKeyStatus)
+                        .font(.system(size: 10))
+                        .foregroundStyle(apiKeyStatus.contains("失败") ? .orange : .green)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Divider()
+
             Text("自定义模型")
                 .font(.system(size: 13, weight: .semibold))
 
@@ -109,7 +151,7 @@ public struct SettingsPanelView: View {
           }
           .padding(20)
         }
-        .frame(width: 320, height: 420, alignment: .topLeading)
+        .frame(width: 340, height: 480, alignment: .topLeading)
         .background(UsageLensTheme.current.panelBackground)
         .tint(UsageLensTheme.current.accent)
         .preferredColorScheme(UsageLensTheme.current.colorScheme)
@@ -121,6 +163,34 @@ public struct SettingsPanelView: View {
 
     private var normalizedDraft: String {
         modelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedAPIKey: String {
+        apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func saveAPIKey() {
+        do {
+            try DeepSeekAPIKeyStore.save(trimmedAPIKey)
+            hasSavedAPIKey = true
+            apiKeyDraft = ""
+            apiKeyStatus = "已保存，正在刷新 DeepSeek 数据…"
+            onAPIKeyChange()
+        } catch {
+            apiKeyStatus = "保存失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func deleteAPIKey() {
+        do {
+            try DeepSeekAPIKeyStore.delete()
+            hasSavedAPIKey = false
+            apiKeyDraft = ""
+            apiKeyStatus = "已从钥匙串删除。"
+            onAPIKeyChange()
+        } catch {
+            apiKeyStatus = "删除失败：\(error.localizedDescription)"
+        }
     }
 
     private func addModel() {

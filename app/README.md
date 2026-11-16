@@ -21,8 +21,9 @@ open --env USAGE_LENS_ROOT=/path/to/usage-lens dist/UsageLens.app
 
 - 菜单栏显示一双定时眨眼的眼睛；点击打开 Codex / DeepSeek 用量面板。
 - 配置页提供科技感、二次元、跟随系统三种主题，以及登录后启动开关。
+- DeepSeek API Key 可在配置页安全保存到 macOS 钥匙串；它只会注入 DeepSeek 探针进程。
 - 自定义模型名称保存在本机配置中；当前不参与按模型拆分的用量统计。
-- Codex 今日 token 数来自本地日志；DeepSeek 花费为本地记录估算，余额查询需设置 `DEEPSEEK_API_KEY`。
+- Codex 今日 token 数来自本地日志；DeepSeek 花费为本地记录估算，余额查询需要 API Key。
 
 ## 开发环境变量
 
