@@ -64,6 +64,9 @@ public enum RepoLocator {
         }
 
         var seeds: [URL] = [bundleURL]
+        if let resourcesURL = Bundle(url: bundleURL)?.resourceURL {
+            seeds.append(resourcesURL)
+        }
         if let executableURL {
             seeds.append(executableURL.deletingLastPathComponent())
         }
