@@ -18,6 +18,12 @@ Codex 配额与本地 token 统计 · DeepSeek 余额与花费估算 · 三种�
 
 <p align="center"><sub>科技感 · 二次元 · 跟随系统。截图使用演示数据，不包含真实账号或用量。</sub></p>
 
+<p align="center">
+  <img src="docs/screenshots/deepseek.png" width="300" alt="DeepSeek 余额和本地花费估算">
+</p>
+
+<p align="center"><sub>DeepSeek 标签页：余额来自官方接口，今日与近 7 天花费为本地估算。</sub></p>
+
 ## 这个项目做什么
 
 UsageLens 是一个 SwiftUI macOS 菜单栏用量看板。它从本机 Codex 与 DeepSeek 的日志读取数据，用小面板展示配额窗口、重置时间、余额和用量；不需要打开多个开发工具，也不把本地会话日志上传到 UsageLens 服务。
