@@ -191,7 +191,11 @@ final class PanelRenderTests: XCTestCase {
         _ provider: any ProbeProviding,
         selected: Provider = ProviderCatalog.codex
     ) -> UsageStore {
-        UsageStore(provider: provider, refreshInterval: 3600, selected: selected, autoStart: false)
+        // UsageStore 只刷新已启用的 provider；渲染某个 tab 前要把它加入测试配置。
+        var activeIDs = ProviderCatalog.defaultActiveIDs
+        if !activeIDs.contains(selected.id) { activeIDs.append(selected.id) }
+        UserDefaults.standard.set(activeIDs.joined(separator: ","), forKey: "usageLens.providers")
+        return UsageStore(provider: provider, refreshInterval: 3600, selected: selected, autoStart: false)
     }
 
     @discardableResult

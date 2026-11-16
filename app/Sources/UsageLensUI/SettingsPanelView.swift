@@ -7,9 +7,11 @@ public struct SettingsPanelView: View {
     @Environment(\.colorScheme) private var systemColorScheme
     @AppStorage("usageLens.providers") private var storedProviderIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
+    @AppStorage("usageLens.deepseek.keyEntryRequested") private var deepSeekKeyEntryRequested = false
     @State private var apiKeyDraft = ""
     @State private var hasSavedAPIKey = DeepSeekAPIKeyStore.hasSavedKey
     @State private var apiKeyStatus: String?
+    @State private var isVerifyingAPIKey = false
 
     private let onAPIKeyChange: () -> Void
 
@@ -80,11 +82,28 @@ public struct SettingsPanelView: View {
             VStack(spacing: 5) {
                 ForEach(activeProviders) { provider in
                     HStack(spacing: 8) {
-                        Image(systemName: "building.2.crop.circle")
-                            .foregroundStyle(UsageLensTheme.current.accent)
-                        Text(provider.displayName)
-                            .font(.system(size: 11, weight: .medium))
-                        Spacer(minLength: 4)
+                        Button {
+                            if provider.id == ProviderCatalog.deepseek.id {
+                                deepSeekKeyEntryRequested = true
+                                apiKeyStatus = nil
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "building.2.crop.circle")
+                                    .foregroundStyle(UsageLensTheme.current.accent)
+                                Text(provider.displayName)
+                                    .font(.system(size: 11, weight: .medium))
+                                if provider.requiresAPIKey {
+                                    Image(systemName: "key.fill")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 4)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!provider.requiresAPIKey)
+                        .accessibilityLabel(provider.requiresAPIKey ? "配置 \(provider.displayName) API Key" : provider.displayName)
                         if provider.id != ProviderCatalog.codex.id {
                             Button(role: .destructive) {
                                 setProviderEnabled(provider, enabled: false)
@@ -151,6 +170,10 @@ public struct SettingsPanelView: View {
             ids.removeAll { $0 == provider.id }
         }
         storedProviderIDs = ids.joined(separator: ",")
+        if provider.id == ProviderCatalog.deepseek.id, enabled {
+            // 添加 DeepSeek 后立即要求配置密钥，而不是留一个无法验证的 provider。
+            deepSeekKeyEntryRequested = true
+        }
     }
 
     private var trimmedAPIKey: String {
@@ -163,26 +186,41 @@ public struct SettingsPanelView: View {
             Text("\(provider.displayName) API Key")
                 .font(.system(size: 13, weight: .semibold))
 
-            SecureField(
-                hasSavedAPIKey ? "✳✳✳✳✳✳✳✳✳✳✳✳" : "粘贴 \(provider.displayName) API Key",
-                text: $apiKeyDraft
-            )
-            .textFieldStyle(.roundedBorder)
-            .onSubmit(saveAPIKey)
+            if hasSavedAPIKey, deepSeekKeyEntryRequested {
+                // 从钥匙串读取的密钥永不回填到 UI；只表明已有密钥并允许删除。
+                TextField("", text: .constant("****************"))
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(true)
+                    .accessibilityLabel("已保存的 \(provider.displayName) API Key")
 
-            HStack(spacing: 8) {
-                Button("保存到钥匙串", action: saveAPIKey)
-                    .disabled(trimmedAPIKey.isEmpty)
-                if hasSavedAPIKey {
+                HStack(spacing: 8) {
                     Button("删除", role: .destructive, action: deleteAPIKey)
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
-            }
+                Text("已保存的密钥以掩码显示，不会读取或显示明文。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else if !hasSavedAPIKey {
+                SecureField(
+                    "粘贴 \(provider.displayName) API Key",
+                    text: $apiKeyDraft
+                )
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(saveAPIKey)
 
-            Text(hasSavedAPIKey ? "已安全保存在本机钥匙串；密钥仅以✳显示。" : "尚未设置；本地花费估算仍可使用，余额查询需要 API Key。")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button(isVerifyingAPIKey ? "正在验证…" : "验证并保存", action: saveAPIKey)
+                        .disabled(trimmedAPIKey.isEmpty || isVerifyingAPIKey)
+                    Spacer(minLength: 0)
+                }
+                Text("密钥输入全程以 ✳ 掩码显示；仅验证成功后才会写入本机钥匙串。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else {
+                Label("API Key 已验证并安全保存在本机钥匙串", systemImage: "checkmark.shield.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.green)
+            }
 
             if let apiKeyStatus {
                 Text(apiKeyStatus)
@@ -194,14 +232,27 @@ public struct SettingsPanelView: View {
     }
 
     private func saveAPIKey() {
-        do {
-            try DeepSeekAPIKeyStore.save(trimmedAPIKey)
-            hasSavedAPIKey = true
-            apiKeyDraft = ""
-            apiKeyStatus = "已保存，正在刷新 DeepSeek 数据…"
-            onAPIKeyChange()
-        } catch {
-            apiKeyStatus = "保存失败：\(error.localizedDescription)"
+        let candidate = trimmedAPIKey
+        guard !candidate.isEmpty, !isVerifyingAPIKey else { return }
+        isVerifyingAPIKey = true
+        apiKeyStatus = nil
+        Task { @MainActor in
+            if let message = await DeepSeekAPIKeyStore.validationMessage(for: candidate) {
+                isVerifyingAPIKey = false
+                apiKeyStatus = "验证失败：\(message)"
+                return
+            }
+            do {
+                try DeepSeekAPIKeyStore.save(candidate)
+                hasSavedAPIKey = true
+                apiKeyDraft = ""
+                deepSeekKeyEntryRequested = false
+                apiKeyStatus = "验证成功，已安全保存并刷新 DeepSeek 数据。"
+                onAPIKeyChange()
+            } catch {
+                apiKeyStatus = "保存失败：\(error.localizedDescription)"
+            }
+            isVerifyingAPIKey = false
         }
     }
 
@@ -210,6 +261,7 @@ public struct SettingsPanelView: View {
             try DeepSeekAPIKeyStore.delete()
             hasSavedAPIKey = false
             apiKeyDraft = ""
+            deepSeekKeyEntryRequested = true
             apiKeyStatus = "已从钥匙串删除。"
             onAPIKeyChange()
         } catch {
