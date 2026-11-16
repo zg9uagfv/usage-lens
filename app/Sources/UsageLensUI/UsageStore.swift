@@ -55,6 +55,11 @@ public final class UsageStore: ObservableObject {
         Tension.mostTense(in: ProviderCatalog.active.map(state(for:)))
     }
 
+    /// 菜单栏告警阈值：只依据新鲜、可用的最高用量窗口。
+    public var hasCriticalUsage: Bool {
+        (mostTense?.percent ?? 0) >= 90
+    }
+
     public func refresh() {
         Task { await refreshAll() }
     }

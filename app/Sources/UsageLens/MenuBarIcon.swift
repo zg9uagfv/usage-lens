@@ -2,11 +2,12 @@ import AppKit
 
 /// 两只简洁的菜单栏眼睛；眨眼时将眼睛画成短弧线。
 enum MenuBarIcon {
-    static func make(blinking: Bool = false) -> NSImage {
+    static func make(blinking: Bool = false, alert: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: 24, height: 20))
         image.lockFocus()
-        NSColor.black.setStroke()
-        NSColor.black.setFill()
+        let color: NSColor = alert ? .systemRed : .black
+        color.setStroke()
+        color.setFill()
 
         for centerX in [7.0, 17.0] {
             if blinking {
@@ -25,7 +26,8 @@ enum MenuBarIcon {
         }
 
         image.unlockFocus()
-        image.isTemplate = true
+        // 普通状态交给系统自动适配浅色/深色菜单栏；告警状态必须保留红色。
+        image.isTemplate = !alert
         return image
     }
 }
