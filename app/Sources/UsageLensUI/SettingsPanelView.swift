@@ -74,40 +74,6 @@ public struct SettingsPanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("DeepSeek API Key")
-                    .font(.system(size: 13, weight: .semibold))
-
-                SecureField("粘贴 DeepSeek API Key", text: $apiKeyDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(saveAPIKey)
-
-                HStack(spacing: 8) {
-                    Button("保存到钥匙串", action: saveAPIKey)
-                        .disabled(trimmedAPIKey.isEmpty)
-                    if hasSavedAPIKey {
-                        Button("删除", role: .destructive, action: deleteAPIKey)
-                    }
-                    Spacer(minLength: 0)
-                }
-
-                Text(hasSavedAPIKey ? "已安全保存在本机钥匙串。" : "尚未设置；本地花费估算仍可使用，余额查询需要 API Key。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if let apiKeyStatus {
-                    Text(apiKeyStatus)
-                        .font(.system(size: 10))
-                        .foregroundStyle(apiKeyStatus.contains("失败") ? .orange : .green)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Divider()
-
             Text("模型厂商")
                 .font(.system(size: 13, weight: .semibold))
 
@@ -149,6 +115,14 @@ public struct SettingsPanelView: View {
             Text("管理要显示的模型厂商。模型用量来自各厂商的本地记录或探针。")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
+
+            let keyProviders = activeProviders.filter(\.requiresAPIKey)
+            if !keyProviders.isEmpty {
+                Divider()
+                ForEach(keyProviders) { provider in
+                    apiKeySettings(for: provider)
+                }
+            }
           }
           .padding(20)
         }
@@ -181,6 +155,42 @@ public struct SettingsPanelView: View {
 
     private var trimmedAPIKey: String {
         apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private func apiKeySettings(for provider: Provider) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("\(provider.displayName) API Key")
+                .font(.system(size: 13, weight: .semibold))
+
+            SecureField(
+                hasSavedAPIKey ? "✳✳✳✳✳✳✳✳✳✳✳✳" : "粘贴 \(provider.displayName) API Key",
+                text: $apiKeyDraft
+            )
+            .textFieldStyle(.roundedBorder)
+            .onSubmit(saveAPIKey)
+
+            HStack(spacing: 8) {
+                Button("保存到钥匙串", action: saveAPIKey)
+                    .disabled(trimmedAPIKey.isEmpty)
+                if hasSavedAPIKey {
+                    Button("删除", role: .destructive, action: deleteAPIKey)
+                }
+                Spacer(minLength: 0)
+            }
+
+            Text(hasSavedAPIKey ? "已安全保存在本机钥匙串；密钥仅以✳显示。" : "尚未设置；本地花费估算仍可使用，余额查询需要 API Key。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let apiKeyStatus {
+                Text(apiKeyStatus)
+                    .font(.system(size: 10))
+                    .foregroundStyle(apiKeyStatus.contains("失败") ? .orange : .green)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func saveAPIKey() {
