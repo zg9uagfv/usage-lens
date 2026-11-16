@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var blinkTimer: Timer?
     private var openEyesTimer: Timer?
     private var developmentPanel: NSPanel?
-    private var settingsPanel: NSPanel?
+    private var settingsPanel: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 菜单栏常驻，不占 Dock。
@@ -87,11 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusLabel() {
         guard let button = statusItem?.button else { return }
         button.title = ""
-        if let tension = store.mostTense {
-            button.toolTip = "\(tension.fullLabel) · 点击查看 UsageLens"
-        } else {
-            button.toolTip = "UsageLens · 暂无可用配额数据"
-        }
+        button.toolTip = "usage-lens"
     }
 
     private func showDevelopmentPanel() {
@@ -122,14 +118,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        let panel = NSPanel(
+        let panel = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 520),
-            styleMask: [.titled, .closable, .utilityWindow],
+            styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         panel.title = "UsageLens 配置"
         panel.isReleasedWhenClosed = false
+        panel.level = .normal
         panel.contentViewController = NSHostingController(
             rootView: SettingsPanelView(launchAtLogin: launchAtLogin) { [weak self] in
                 self?.store.refresh()

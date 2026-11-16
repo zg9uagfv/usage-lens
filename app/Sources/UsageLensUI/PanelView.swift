@@ -473,7 +473,7 @@ struct FooterBar: View {
             Image(systemName: "gearshape")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .padding(5)
+                .frame(width: 24, height: 24)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
