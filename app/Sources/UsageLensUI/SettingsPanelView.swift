@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// 明确可见的配置页；目前只放首版已确认的登录后启动开关。
+/// 配置页：外观主题、自定义模型名称与登录后启动选项。
 public struct SettingsPanelView: View {
     @ObservedObject public var launchAtLogin: LaunchAtLoginManager
+    @Environment(\.colorScheme) private var systemColorScheme
     @AppStorage("usageLens.customModels") private var storedModels = ""
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
     @State private var modelDraft = ""
@@ -42,6 +43,7 @@ public struct SettingsPanelView: View {
                         .background(RoundedRectangle(cornerRadius: 9).fill(theme.cardSurface))
                     }
                     .buttonStyle(.plain)
+                    .environment(\.colorScheme, theme.colorScheme ?? systemColorScheme)
                 }
             }
 
