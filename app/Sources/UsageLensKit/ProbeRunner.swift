@@ -104,6 +104,14 @@ public struct ProbeRunner: ProbeProviding {
     }
 
     public func report(for provider: Provider) async -> ProbeReport {
+        await report(for: provider, environmentOverrides: [:])
+    }
+
+    /// 候选密钥验证时传入仅供本次子进程使用的环境变量，不会写入钥匙串。
+    public func report(
+        for provider: Provider,
+        environmentOverrides: [String: String]
+    ) async -> ProbeReport {
         let started = Date()
         let resolvedRoot = root ?? RepoLocator.locate()
 
@@ -130,7 +138,8 @@ public struct ProbeRunner: ProbeProviding {
             probe: probeURL,
             workingDirectory: resolvedRoot,
             timeout: timeout,
-            provider: provider
+            provider: provider,
+            environmentOverrides: environmentOverrides
         )
         let duration = Date().timeIntervalSince(started)
 
@@ -234,7 +243,8 @@ public struct ProbeRunner: ProbeProviding {
         probe: URL,
         workingDirectory: URL,
         timeout: TimeInterval,
-        provider: Provider? = nil
+        provider: Provider? = nil,
+        environmentOverrides: [String: String] = [:]
     ) async -> ProbeProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -252,6 +262,10 @@ public struct ProbeRunner: ProbeProviding {
            let key = DeepSeekAPIKeyStore.load() {
             // 仅注入 DeepSeek 探针；不会传给 Codex 或写入日志 / 文件。
             environment["DEEPSEEK_API_KEY"] = key
+        }
+        // 仅用于保存前验证候选密钥；优先级高于钥匙串，绝不落盘。
+        for (name, value) in environmentOverrides {
+            environment[name] = value
         }
         process.environment = environment
 
