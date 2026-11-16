@@ -20,7 +20,8 @@ public struct PanelView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
+        let selectedTheme = UsageLensTheme(rawValue: themeRawValue) ?? .system
+        return VStack(spacing: 0) {
             ProviderTabBar(store: store)
             Divider().opacity(0.35)
             ProviderDetailView(state: store.state(for: store.selected))
@@ -31,9 +32,9 @@ public struct PanelView: View {
             FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings)
         }
         .frame(width: Theme.panelWidth)
-        .background(UsageLensTheme.current.panelBackground)
-        .tint(UsageLensTheme.current.accent)
-        .preferredColorScheme(UsageLensTheme.current.colorScheme)
+        .background(selectedTheme.panelBackground)
+        .tint(selectedTheme.accent)
+        .preferredColorScheme(selectedTheme.colorScheme)
     }
 }
 
