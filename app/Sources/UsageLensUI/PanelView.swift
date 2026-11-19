@@ -332,12 +332,12 @@ struct WindowRowView: View {
     }
 
     private var barTint: Color {
-        isExpired ? Color.orange.opacity(0.45) : Theme.tint(for: window.usedPercent)
+        isExpired ? Color.orange : Theme.tint(for: window.usedPercent)
     }
 
     private var percentTint: Color {
         guard window.usedPercent != nil else { return .secondary }
-        return isExpired ? Color.orange.opacity(0.75) : Theme.tint(for: window.usedPercent)
+        return isExpired ? Color.orange : Theme.tint(for: window.usedPercent)
     }
 
     var body: some View {
@@ -391,12 +391,12 @@ struct ProgressTrack: View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 Capsule()
-                    .fill(Color.primary.opacity(0.10))
+                    .fill(Theme.progressTrack)
                 if let fraction {
                     Capsule()
                         .fill(
                             LinearGradient(
-                                colors: [tint.opacity(0.72), tint],
+                                colors: [tint.opacity(0.88), tint],
                                 startPoint: .leading,
                                 endPoint: .trailing
                             )
