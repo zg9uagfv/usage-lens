@@ -204,12 +204,20 @@ public enum ThemeHostRegistrar {
     }
 
     private static func reload() {
-        // 1) 同步 AppKit 外观到所有窗口（popover / 开发面板不会跟随 SwiftUI 的 preferredColorScheme）。
+        // 1) 只同步面板类窗口的 AppKit 外观。NSPopover / 开发面板不会跟随
+        //    SwiftUI 的 preferredColorScheme；但菜单栏窗口（NSStatusBarWindow）
+        //    必须保留系统外观，否则 template 图标颜色会被主题外观带偏。
         let appearance = UsageLensTheme.appkitAppearance
-        for window in NSApp?.windows ?? [] {
+        for window in NSApp?.windows ?? [] where !isStatusBarWindow(window) {
             window.appearance = appearance
         }
         // 2) bump 信号 → PanelView 的 .id 变化 → SwiftUI 重建子树，用新 colorScheme 重渲文字/卡片。
         ThemeChangeSignal.shared.bump()
+    }
+
+    /// 菜单栏窗口（状态项所在窗口）：按类名或标识符识别，避免误改 template 图标外观。
+    private static func isStatusBarWindow(_ window: NSWindow) -> Bool {
+        if String(describing: type(of: window)).contains("StatusBarWindow") { return true }
+        return window.identifier?.rawValue.contains("NSStatusBarWindow") == true
     }
 }
