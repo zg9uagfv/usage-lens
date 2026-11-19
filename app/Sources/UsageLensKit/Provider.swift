@@ -33,6 +33,12 @@ public enum ProviderCatalog {
         requiresAPIKey: true
     )
 
+    public static let claude = Provider(
+        id: "claude",
+        displayName: "Claude",
+        probeRelativePath: "probes/claude.py"
+    )
+
     public static let gemini = Provider(
         id: "gemini",
         displayName: "Gemini",
@@ -46,10 +52,10 @@ public enum ProviderCatalog {
     )
 
     /// 可添加的厂商。显示顺序由这里决定。
-    public static let available: [Provider] = [codex, gemini, opencode, deepseek]
+    public static let available: [Provider] = [codex, claude, gemini, opencode, deepseek]
 
-    /// 默认开启 Codex、Gemini、OpenCode；用户可在设置中修改。
-    public static let defaultActiveIDs = ["codex", "gemini", "opencode"]
+    /// 默认开启 Codex、Claude、Gemini、OpenCode；用户可在设置中修改。
+    public static let defaultActiveIDs = ["codex", "claude", "gemini", "opencode"]
 
     /// `all` 保留为全部厂商，供初始化状态使用；界面应使用 `active`。
     public static var all: [Provider] { available }
