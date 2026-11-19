@@ -67,12 +67,38 @@ enum Theme {
     static let cardCorner: CGFloat = 10
     static let barHeight: CGFloat = 6
 
-    /// 进度与百分比配色：越紧张越暖，全部走系统色以跟随深浅色。
+    /// 用量状态色使用明确的浅/深色变体，避免系统色在不同主题里变淡。
     static func tint(for percent: Double?) -> Color {
         guard let percent, percent.isFinite else { return .secondary }
-        if percent >= 90 { return .red }
-        if percent >= 70 { return .orange }
-        return UsageLensTheme.current.accent
+        let isDark: Bool
+        switch UsageLensTheme.current {
+        case .tech: isDark = true
+        case .anime: isDark = false
+        case .system:
+            isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        }
+
+        if percent >= 90 {
+            return isDark ? Color(red: 1.0, green: 0.36, blue: 0.34) : Color(red: 0.78, green: 0.12, blue: 0.16)
+        }
+        if percent >= 70 {
+            return isDark ? Color(red: 1.0, green: 0.66, blue: 0.24) : Color(red: 0.78, green: 0.36, blue: 0.04)
+        }
+        switch UsageLensTheme.current {
+        case .tech: return Color(red: 0.27, green: 0.91, blue: 1.0)
+        case .anime: return Color(red: 0.68, green: 0.20, blue: 0.62)
+        case .system: return isDark ? Color(red: 0.36, green: 0.82, blue: 1.0) : Color(red: 0.08, green: 0.36, blue: 0.78)
+        }
+    }
+
+    static var progressTrack: Color {
+        let dark: Bool
+        switch UsageLensTheme.current {
+        case .tech: dark = true
+        case .anime: dark = false
+        case .system: dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        }
+        return dark ? Color.white.opacity(0.22) : Color.black.opacity(0.15)
     }
 
     static func statusColor(_ status: ProviderStatus) -> Color {
