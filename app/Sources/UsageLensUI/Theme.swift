@@ -57,8 +57,29 @@ public enum UsageLensTheme: String, CaseIterable, Identifiable {
         }
     }
 
+    /// AppKit 外观名：NSPopover / NSWindow 的 appearance 不会跟随 SwiftUI 的
+    /// preferredColorScheme，必须在这里显式同步，否则 .primary/.secondary 文字不反转。
+    /// system 主题返回 nil，表示沿用系统外观。
+    var appkitAppearanceName: NSAppearance.Name? {
+        switch self {
+        case .tech: .darkAqua
+        case .anime: .aqua
+        case .system: nil
+        }
+    }
+
     static var current: UsageLensTheme {
         UsageLensTheme(rawValue: UserDefaults.standard.string(forKey: "usageLens.theme") ?? "") ?? .system
+    }
+
+    /// 当前主题的 AppKit 外观；system 主题下返回系统有效外观。
+    /// 非 AppKit 环境（单元测试）下 NSApp 为 nil，退回命名外观或空外观，避免崩溃。
+    public static var appkitAppearance: NSAppearance {
+        let system = NSApp?.effectiveAppearance ?? NSAppearance()
+        if let name = current.appkitAppearanceName {
+            return NSAppearance(named: name) ?? system
+        }
+        return system
     }
 }
 
@@ -136,5 +157,59 @@ struct CardBackground: ViewModifier {
 extension View {
     func cardBackground(corner: CGFloat = Theme.cardCorner, opacity: Double = 0.05) -> some View {
         modifier(CardBackground(corner: corner, opacity: opacity))
+    }
+}
+
+/// 主题变更计数器：PanelView 通过 @ObservedObject 观察它，
+/// 切主题时 bump 一下即可让 SwiftUI 重跑 body（外部 NSView layout 做不到这点）。
+@MainActor
+public final class ThemeChangeSignal: ObservableObject {
+    public static let shared = ThemeChangeSignal()
+    @Published private(set) public var revision: Int = 0
+    private init() {}
+    public func bump() { revision += 1 }
+}
+
+/// 主题变化广播：NSPopover / NSWindow 里的 NSHostingView 缓存旧外观，光改
+/// preferredColorScheme 不会驱动已创建的视图重渲。这里在 `usageLens.theme` 变动时
+/// 切主题时同步 AppKit 外观并 bump 信号，让 PanelView 重建子树用新 colorScheme 重渲。
+///
+/// NSPopover/NSWindow 的 appearance 不跟随 SwiftUI 的 preferredColorScheme；
+/// SwiftUI 对「外部已写入 UserDefaults」的 @AppStorage 变化也不一定即时重渲
+/// 已创建的子树。这里在 theme 变动时：1) 同步 AppKit 外观 2) bump 信号触发
+/// PanelView 的 .id 变化 → 整棵子树重建，保证文字/卡片颜色即时跟随。
+@MainActor
+public enum ThemeHostRegistrar {
+    private static var observer: NSObjectProtocol?
+    /// 上次见到的主题：与它比而非 current，避开 @AppStorage 抢先写入 current 的竞态。
+    private static var lastSeenTheme: UsageLensTheme?
+
+    /// 登记开始监听主题变化。幂等。
+    public static func register(_ view: NSView) {
+        lastSeenTheme = UsageLensTheme.current
+        guard observer == nil else { return }
+        observer = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                let raw = UserDefaults.standard.string(forKey: "usageLens.theme") ?? UsageLensTheme.system.rawValue
+                let newTheme = UsageLensTheme(rawValue: raw) ?? .system
+                defer { lastSeenTheme = newTheme }
+                guard newTheme != lastSeenTheme else { return }
+                reload()
+            }
+        }
+    }
+
+    private static func reload() {
+        // 1) 同步 AppKit 外观到所有窗口（popover / 开发面板不会跟随 SwiftUI 的 preferredColorScheme）。
+        let appearance = UsageLensTheme.appkitAppearance
+        for window in NSApp?.windows ?? [] {
+            window.appearance = appearance
+        }
+        // 2) bump 信号 → PanelView 的 .id 变化 → SwiftUI 重建子树，用新 colorScheme 重渲文字/卡片。
+        ThemeChangeSignal.shared.bump()
     }
 }

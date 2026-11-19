@@ -8,16 +8,20 @@ public struct PanelView: View {
     @StateObject private var launchAtLogin: LaunchAtLoginManager
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
     @AppStorage("usageLens.providers") private var providerIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
+    @ObservedObject private var themeSignal = ThemeChangeSignal.shared
     private let showSettings: () -> Void
+    private let showAbout: () -> Void
 
     @MainActor public init(
         store: UsageStore,
         launchAtLogin: LaunchAtLoginManager? = nil,
-        showSettings: @escaping () -> Void = {}
+        showSettings: @escaping () -> Void = {},
+        showAbout: @escaping () -> Void = {}
     ) {
         self.store = store
         _launchAtLogin = StateObject(wrappedValue: launchAtLogin ?? LaunchAtLoginManager())
         self.showSettings = showSettings
+        self.showAbout = showAbout
     }
 
     public var body: some View {
@@ -30,12 +34,15 @@ public struct PanelView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 14)
             Divider().opacity(0.35)
-            FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings)
+            FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings, showAbout: showAbout)
         }
         .frame(width: Theme.panelWidth)
         .background(selectedTheme.panelBackground)
         .tint(selectedTheme.accent)
         .preferredColorScheme(selectedTheme.colorScheme)
+        // revision 变化 → 整棵子树重建，SwiftUI 用新 colorScheme 重渲文字/卡片。
+        .id("panel-\(selectedTheme.rawValue)-\(themeSignal.revision)")
+        .background(ThemeHostBridge())
         .onChange(of: providerIDs) { _, _ in
             let active = ProviderCatalog.active
             if !active.contains(store.selected) {
@@ -44,6 +51,19 @@ public struct PanelView: View {
             store.refresh()
         }
     }
+}
+
+/// 把自己（NSViewRepresentable 产出的 NSView）登记到 ThemeHostRegistrar；
+/// registrar 会沿 superview 链向上找到真正的 NSHostingView 宿主。
+private struct ThemeHostBridge: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        // 入窗后再登记：此时 superview 链已挂上 NSHostingView。
+        DispatchQueue.main.async { ThemeHostRegistrar.register(view) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 // MARK: - Tab 头
@@ -450,6 +470,7 @@ struct FooterBar: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var launchAtLogin: LaunchAtLoginManager
     let showSettings: () -> Void
+    let showAbout: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -459,11 +480,27 @@ struct FooterBar: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+            aboutButton
             settingsButton
             quitButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var aboutButton: some View {
+        Button {
+            showAbout()
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("关于 usage-lens")
+        .accessibilityLabel("关于 usage-lens")
     }
 
     private var settingsButton: some View {

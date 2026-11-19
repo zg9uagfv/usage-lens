@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isCriticalUsage = false
     private var developmentPanel: NSPanel?
     private var settingsPanel: NSWindow?
+    private var aboutPanel: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 菜单栏常驻，不占 Dock。
@@ -45,7 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.contentSize = NSSize(width: 340, height: 560)
-        popover.contentViewController = NSHostingController(rootView: panelView)
+        // rootView 用 AnyView 包一层：切主题时可原地替换 rootView 强制重渲，
+        // 避免 NSHostingView 缓存旧外观导致文字颜色不跟随。
+        popover.contentViewController = NSHostingController<AnyView>(rootView: AnyView(panelView))
+        popover.appearance = UsageLensTheme.appkitAppearance
 
         let item = NSStatusBar.system.statusItem(withLength: 32)
         item.button?.target = self
@@ -96,6 +100,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            // 切主题后 NSPopover / NSHostingView 缓存的旧外观不会自动失效，
+            // 必须在每次打开前：同步 appearance + 重建 rootView 强制 SwiftUI 用新外观重渲。
+            let appearance = UsageLensTheme.appkitAppearance
+            popover.appearance = appearance
+            if let host = popover.contentViewController as? NSHostingController<AnyView> {
+                host.rootView = AnyView(panelView)
+            }
+            popover.contentViewController?.view.appearance = appearance
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
@@ -141,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         panel.title = "UsageLens"
         panel.isReleasedWhenClosed = false
+        panel.appearance = UsageLensTheme.appkitAppearance
         panel.contentViewController = NSHostingController(rootView: panelView)
         panel.center()
         panel.makeKeyAndOrderFront(nil)
@@ -151,7 +164,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelView: PanelView {
         PanelView(store: store, launchAtLogin: launchAtLogin) { [weak self] in
             self?.showSettings()
+        } showAbout: { [weak self] in
+            self?.showAbout()
         }
+    }
+
+    private func showAbout() {
+        if let panel = aboutPanel {
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let panel = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: 230),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "关于 usage-lens"
+        panel.isReleasedWhenClosed = false
+        panel.level = .normal
+        panel.appearance = UsageLensTheme.appkitAppearance
+        panel.contentViewController = NSHostingController(rootView: AboutPanelView())
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        aboutPanel = panel
     }
 
     private func showSettings() {
