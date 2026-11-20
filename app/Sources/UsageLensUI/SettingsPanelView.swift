@@ -8,21 +8,40 @@ public struct SettingsPanelView: View {
     @Environment(\.colorScheme) private var systemColorScheme
     @AppStorage("usageLens.providers") private var storedProviderIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
-    @State private var expandedKeyProviderID: String?
+    @State private var expandedCredentialProviderID: String?
     @State private var apiKeyDraft = ""
     @State private var hasSavedAPIKey: Bool
     @State private var apiKeyStatus: String?
     @State private var isVerifyingAPIKey = false
+
+    @State private var geminiEmailDraft = ""
+    @State private var geminiTokenDraft = ""
+    @State private var geminiProjectIDDraft = ""
+    @State private var savedGeminiAccountEmail: String?
+    @State private var geminiAccountStatus: String?
+    @State private var isVerifyingGeminiAccount = false
 
     private let onAPIKeyChange: () -> Void
 
     public init(
         launchAtLogin: LaunchAtLoginManager,
         hasSavedAPIKey: Bool? = nil,
+        savedGeminiAccountEmail: String?? = nil,
+        initialExpandedProviderID: String? = nil,
         onAPIKeyChange: @escaping () -> Void = {}
     ) {
         self.launchAtLogin = launchAtLogin
         _hasSavedAPIKey = State(initialValue: hasSavedAPIKey ?? DeepSeekAPIKeyStore.hasSavedKey)
+        let resolvedGeminiEmail: String?
+        if let override = savedGeminiAccountEmail {
+            resolvedGeminiEmail = override
+        } else if hasSavedAPIKey != nil {
+            resolvedGeminiEmail = nil
+        } else {
+            resolvedGeminiEmail = GeminiAccountStore.savedAccountEmail()
+        }
+        _savedGeminiAccountEmail = State(initialValue: resolvedGeminiEmail)
+        _expandedCredentialProviderID = State(initialValue: initialExpandedProviderID)
         self.onAPIKeyChange = onAPIKeyChange
     }
 
@@ -89,9 +108,10 @@ public struct SettingsPanelView: View {
                 ForEach(activeProviders) { provider in
                     HStack(spacing: metrics.scaledSpacing(8)) {
                         Button {
-                            if provider.id == ProviderCatalog.deepseek.id {
-                                expandedKeyProviderID = expandedKeyProviderID == provider.id ? nil : provider.id
+                            if provider.requiresCredentials {
+                                expandedCredentialProviderID = expandedCredentialProviderID == provider.id ? nil : provider.id
                                 apiKeyStatus = nil
+                                geminiAccountStatus = nil
                             }
                         } label: {
                             HStack(spacing: metrics.scaledSpacing(8)) {
@@ -104,13 +124,21 @@ public struct SettingsPanelView: View {
                                     Image(systemName: "key.fill")
                                         .font(metrics.font(10))
                                         .foregroundStyle(.secondary)
+                                } else if provider.requiresAccount {
+                                    Image(
+                                        systemName: savedGeminiAccountEmail != nil
+                                            ? "person.crop.circle.badge.checkmark"
+                                            : "person.crop.circle"
+                                    )
+                                    .font(metrics.font(11))
+                                    .foregroundStyle(savedGeminiAccountEmail != nil ? Color.green : Color.secondary)
                                 }
                                 Spacer(minLength: metrics.scaledSpacing(4))
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(!provider.requiresAPIKey)
-                        .accessibilityLabel(provider.requiresAPIKey ? "配置 \(provider.displayName) API Key" : provider.displayName)
+                        .disabled(!provider.requiresCredentials)
+                        .accessibilityLabel(providerAccessibilityLabel(for: provider))
                         if provider.id != ProviderCatalog.codex.id {
                             Button(role: .destructive) {
                                 setProviderEnabled(provider, enabled: false)
@@ -143,9 +171,13 @@ public struct SettingsPanelView: View {
                 .font(metrics.font(10))
                 .foregroundStyle(.tertiary)
 
-            if let provider = activeProviders.first(where: { $0.id == expandedKeyProviderID && $0.requiresAPIKey }) {
+            if let provider = activeProviders.first(where: { $0.id == expandedCredentialProviderID && $0.requiresCredentials }) {
                 Divider()
-                apiKeySettings(for: provider)
+                if provider.requiresAPIKey {
+                    apiKeySettings(for: provider)
+                } else if provider.requiresAccount {
+                    geminiAccountSettings(for: provider)
+                }
             }
           }
           .padding(metrics.scaledSpacing(20))
@@ -158,6 +190,16 @@ public struct SettingsPanelView: View {
         .background(UsageLensTheme.current.panelBackground)
         .tint(UsageLensTheme.current.accent)
         .preferredColorScheme(UsageLensTheme.current.colorScheme)
+    }
+
+    private func providerAccessibilityLabel(for provider: Provider) -> String {
+        if provider.requiresAPIKey {
+            return "配置 \(provider.displayName) API Key"
+        }
+        if provider.requiresAccount {
+            return "配置 \(provider.displayName) 账号"
+        }
+        return provider.displayName
     }
 
     private var activeProviders: [Provider] {
@@ -179,13 +221,25 @@ public struct SettingsPanelView: View {
             ids.removeAll { $0 == provider.id }
         }
         storedProviderIDs = ids.joined(separator: ",")
-        if !enabled, expandedKeyProviderID == provider.id {
-            expandedKeyProviderID = nil
+        if !enabled, expandedCredentialProviderID == provider.id {
+            expandedCredentialProviderID = nil
         }
     }
 
     private var trimmedAPIKey: String {
         apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedGeminiEmail: String {
+        geminiEmailDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedGeminiToken: String {
+        geminiTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedGeminiProjectID: String {
+        geminiProjectIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @ViewBuilder
@@ -238,6 +292,79 @@ public struct SettingsPanelView: View {
         }
     }
 
+    @ViewBuilder
+    private func geminiAccountSettings(for provider: Provider) -> some View {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(8)) {
+            Text("\(provider.displayName) 账号")
+                .font(metrics.font(13, weight: .semibold))
+
+            if let email = savedGeminiAccountEmail {
+                // 仅展示非敏感邮箱标签；访问令牌永不回填到 UI。
+                TextField("", text: .constant(email))
+                    .font(metrics.font(12))
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(true)
+                    .accessibilityLabel("已保存的 \(provider.displayName) 账号")
+
+                TextField("", text: .constant("****************"))
+                    .font(metrics.font(12))
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(true)
+                    .accessibilityLabel("已保存的 \(provider.displayName) 访问令牌")
+
+                HStack(spacing: metrics.scaledSpacing(8)) {
+                    Button("删除", role: .destructive, action: deleteGeminiAccount)
+                        .font(metrics.font(12))
+                    Spacer(minLength: 0)
+                }
+                Text("已保存的访问令牌以掩码显示，不会读取或显示明文。")
+                    .font(metrics.font(10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                TextField(
+                    "Gemini 账号邮箱（例如 user@gmail.com）",
+                    text: $geminiEmailDraft
+                )
+                .font(metrics.font(12))
+                .textFieldStyle(.roundedBorder)
+
+                SecureField(
+                    "粘贴 Gemini 访问令牌 (OAuth Access Token)",
+                    text: $geminiTokenDraft
+                )
+                .font(metrics.font(12))
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(saveGeminiAccount)
+
+                TextField(
+                    "项目 ID（可选，留空自动获取）",
+                    text: $geminiProjectIDDraft
+                )
+                .font(metrics.font(12))
+                .textFieldStyle(.roundedBorder)
+
+                HStack(spacing: metrics.scaledSpacing(8)) {
+                    Button(isVerifyingGeminiAccount ? "正在验证…" : "验证并保存", action: saveGeminiAccount)
+                        .font(metrics.font(12))
+                        .disabled(trimmedGeminiEmail.isEmpty || trimmedGeminiToken.isEmpty || isVerifyingGeminiAccount)
+                    Spacer(minLength: 0)
+                }
+                Text("提供 Gemini 账号以查看 5 小时与 7 天使用量；令牌全程以掩码输入，仅验证成功后写入本机钥匙串。")
+                    .font(metrics.font(10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let geminiAccountStatus {
+                Text(geminiAccountStatus)
+                    .font(metrics.font(10))
+                    .foregroundStyle(geminiAccountStatus.contains("失败") ? .orange : .green)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private func saveAPIKey() {
         let candidate = trimmedAPIKey
         guard !candidate.isEmpty, !isVerifyingAPIKey else { return }
@@ -253,7 +380,7 @@ public struct SettingsPanelView: View {
                 try DeepSeekAPIKeyStore.save(candidate)
                 hasSavedAPIKey = true
                 apiKeyDraft = ""
-                expandedKeyProviderID = nil
+                expandedCredentialProviderID = nil
                 apiKeyStatus = nil
                 onAPIKeyChange()
             } catch {
@@ -268,7 +395,7 @@ public struct SettingsPanelView: View {
             try DeepSeekAPIKeyStore.delete()
             hasSavedAPIKey = false
             apiKeyDraft = ""
-            expandedKeyProviderID = ProviderCatalog.deepseek.id
+            expandedCredentialProviderID = ProviderCatalog.deepseek.id
             apiKeyStatus = "已从钥匙串删除。"
             onAPIKeyChange()
         } catch {
@@ -276,4 +403,50 @@ public struct SettingsPanelView: View {
         }
     }
 
+    private func saveGeminiAccount() {
+        let email = trimmedGeminiEmail
+        let token = trimmedGeminiToken
+        let projectID = trimmedGeminiProjectID.isEmpty ? nil : trimmedGeminiProjectID
+        guard !email.isEmpty, !token.isEmpty, !isVerifyingGeminiAccount else { return }
+        isVerifyingGeminiAccount = true
+        geminiAccountStatus = nil
+        Task { @MainActor in
+            if let message = await GeminiAccountStore.validationMessage(
+                email: email,
+                accessToken: token,
+                projectID: projectID
+            ) {
+                isVerifyingGeminiAccount = false
+                geminiAccountStatus = "验证失败：\(message)"
+                return
+            }
+            do {
+                try GeminiAccountStore.save(email: email, accessToken: token, projectID: projectID)
+                savedGeminiAccountEmail = email
+                geminiEmailDraft = ""
+                geminiTokenDraft = ""
+                geminiProjectIDDraft = ""
+                geminiAccountStatus = "已验证并保存到钥匙串。"
+                onAPIKeyChange()
+            } catch {
+                geminiAccountStatus = "保存失败：\(error.localizedDescription)"
+            }
+            isVerifyingGeminiAccount = false
+        }
+    }
+
+    private func deleteGeminiAccount() {
+        do {
+            try GeminiAccountStore.delete()
+            savedGeminiAccountEmail = nil
+            geminiEmailDraft = ""
+            geminiTokenDraft = ""
+            geminiProjectIDDraft = ""
+            expandedCredentialProviderID = ProviderCatalog.gemini.id
+            geminiAccountStatus = "已从钥匙串删除。"
+            onAPIKeyChange()
+        } catch {
+            geminiAccountStatus = "删除失败：\(error.localizedDescription)"
+        }
+    }
 }

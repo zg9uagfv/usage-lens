@@ -30,7 +30,7 @@ public struct PanelView: View {
         return VStack(spacing: 0) {
             ProviderTabBar(store: store)
             Divider().opacity(0.35)
-            ProviderDetailView(state: store.state(for: store.selected))
+            ProviderDetailView(state: store.state(for: store.selected), showSettings: showSettings)
                 .padding(.horizontal, metrics.scaledSpacing(14))
                 .padding(.top, metrics.scaledSpacing(12))
                 .padding(.bottom, metrics.scaledSpacing(14))
@@ -113,9 +113,26 @@ struct ProviderTabBar: View {
 
 struct ProviderDetailView: View {
     let state: ProviderState
+    var showSettings: () -> Void = {}
     @Environment(\.displayScaleMetrics) private var metrics
 
     private var isDimmed: Bool { state.isDimmed }
+
+    private var needsAccountConfiguration: Bool {
+        state.provider.requiresAccount
+            && state.hasLoaded
+            && !state.isMissingProbe
+            && !state.isIncompatibleSchema
+            && state.failureReason == nil
+            && state.windows.isEmpty
+            && !hasMetrics
+            && state.accountLabel == nil
+    }
+
+    private var displayedWarnings: [String] {
+        guard needsAccountConfiguration else { return state.visibleWarnings }
+        return state.visibleWarnings.filter { !$0.contains("请先在配置中提供") }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: metrics.scaledSpacing(12)) {
@@ -147,7 +164,7 @@ struct ProviderDetailView: View {
                 staleBanner(failure)
             }
 
-            if !state.visibleWarnings.isEmpty {
+            if !displayedWarnings.isEmpty {
                 warningsList
             }
         }
@@ -218,18 +235,34 @@ struct ProviderDetailView: View {
 
     private var emptyTile: some View {
         VStack(spacing: metrics.scaledSpacing(6)) {
-            Image(systemName: "chart.bar.xaxis")
+            Image(systemName: needsAccountConfiguration ? "person.crop.circle.badge.exclamationmark" : "chart.bar.xaxis")
                 .font(metrics.font(18, weight: .regular))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(needsAccountConfiguration ? Color.secondary : Color.secondary.opacity(0.6))
             Text(emptyTitle)
                 .font(metrics.font(12.5, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(needsAccountConfiguration ? .primary : .secondary)
             if let reason = emptyReason {
                 Text(reason)
                     .font(metrics.font(10.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(needsAccountConfiguration ? .secondary : .tertiary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if needsAccountConfiguration {
+                Button {
+                    showSettings()
+                } label: {
+                    Text("前往配置")
+                        .font(metrics.font(11, weight: .semibold))
+                        .padding(.horizontal, metrics.scaledSpacing(12))
+                        .padding(.vertical, metrics.scaledSpacing(5))
+                        .background(Capsule().fill(Color.accentColor.opacity(0.16)))
+                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, metrics.scaledSpacing(4))
+                .accessibilityLabel("前往配置 \(state.provider.displayName) 账号")
             }
         }
         .frame(maxWidth: .infinity)
@@ -239,7 +272,13 @@ struct ProviderDetailView: View {
     }
 
     private var emptyTitle: String {
-        state.status == .incompatible ? "探针输出格式不兼容" : "无数据"
+        if state.status == .incompatible {
+            return "探针输出格式不兼容"
+        }
+        if needsAccountConfiguration {
+            return "需要提供 \(state.provider.displayName) 账号"
+        }
+        return "无数据"
     }
 
     private var emptyReason: String? {
@@ -255,6 +294,9 @@ struct ProviderDetailView: View {
             return failure
         }
         guard state.hasLoaded else { return "正在读取探针" }
+        if needsAccountConfiguration {
+            return "请在配置中提供 \(state.provider.displayName) 账号，以查看 5 小时与 7 天使用量"
+        }
         return "探针没有返回窗口数据"
     }
 
@@ -327,7 +369,7 @@ struct ProviderDetailView: View {
 
     private var warningsList: some View {
         VStack(alignment: .leading, spacing: metrics.scaledSpacing(4)) {
-            ForEach(state.visibleWarnings, id: \.self) { warning in
+            ForEach(displayedWarnings, id: \.self) { warning in
                 HStack(alignment: .top, spacing: metrics.scaledSpacing(5)) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(metrics.font(9))

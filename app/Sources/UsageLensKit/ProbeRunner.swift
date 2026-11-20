@@ -96,14 +96,23 @@ public enum RepoLocator {
 
 // MARK: - 执行探针
 
-/// 定位脚本、运行并解析 stdout。DeepSeek 凭据只从钥匙串传给 DeepSeek 探针子进程。
+/// 定位脚本、运行并解析 stdout。凭据按厂商严格隔离，仅从钥匙串注入对应探针子进程。
 public struct ProbeRunner: ProbeProviding {
     public var root: URL?
     public var timeout: TimeInterval
+    private let deepSeekAPIKeyLoader: @Sendable () -> String?
+    private let geminiAccountLoader: @Sendable () -> GeminiAccount?
 
-    public init(root: URL? = nil, timeout: TimeInterval = 6) {
+    public init(
+        root: URL? = nil,
+        timeout: TimeInterval = 6,
+        deepSeekAPIKeyLoader: @escaping @Sendable () -> String? = { DeepSeekAPIKeyStore.load() },
+        geminiAccountLoader: @escaping @Sendable () -> GeminiAccount? = { GeminiAccountStore.load() }
+    ) {
         self.root = root
         self.timeout = timeout
+        self.deepSeekAPIKeyLoader = deepSeekAPIKeyLoader
+        self.geminiAccountLoader = geminiAccountLoader
     }
 
     public func report(for provider: Provider) async -> ProbeReport {
@@ -261,10 +270,27 @@ public struct ProbeRunner: ProbeProviding {
         // 契约要求 stdout 无颜色码；这里兜底，免得解析被 ANSI 污染。
         environment["NO_COLOR"] = "1"
         environment["TERM"] = "dumb"
-        if provider?.id == ProviderCatalog.deepseek.id,
-           let key = DeepSeekAPIKeyStore.load() {
-            // 仅注入 DeepSeek 探针；不会传给 Codex 或写入日志 / 文件。
-            environment["DEEPSEEK_API_KEY"] = key
+        if provider?.id == ProviderCatalog.deepseek.id {
+            if let key = deepSeekAPIKeyLoader() {
+                // 仅注入 DeepSeek 探针；不会传给其他厂商或写入日志 / 文件。
+                environment["DEEPSEEK_API_KEY"] = key
+            }
+        } else {
+            environment.removeValue(forKey: "DEEPSEEK_API_KEY")
+        }
+        if provider?.id == ProviderCatalog.gemini.id {
+            if let account = geminiAccountLoader() {
+                // 仅注入 Gemini 探针；不会传给 Codex / DeepSeek / OpenCode。
+                environment["GEMINI_ACCOUNT_EMAIL"] = account.email
+                environment["GEMINI_ACCESS_TOKEN"] = account.accessToken
+                if let projectID = account.projectID, !projectID.isEmpty {
+                    environment["GEMINI_PROJECT_ID"] = projectID
+                }
+            }
+        } else {
+            environment.removeValue(forKey: "GEMINI_ACCOUNT_EMAIL")
+            environment.removeValue(forKey: "GEMINI_ACCESS_TOKEN")
+            environment.removeValue(forKey: "GEMINI_PROJECT_ID")
         }
         // 仅用于保存前验证候选密钥；优先级高于钥匙串，绝不落盘。
         for (name, value) in environmentOverrides {

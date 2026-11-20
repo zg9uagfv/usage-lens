@@ -148,8 +148,14 @@ public enum ProviderReducer {
         next.isIncompatibleSchema = false
 
         if let envelope = report.envelope {
-            next.envelope = envelope
-            next.lastDataAt = report.finishedAt
+            let hasData = !envelope.windows.isEmpty
+                || envelope.balance != nil
+                || envelope.spend != nil
+                || envelope.usage != nil
+            if report.failure == nil || hasData {
+                next.envelope = envelope
+                next.lastDataAt = report.finishedAt
+            }
         }
 
         next.failureReason = report.failure

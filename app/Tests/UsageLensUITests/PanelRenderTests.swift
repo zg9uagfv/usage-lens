@@ -175,6 +175,65 @@ enum Fixtures {
             finishedAt: Date()
         )
     }
+
+    static func geminiNeedsAccountReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: nil, plan: nil),
+                windows: [],
+                warnings: ["请先在配置中提供 Gemini 账号以查看 5 小时与 7 天用量"]
+            ),
+            finishedAt: Date()
+        )
+    }
+
+    static func geminiConfiguredReport() -> ProbeReport {
+        let now = Date()
+        return ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "user@gmail.com", plan: "pro"),
+                generatedAt: now,
+                observedAt: now,
+                windows: [
+                    ProbeWindow(
+                        id: "5h",
+                        label: "5 小时",
+                        usedPercent: 35,
+                        windowSeconds: 18_000,
+                        resetsAt: now.addingTimeInterval(3 * 3600),
+                        basis: "server"
+                    ),
+                    ProbeWindow(
+                        id: "7d",
+                        label: "7 天",
+                        usedPercent: 60,
+                        windowSeconds: 604_800,
+                        resetsAt: now.addingTimeInterval(4 * 86_400),
+                        basis: "server"
+                    ),
+                ]
+            ),
+            finishedAt: now
+        )
+    }
+
+    static func geminiAuthErrorReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "user@gmail.com", plan: nil),
+                windows: [],
+                error: "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号"
+            ),
+            failure: "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号",
+            finishedAt: Date()
+        )
+    }
 }
 
 // MARK: - 离屏渲染
@@ -358,5 +417,92 @@ final class PanelRenderTests: XCTestCase {
         XCTAssertEqual(store.mostTense?.compactLabel, "Codex 5h 21%")
 
         try render(MenuBarLabel(store: store), named: "06-menubar", background: windowBackground)
+    }
+
+    func testGeminiNeedsAccountRendersEmptyGuidance() async throws {
+        let store = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiNeedsAccountReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await store.refreshAll()
+        let state = store.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertTrue(state.windows.isEmpty)
+        XCTAssertNil(state.accountLabel)
+        XCTAssertNil(store.mostTense)
+
+        let url = try render(PanelView(store: store), named: "10-gemini-needs-account", background: windowBackground)
+        let image = try XCTUnwrap(NSImage(contentsOf: url))
+        XCTAssertGreaterThan(image.size.width, 300)
+        XCTAssertGreaterThan(image.size.height, 200)
+    }
+
+    func testGeminiConfiguredShows5hAnd7dWindows() async throws {
+        let store = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await store.refreshAll()
+        let state = store.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(state.status, .ok)
+        XCTAssertEqual(state.accountLabel, "user@gmail.com")
+        XCTAssertEqual(state.windows.map(\.id), ["5h", "7d"])
+        XCTAssertEqual(store.mostTense?.compactLabel, "Gemini 7d 60%")
+
+        let url = try render(PanelView(store: store), named: "11-gemini-configured", background: windowBackground)
+        let image = try XCTUnwrap(NSImage(contentsOf: url))
+        XCTAssertGreaterThan(image.size.width, 300)
+        XCTAssertGreaterThan(image.size.height, 240)
+    }
+
+    func testGeminiAuthErrorRendersFailedAndStaleStates() async throws {
+        let failedStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiAuthErrorReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await failedStore.refreshAll()
+        XCTAssertEqual(failedStore.state(for: ProviderCatalog.gemini).status, .failed)
+        try render(PanelView(store: failedStore), named: "12-gemini-auth-failed", background: windowBackground)
+
+        let staleStore = makeStore(
+            SequencedProbeProvider([
+                ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport(), Fixtures.geminiAuthErrorReport()],
+            ]),
+            selected: ProviderCatalog.gemini
+        )
+        await staleStore.refreshAll()
+        await staleStore.refreshAll()
+        let staleState = staleStore.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(staleState.status, .stale)
+        XCTAssertEqual(staleState.windows.count, 2)
+        try render(PanelView(store: staleStore), named: "13-gemini-auth-stale", background: windowBackground)
+    }
+
+    func testSettingsPanelViewGeminiStatesAcrossDisplayScales() throws {
+        let launchAtLogin = LaunchAtLoginManager()
+        let profiles: [(String, DisplayScaleMetrics)] = [
+            ("compact", DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))),
+            ("baseline", DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900), physicalSizeMM: CGSize(width: 286, height: 179))),
+            ("mbp16", DisplayScaleMetrics.make(displaySize: CGSize(width: 1728, height: 1117), physicalSizeMM: CGSize(width: 345, height: 223))),
+            ("monitor27", DisplayScaleMetrics.make(displaySize: CGSize(width: 1920, height: 1080), visibleSize: CGSize(width: 1920, height: 1020), physicalSizeMM: CGSize(width: 597, height: 336))),
+        ]
+
+        for (label, metrics) in profiles {
+            let unconfigured = SettingsPanelView(
+                launchAtLogin: launchAtLogin,
+                hasSavedAPIKey: false,
+                savedGeminiAccountEmail: .some(nil),
+                initialExpandedProviderID: ProviderCatalog.gemini.id
+            ).environment(\.displayScaleMetrics, metrics)
+            try render(unconfigured, named: "14-settings-gemini-unconfigured-\(label)", background: windowBackground)
+
+            let configured = SettingsPanelView(
+                launchAtLogin: launchAtLogin,
+                hasSavedAPIKey: false,
+                savedGeminiAccountEmail: "user@gmail.com",
+                initialExpandedProviderID: ProviderCatalog.gemini.id
+            ).environment(\.displayScaleMetrics, metrics)
+            try render(configured, named: "15-settings-gemini-configured-\(label)", background: windowBackground)
+        }
     }
 }

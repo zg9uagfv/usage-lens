@@ -6,12 +6,24 @@ public struct Provider: Identifiable, Hashable, Sendable {
     public let displayName: String
     public let probeRelativePath: String
     public let requiresAPIKey: Bool
+    public let requiresAccount: Bool
 
-    public init(id: String, displayName: String, probeRelativePath: String, requiresAPIKey: Bool = false) {
+    public init(
+        id: String,
+        displayName: String,
+        probeRelativePath: String,
+        requiresAPIKey: Bool = false,
+        requiresAccount: Bool = false
+    ) {
         self.id = id
         self.displayName = displayName
         self.probeRelativePath = probeRelativePath
         self.requiresAPIKey = requiresAPIKey
+        self.requiresAccount = requiresAccount
+    }
+
+    public var requiresCredentials: Bool {
+        requiresAPIKey || requiresAccount
     }
 
     public var probeFileName: String {
@@ -36,7 +48,8 @@ public enum ProviderCatalog {
     public static let gemini = Provider(
         id: "gemini",
         displayName: "Gemini",
-        probeRelativePath: "probes/gemini.py"
+        probeRelativePath: "probes/gemini.py",
+        requiresAccount: true
     )
 
     public static let opencode = Provider(
