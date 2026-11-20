@@ -96,7 +96,7 @@ enum Theme {
         case .tech: isDark = true
         case .anime: isDark = false
         case .system:
-            isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            isDark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
 
         if percent >= 90 {
@@ -117,7 +117,7 @@ enum Theme {
         switch UsageLensTheme.current {
         case .tech: dark = true
         case .anime: dark = false
-        case .system: dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        case .system: dark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
         return dark ? Color.white.opacity(0.22) : Color.black.opacity(0.15)
     }
@@ -142,13 +142,14 @@ enum Theme {
 
 /// 卡片底：用 primary 的低透明度，深浅色自动反转。
 struct CardBackground: ViewModifier {
+    @Environment(\.displayScaleMetrics) private var metrics
     var corner: CGFloat = Theme.cardCorner
     var opacity: Double = 0.05
 
     func body(content: Content) -> some View {
         content
             .background(
-                RoundedRectangle(cornerRadius: corner, style: .continuous)
+                RoundedRectangle(cornerRadius: metrics.scaledSpacing(corner), style: .continuous)
                     .fill(UsageLensTheme.current.cardSurface)
             )
     }

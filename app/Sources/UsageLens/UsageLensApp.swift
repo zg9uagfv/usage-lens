@@ -34,6 +34,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var developmentPanel: NSPanel?
     private var settingsPanel: NSWindow?
     private var aboutPanel: NSWindow?
+    private let popoverScaleController = DisplayScaleController()
+    private let developmentScaleController = DisplayScaleController()
+    private let settingsScaleController = DisplayScaleController()
+    private let aboutScaleController = DisplayScaleController()
+    private var screenParametersObserver: NSObjectProtocol?
+    private var windowScreenObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 菜单栏常驻，不占 Dock。
@@ -44,11 +50,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.closeRestoredSwiftUISettingsWindow()
         }
 
+        let initialMetrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+        popoverScaleController.update(initialMetrics)
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 340, height: 560)
+        popover.contentSize = initialMetrics.popoverSize
         // rootView 用 AnyView 包一层：切主题时可原地替换 rootView 强制重渲，
         // 避免 NSHostingView 缓存旧外观导致文字颜色不跟随。
-        popover.contentViewController = NSHostingController<AnyView>(rootView: AnyView(panelView))
+        popover.contentViewController = NSHostingController<AnyView>(rootView: AnyView(scaledPopoverView))
         popover.appearance = UsageLensTheme.appkitAppearance
 
         let item = NSStatusBar.system.statusItem(withLength: 32)
@@ -60,6 +68,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateIcon()
         statusItem = item
         blinkTimer = Timer.scheduledTimer(timeInterval: 3.2, target: self, selector: #selector(blink), userInfo: nil, repeats: true)
+
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleScreenParametersDidChange()
+            }
+        }
 
         stateSubscription = store.objectWillChange.sink { [weak self] _ in
             // objectWillChange 在属性更新前发出，下一轮主队列再读取才能得到新标签。
@@ -78,6 +96,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         blinkTimer = nil
         openEyesTimer?.invalidate()
         openEyesTimer = nil
+        if let observer = screenParametersObserver {
+            NotificationCenter.default.removeObserver(observer)
+            screenParametersObserver = nil
+        }
+        for observer in windowScreenObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        windowScreenObservers.removeAll()
         statusItem?.button?.layer?.removeAnimation(forKey: "usageLens.criticalPulse")
     }
 
@@ -100,12 +126,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+            popoverScaleController.update(metrics)
+            popover.contentSize = metrics.popoverSize
+
             // 切主题后 NSPopover / NSHostingView 缓存的旧外观不会自动失效，
             // 必须在每次打开前：同步 appearance + 重建 rootView 强制 SwiftUI 用新外观重渲。
             let appearance = UsageLensTheme.appkitAppearance
             popover.appearance = appearance
             if let host = popover.contentViewController as? NSHostingController<AnyView> {
-                host.rootView = AnyView(panelView)
+                host.rootView = AnyView(scaledPopoverView)
             }
             popover.contentViewController?.view.appearance = appearance
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -145,8 +175,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showDevelopmentPanel() {
+        let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+        developmentScaleController.update(metrics)
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 368, height: 620),
+            contentRect: NSRect(origin: .zero, size: metrics.developmentPanelSize),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -154,11 +186,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.title = "UsageLens"
         panel.isReleasedWhenClosed = false
         panel.appearance = UsageLensTheme.appkitAppearance
-        panel.contentViewController = NSHostingController(rootView: panelView)
+        panel.contentViewController = NSHostingController(
+            rootView: ScaledHostingView(controller: developmentScaleController) { [self] in
+                panelView
+            }
+        )
+        observeScreenChange(
+            for: panel,
+            controller: developmentScaleController,
+            sizeFor: \.developmentPanelSize
+        )
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         developmentPanel = panel
+    }
+
+    private var scaledPopoverView: some View {
+        ScaledHostingView(controller: popoverScaleController) { [self] in
+            panelView
+        }
     }
 
     private var panelView: PanelView {
@@ -171,12 +218,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showAbout() {
         if let panel = aboutPanel {
+            panel.appearance = UsageLensTheme.appkitAppearance
+            refreshWindowScale(panel, controller: aboutScaleController, sizeFor: \.aboutWindowSize)
             panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
+        let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+        aboutScaleController.update(metrics)
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 230),
+            contentRect: NSRect(origin: .zero, size: metrics.aboutWindowSize),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -185,7 +236,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.level = .normal
         panel.appearance = UsageLensTheme.appkitAppearance
-        panel.contentViewController = NSHostingController(rootView: AboutPanelView())
+        panel.contentViewController = NSHostingController(
+            rootView: ScaledHostingView(controller: aboutScaleController) {
+                AboutPanelView()
+            }
+        )
+        observeScreenChange(
+            for: panel,
+            controller: aboutScaleController,
+            sizeFor: \.aboutWindowSize
+        )
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -194,12 +254,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSettings() {
         if let panel = settingsPanel {
+            panel.appearance = UsageLensTheme.appkitAppearance
+            refreshWindowScale(panel, controller: settingsScaleController, sizeFor: \.settingsWindowSize)
             panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
+        let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+        settingsScaleController.update(metrics)
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 520),
+            contentRect: NSRect(origin: .zero, size: metrics.settingsWindowSize),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -207,15 +271,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.title = "UsageLens 配置"
         panel.isReleasedWhenClosed = false
         panel.level = .normal
+        panel.appearance = UsageLensTheme.appkitAppearance
         panel.contentViewController = NSHostingController(
-            rootView: SettingsPanelView(launchAtLogin: launchAtLogin) { [weak self] in
-                self?.store.refresh()
+            rootView: ScaledHostingView(controller: settingsScaleController) { [weak self, launchAtLogin] in
+                SettingsPanelView(launchAtLogin: launchAtLogin) {
+                    self?.store.refresh()
+                }
             }
+        )
+        observeScreenChange(
+            for: panel,
+            controller: settingsScaleController,
+            sizeFor: \.settingsWindowSize
         )
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         settingsPanel = panel
+    }
+
+    private func activeStatusScreen() -> NSScreen? {
+        statusItem?.button?.window?.screen ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    private func observeScreenChange(
+        for window: NSWindow,
+        controller: DisplayScaleController,
+        sizeFor: @escaping (DisplayScaleMetrics) -> CGSize
+    ) {
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: window,
+            queue: .main
+        ) { [weak self, weak window] _ in
+            MainActor.assumeIsolated {
+                guard let self, let window else { return }
+                self.refreshWindowScale(window, controller: controller, sizeFor: sizeFor)
+            }
+        }
+        windowScreenObservers.append(observer)
+    }
+
+    private func handleScreenParametersDidChange() {
+        if popover.isShown {
+            let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())
+            popoverScaleController.update(metrics)
+            popover.contentSize = metrics.popoverSize
+        }
+        if let panel = settingsPanel {
+            refreshWindowScale(panel, controller: settingsScaleController, sizeFor: \.settingsWindowSize)
+        }
+        if let panel = aboutPanel {
+            refreshWindowScale(panel, controller: aboutScaleController, sizeFor: \.aboutWindowSize)
+        }
+        if let panel = developmentPanel {
+            refreshWindowScale(panel, controller: developmentScaleController, sizeFor: \.developmentPanelSize)
+        }
+    }
+
+    private func refreshWindowScale(
+        _ window: NSWindow,
+        controller: DisplayScaleController,
+        sizeFor: (DisplayScaleMetrics) -> CGSize
+    ) {
+        let metrics = DisplayScaleMetrics.from(screen: window.screen ?? activeStatusScreen())
+        controller.update(metrics)
+        resizeWindowPreservingCenter(window, to: sizeFor(metrics))
+    }
+
+    private func resizeWindowPreservingCenter(_ window: NSWindow, to contentSize: NSSize) {
+        let current = window.contentRect(forFrameRect: window.frame).size
+        guard abs(current.width - contentSize.width) >= 1 || abs(current.height - contentSize.height) >= 1 else {
+            return
+        }
+        let oldFrame = window.frame
+        let newFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).size
+        let newOrigin = NSPoint(
+            x: oldFrame.midX - newFrameSize.width / 2,
+            y: oldFrame.midY - newFrameSize.height / 2
+        )
+        window.setFrame(NSRect(origin: newOrigin, size: newFrameSize), display: true, animate: false)
     }
 
     private func closeRestoredSwiftUISettingsWindow() {

@@ -6,6 +6,7 @@ import UsageLensKit
 public struct PanelView: View {
     @ObservedObject private var store: UsageStore
     @StateObject private var launchAtLogin: LaunchAtLoginManager
+    @Environment(\.displayScaleMetrics) private var metrics
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
     @AppStorage("usageLens.providers") private var providerIDs = ProviderCatalog.defaultActiveIDs.joined(separator: ",")
     @ObservedObject private var themeSignal = ThemeChangeSignal.shared
@@ -30,13 +31,13 @@ public struct PanelView: View {
             ProviderTabBar(store: store)
             Divider().opacity(0.35)
             ProviderDetailView(state: store.state(for: store.selected))
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
-                .padding(.bottom, 14)
+                .padding(.horizontal, metrics.scaledSpacing(14))
+                .padding(.top, metrics.scaledSpacing(12))
+                .padding(.bottom, metrics.scaledSpacing(14))
             Divider().opacity(0.35)
             FooterBar(store: store, launchAtLogin: launchAtLogin, showSettings: showSettings, showAbout: showAbout)
         }
-        .frame(width: Theme.panelWidth)
+        .frame(width: metrics.panelWidth)
         .background(selectedTheme.panelBackground)
         .tint(selectedTheme.accent)
         .preferredColorScheme(selectedTheme.colorScheme)
@@ -70,29 +71,32 @@ private struct ThemeHostBridge: NSViewRepresentable {
 
 struct ProviderTabBar: View {
     @ObservedObject var store: UsageStore
+    @Environment(\.displayScaleMetrics) private var metrics
 
     var body: some View {
-        HStack(spacing: 3) {
+        let dotSize = metrics.scaledSpacing(6)
+        let tabCorner = metrics.scaledSpacing(8)
+        HStack(spacing: metrics.scaledSpacing(3)) {
             ForEach(ProviderCatalog.active) { provider in
                 let isSelected = store.selected == provider
                 Button {
                     store.selected = provider
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: metrics.scaledSpacing(5)) {
                         Circle()
                             .fill(Theme.statusColor(store.state(for: provider).status))
-                            .frame(width: 6, height: 6)
+                            .frame(width: dotSize, height: dotSize)
                         Text(provider.displayName)
-                            .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                            .font(metrics.font(12, weight: isSelected ? .semibold : .medium))
                             .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                     }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, metrics.scaledSpacing(9))
+                    .padding(.vertical, metrics.scaledSpacing(6))
                     .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: tabCorner, style: .continuous)
                             .fill(isSelected ? Color.primary.opacity(0.10) : Color.clear)
                     )
-                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .contentShape(RoundedRectangle(cornerRadius: tabCorner, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(provider.displayName) 用量")
@@ -100,8 +104,8 @@ struct ProviderTabBar: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.horizontal, metrics.scaledSpacing(10))
+        .padding(.vertical, metrics.scaledSpacing(9))
     }
 }
 
@@ -109,11 +113,12 @@ struct ProviderTabBar: View {
 
 struct ProviderDetailView: View {
     let state: ProviderState
+    @Environment(\.displayScaleMetrics) private var metrics
 
     private var isDimmed: Bool { state.isDimmed }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(12)) {
             header
 
             if state.isDataStale {
@@ -154,19 +159,19 @@ struct ProviderDetailView: View {
 
     // 账号 + plan
     private var header: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: metrics.scaledSpacing(6)) {
             Text(state.accountLabel ?? "未提供账号")
-                .font(.system(size: 11.5, weight: .medium))
+                .font(metrics.font(11.5, weight: .medium))
                 .foregroundStyle(state.accountLabel == nil ? Color.secondary : Color.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
 
             if let plan = UsageFormat.planLabel(state.planLabel) {
                 Text(plan)
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(metrics.font(9, weight: .semibold))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1.5)
+                    .padding(.horizontal, metrics.scaledSpacing(5))
+                    .padding(.vertical, metrics.scaledSpacing(1.5))
                     .background(Capsule().fill(Color.primary.opacity(0.07)))
             }
             Spacer(minLength: 0)
@@ -174,27 +179,27 @@ struct ProviderDetailView: View {
     }
 
     private var staleDataNote: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: metrics.scaledSpacing(5)) {
             Image(systemName: "clock")
-                .font(.system(size: 10, weight: .medium))
+                .font(metrics.font(10, weight: .medium))
             Text(UsageFormat.staleMessage(observedAt: state.observedAt))
-                .font(.system(size: 10.5, weight: .medium))
+                .font(metrics.font(10.5, weight: .medium))
             Spacer(minLength: 0)
         }
         .foregroundStyle(.secondary)
     }
 
     private var loadingRow: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: metrics.scaledSpacing(7)) {
             ProgressView().controlSize(.small)
-            Text("读取探针…").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("读取探针…").font(metrics.font(11)).foregroundStyle(.secondary)
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 18)
+        .padding(.vertical, metrics.scaledSpacing(18))
     }
 
     private var windowsSection: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: metrics.scaledSpacing(8)) {
             ForEach(state.windows) { window in
                 WindowRowView(window: window, observedAt: state.observedAt)
             }
@@ -203,33 +208,33 @@ struct ProviderDetailView: View {
 
     // 没有窗口概念的服务（例如 DeepSeek）：不画进度条，只说明。
     private var noWindowCaption: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "minus.circle").font(.system(size: 10))
-            Text("该服务无窗口配额").font(.system(size: 11))
+        HStack(spacing: metrics.scaledSpacing(5)) {
+            Image(systemName: "minus.circle").font(metrics.font(10))
+            Text("该服务无窗口配额").font(metrics.font(11))
             Spacer(minLength: 0)
         }
         .foregroundStyle(.secondary)
     }
 
     private var emptyTile: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: metrics.scaledSpacing(6)) {
             Image(systemName: "chart.bar.xaxis")
-                .font(.system(size: 18, weight: .regular))
+                .font(metrics.font(18, weight: .regular))
                 .foregroundStyle(.tertiary)
             Text(emptyTitle)
-                .font(.system(size: 12.5, weight: .semibold))
+                .font(metrics.font(12.5, weight: .semibold))
                 .foregroundStyle(.secondary)
             if let reason = emptyReason {
                 Text(reason)
-                    .font(.system(size: 10.5))
+                    .font(metrics.font(10.5))
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .padding(.horizontal, 12)
+        .padding(.vertical, metrics.scaledSpacing(20))
+        .padding(.horizontal, metrics.scaledSpacing(12))
         .cardBackground(opacity: 0.04)
     }
 
@@ -254,7 +259,7 @@ struct ProviderDetailView: View {
     }
 
     private var metricsRow: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: metrics.scaledSpacing(8)) {
             if let balance = state.envelope?.balance {
                 MetricTile(
                     title: "余额",
@@ -293,23 +298,23 @@ struct ProviderDetailView: View {
     }
 
     private func staleBanner(_ failure: String) -> some View {
-        HStack(alignment: .top, spacing: 7) {
+        HStack(alignment: .top, spacing: metrics.scaledSpacing(7)) {
             Image(systemName: "clock.arrow.circlepath")
-                .font(.system(size: 10.5, weight: .medium))
+                .font(metrics.font(10.5, weight: .medium))
                 .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: metrics.scaledSpacing(2)) {
                 Text(staleTitle)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(metrics.font(11, weight: .medium))
                 Text(failure)
-                    .font(.system(size: 10.5))
+                    .font(metrics.font(10.5))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
-        .padding(9)
+        .padding(metrics.scaledSpacing(9))
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: metrics.scaledSpacing(8), style: .continuous)
                 .fill(Color.orange.opacity(0.12))
         )
     }
@@ -321,15 +326,15 @@ struct ProviderDetailView: View {
     }
 
     private var warningsList: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(4)) {
             ForEach(state.visibleWarnings, id: \.self) { warning in
-                HStack(alignment: .top, spacing: 5) {
+                HStack(alignment: .top, spacing: metrics.scaledSpacing(5)) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
+                        .font(metrics.font(9))
                         .foregroundStyle(.orange)
-                        .padding(.top, 1.5)
+                        .padding(.top, metrics.scaledSpacing(1.5))
                     Text(warning)
-                        .font(.system(size: 10.5))
+                        .font(metrics.font(10.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
@@ -345,6 +350,7 @@ struct WindowRowView: View {
     let window: ProbeWindow
     /// 数据源时间，用来写「窗口已过期（数据 3 天前）」。
     let observedAt: Date?
+    @Environment(\.displayScaleMetrics) private var metrics
 
     /// 窗口过了重置时间：数值仍是最后一帧，但不能再画成「活跃」的高饱和色。
     private var isExpired: Bool {
@@ -361,13 +367,13 @@ struct WindowRowView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(7)) {
+            HStack(alignment: .firstTextBaseline, spacing: metrics.scaledSpacing(8)) {
                 Text(window.label ?? window.id)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(metrics.font(12, weight: .semibold))
                 Spacer(minLength: 0)
                 Text(UsageFormat.usedText(window.usedPercent))
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(metrics.font(12, weight: .semibold))
                     .monospacedDigit()
                     .foregroundStyle(percentTint)
             }
@@ -377,7 +383,7 @@ struct WindowRowView: View {
                 tint: barTint
             )
 
-            HStack(spacing: 6) {
+            HStack(spacing: metrics.scaledSpacing(6)) {
                 if isExpired {
                     // 过期窗口不显示倒计时，只说数据有多旧。
                     Text(UsageFormat.expiredMessage(observedAt: observedAt))
@@ -392,12 +398,12 @@ struct WindowRowView: View {
                     Text(basis).foregroundStyle(.tertiary)
                 }
             }
-            .font(.system(size: 10.5))
+            .font(metrics.font(10.5))
             .foregroundStyle(.secondary)
             .monospacedDigit()
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 10)
+        .padding(.horizontal, metrics.scaledSpacing(11))
+        .padding(.vertical, metrics.scaledSpacing(10))
         .cardBackground()
         .accessibilityElement(children: .combine)
     }
@@ -406,6 +412,7 @@ struct WindowRowView: View {
 struct ProgressTrack: View {
     let fraction: Double?
     let tint: Color
+    @Environment(\.displayScaleMetrics) private var metrics
 
     var body: some View {
         GeometryReader { proxy in
@@ -421,7 +428,7 @@ struct ProgressTrack: View {
                                 endPoint: .trailing
                             )
                         )
-                        .frame(width: max(proxy.size.width * fraction, 4))
+                        .frame(width: max(proxy.size.width * fraction, metrics.scaledSpacing(4, minimum: 3)))
                 } else {
                     Capsule()
                         .strokeBorder(
@@ -431,7 +438,7 @@ struct ProgressTrack: View {
                 }
             }
         }
-        .frame(height: Theme.barHeight)
+        .frame(height: metrics.scaledSpacing(Theme.barHeight, minimum: 4))
         .animation(.easeOut(duration: 0.25), value: fraction)
         .accessibilityHidden(true)
     }
@@ -441,25 +448,26 @@ struct MetricTile: View {
     let title: String
     let value: String
     let note: String?
+    @Environment(\.displayScaleMetrics) private var metrics
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(2)) {
             Text(title)
-                .font(.system(size: 9.5, weight: .medium))
+                .font(metrics.font(9.5, weight: .medium))
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.system(size: 14, weight: .semibold))
+                .font(metrics.font(14, weight: .semibold))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
             if let note {
                 Text(note)
-                    .font(.system(size: 9))
+                    .font(metrics.font(9))
                     .foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(9)
+        .padding(metrics.scaledSpacing(9))
         .cardBackground(corner: 9)
     }
 }
@@ -469,33 +477,35 @@ struct MetricTile: View {
 struct FooterBar: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var launchAtLogin: LaunchAtLoginManager
+    @Environment(\.displayScaleMetrics) private var metrics
     let showSettings: () -> Void
     let showAbout: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: metrics.scaledSpacing(10)) {
             refreshButton
             Spacer(minLength: 0)
             Text(UsageFormat.updatedText(at: store.state(for: store.selected).lastDataAt))
-                .font(.system(size: 10.5))
+                .font(metrics.font(10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             aboutButton
             settingsButton
             quitButton
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, metrics.scaledSpacing(12))
+        .padding(.vertical, metrics.scaledSpacing(8))
     }
 
     private var aboutButton: some View {
-        Button {
+        let buttonSize = metrics.scaledDimension(24, minimum: 20)
+        return Button {
             showAbout()
         } label: {
             Image(systemName: "info.circle")
-                .font(.system(size: 10, weight: .semibold))
+                .font(metrics.font(10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
+                .frame(width: buttonSize, height: buttonSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -504,13 +514,14 @@ struct FooterBar: View {
     }
 
     private var settingsButton: some View {
-        Button {
+        let buttonSize = metrics.scaledDimension(24, minimum: 20)
+        return Button {
             showSettings()
         } label: {
             Image(systemName: "gearshape")
-                .font(.system(size: 10, weight: .semibold))
+                .font(metrics.font(10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
+                .frame(width: buttonSize, height: buttonSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -522,9 +533,9 @@ struct FooterBar: View {
         Button {
             store.refresh()
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: metrics.scaledSpacing(4)) {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(metrics.font(9.5, weight: .semibold))
                     .rotationEffect(.degrees(store.isRefreshing ? 360 : 0))
                     .animation(
                         store.isRefreshing
@@ -533,10 +544,10 @@ struct FooterBar: View {
                         value: store.isRefreshing
                     )
                 Text(store.isRefreshing ? "刷新中" : "刷新")
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(metrics.font(10.5, weight: .medium))
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4.5)
+            .padding(.horizontal, metrics.scaledSpacing(9))
+            .padding(.vertical, metrics.scaledSpacing(4.5))
             .background(Capsule().fill(Color.primary.opacity(0.08)))
             .contentShape(Capsule())
         }
@@ -550,9 +561,9 @@ struct FooterBar: View {
             NSApp.terminate(nil)
         } label: {
             Image(systemName: "power")
-                .font(.system(size: 9.5, weight: .semibold))
+                .font(metrics.font(9.5, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .padding(5)
+                .padding(metrics.scaledSpacing(5))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

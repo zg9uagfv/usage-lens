@@ -4,6 +4,7 @@ import UsageLensKit
 
 /// 「关于 usage-lens」：图标 + 名称 + 版本/构建号。
 public struct AboutPanelView: View {
+    @Environment(\.displayScaleMetrics) private var metrics
     @AppStorage("usageLens.theme") private var themeRawValue = UsageLensTheme.system.rawValue
 
     private var selectedTheme: UsageLensTheme {
@@ -13,26 +14,26 @@ public struct AboutPanelView: View {
     public init() {}
 
     public var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: metrics.scaledSpacing(14)) {
             Text("关于")
-                .font(.system(size: 17, weight: .semibold))
+                .font(metrics.font(17, weight: .semibold))
 
             // 菜单栏同款「眼睛」图标，放大展示。
             MenuBarIconImage()
-                .frame(width: 64, height: 54)
+                .frame(width: metrics.scaledDimension(64), height: metrics.scaledDimension(54))
 
-            VStack(spacing: 3) {
+            VStack(spacing: metrics.scaledSpacing(3)) {
                 Text("usage-lens")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(metrics.font(15, weight: .semibold))
                 Text("\(appVersion)（构建 \(buildNumber)）")
-                    .font(.system(size: 11.5))
+                    .font(metrics.font(11.5))
                     .foregroundStyle(.secondary)
                 Text("菜单栏用量看板 · Codex / DeepSeek")
-                    .font(.system(size: 10.5))
+                    .font(metrics.font(10.5))
                     .foregroundStyle(.tertiary)
             }
         }
-        .frame(width: 280, height: 230)
+        .frame(width: metrics.aboutWindowSize.width, height: metrics.aboutWindowSize.height)
         .background(selectedTheme.panelBackground)
         .preferredColorScheme(selectedTheme.colorScheme)
     }
