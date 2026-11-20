@@ -22,12 +22,14 @@ public struct SettingsPanelView: View {
     @State private var isVerifyingGeminiAccount = false
 
     private let onAPIKeyChange: () -> Void
+    private let onCredentialChange: ((Provider) -> Void)?
 
     public init(
         launchAtLogin: LaunchAtLoginManager,
         hasSavedAPIKey: Bool? = nil,
         savedGeminiAccountEmail: String?? = nil,
         initialExpandedProviderID: String? = nil,
+        onCredentialChange: ((Provider) -> Void)? = nil,
         onAPIKeyChange: @escaping () -> Void = {}
     ) {
         self.launchAtLogin = launchAtLogin
@@ -42,6 +44,7 @@ public struct SettingsPanelView: View {
         }
         _savedGeminiAccountEmail = State(initialValue: resolvedGeminiEmail)
         _expandedCredentialProviderID = State(initialValue: initialExpandedProviderID)
+        self.onCredentialChange = onCredentialChange
         self.onAPIKeyChange = onAPIKeyChange
     }
 
@@ -382,7 +385,7 @@ public struct SettingsPanelView: View {
                 apiKeyDraft = ""
                 expandedCredentialProviderID = nil
                 apiKeyStatus = nil
-                onAPIKeyChange()
+                notifyCredentialChange(for: ProviderCatalog.deepseek)
             } catch {
                 apiKeyStatus = "保存失败：\(error.localizedDescription)"
             }
@@ -397,7 +400,7 @@ public struct SettingsPanelView: View {
             apiKeyDraft = ""
             expandedCredentialProviderID = ProviderCatalog.deepseek.id
             apiKeyStatus = "已从钥匙串删除。"
-            onAPIKeyChange()
+            notifyCredentialChange(for: ProviderCatalog.deepseek)
         } catch {
             apiKeyStatus = "删除失败：\(error.localizedDescription)"
         }
@@ -427,7 +430,7 @@ public struct SettingsPanelView: View {
                 geminiTokenDraft = ""
                 geminiProjectIDDraft = ""
                 geminiAccountStatus = "已验证并保存到钥匙串。"
-                onAPIKeyChange()
+                notifyCredentialChange(for: ProviderCatalog.gemini)
             } catch {
                 geminiAccountStatus = "保存失败：\(error.localizedDescription)"
             }
@@ -444,9 +447,14 @@ public struct SettingsPanelView: View {
             geminiProjectIDDraft = ""
             expandedCredentialProviderID = ProviderCatalog.gemini.id
             geminiAccountStatus = "已从钥匙串删除。"
-            onAPIKeyChange()
+            notifyCredentialChange(for: ProviderCatalog.gemini)
         } catch {
             geminiAccountStatus = "删除失败：\(error.localizedDescription)"
         }
+    }
+
+    private func notifyCredentialChange(for provider: Provider) {
+        onCredentialChange?(provider)
+        onAPIKeyChange()
     }
 }

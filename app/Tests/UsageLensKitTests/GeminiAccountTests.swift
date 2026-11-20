@@ -261,4 +261,80 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(cleared.windows.isEmpty)
         XCTAssertNil(Tension.mostTense(in: [cleared], now: now))
     }
+
+    func testAuthFailureAfterUnconfiguredOrEmptyQuotaBecomesFailed() {
+        let now = Date()
+
+        // 1. 未配置账号成功 envelope（0 窗口、无指标）后遇到 HTTP 401 -> 必须进入 .failed，而不是 .stale
+        let unconfigured = ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: nil, plan: nil),
+                windows: [],
+                warnings: ["请先在配置中提供 Gemini 账号以查看 5 小时与 7 天用量"]
+            ),
+            finishedAt: now
+        )
+        let auth401 = ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "user@gmail.com", plan: nil),
+                windows: [],
+                error: "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号"
+            ),
+            failure: "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号",
+            finishedAt: now.addingTimeInterval(30)
+        )
+
+        var state = ProviderState(provider: ProviderCatalog.gemini)
+        state = ProviderReducer.apply(unconfigured, to: state)
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertFalse(state.hasDisplayableUsage)
+
+        state = ProviderReducer.apply(auth401, to: state)
+        XCTAssertEqual(state.status, .failed)
+        XCTAssertFalse(state.isStale)
+        XCTAssertNil(state.envelope)
+        XCTAssertNil(state.lastDataAt)
+        XCTAssertTrue(state.windows.isEmpty)
+        XCTAssertEqual(state.failureReason, auth401.failure)
+        XCTAssertNil(Tension.mostTense(in: [state], now: now))
+
+        // 2. 已配置账号但返回空配额（0 窗口、无指标）后遇到 HTTP 403 -> 也必须进入 .failed
+        let emptyQuota = ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "user@gmail.com", plan: "free"),
+                windows: [],
+                warnings: ["未返回任何配额窗口"]
+            ),
+            finishedAt: now
+        )
+        let auth403 = ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "user@gmail.com", plan: nil),
+                windows: [],
+                error: "Gemini 账号凭据无权限（HTTP 403），请在配置中重新提供账号"
+            ),
+            failure: "Gemini 账号凭据无权限（HTTP 403），请在配置中重新提供账号",
+            finishedAt: now.addingTimeInterval(60)
+        )
+
+        var emptyState = ProviderReducer.apply(emptyQuota, to: ProviderState(provider: ProviderCatalog.gemini))
+        XCTAssertEqual(emptyState.status, .warning)
+        XCTAssertFalse(emptyState.hasDisplayableUsage)
+
+        emptyState = ProviderReducer.apply(auth403, to: emptyState)
+        XCTAssertEqual(emptyState.status, .failed)
+        XCTAssertFalse(emptyState.isStale)
+        XCTAssertNil(emptyState.envelope)
+        XCTAssertNil(emptyState.lastDataAt)
+        XCTAssertTrue(emptyState.windows.isEmpty)
+        XCTAssertEqual(emptyState.failureReason, auth403.failure)
+    }
 }

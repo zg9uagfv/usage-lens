@@ -50,9 +50,10 @@ public struct ProviderState: Sendable, Equatable {
 
     public var windows: [ProbeWindow] { envelope?.windows ?? [] }
     public var hasWindows: Bool { !windows.isEmpty }
+    public var hasDisplayableUsage: Bool { envelope?.hasDisplayableUsage ?? false }
 
-    /// 失败但还有旧值可显示 = 灰化态。
-    public var isStale: Bool { failureReason != nil && envelope != nil && !isMissingProbe }
+    /// 失败但还有可展示的旧值 = 灰化态。
+    public var isStale: Bool { failureReason != nil && hasDisplayableUsage && !isMissingProbe }
 
     /// 契约的 stale：数据源帧太旧（探针明确置位，不靠 warnings 兜底）。
     public var isDataStale: Bool { envelope?.dataIsStale ?? false }
@@ -69,10 +70,10 @@ public struct ProviderState: Sendable, Equatable {
         guard hasLoaded else { return .loading }
         if isIncompatibleSchema { return .incompatible }
         if failureReason != nil {
-            // 有旧值 → 灰化保留；没有旧值 → 明确报错，而不是伪装成「空的」。
-            return envelope == nil ? .failed : .stale
+            // 有可展示的旧值 → 灰化保留；没有旧值 → 明确报错，而不是伪装成「空的」。
+            return hasDisplayableUsage ? .stale : .failed
         }
-        if !hasWindows && envelope?.balance == nil && envelope?.spend == nil && envelope?.usage == nil {
+        if !hasDisplayableUsage {
             return (warnings.isEmpty && !isDataStale) ? .empty : .warning
         }
         return (warnings.isEmpty && !isDataStale) ? .ok : .warning
@@ -147,19 +148,31 @@ public enum ProviderReducer {
         next.isMissingProbe = false
         next.isIncompatibleSchema = false
 
-        if let envelope = report.envelope {
-            let hasData = !envelope.windows.isEmpty
-                || envelope.balance != nil
-                || envelope.spend != nil
-                || envelope.usage != nil
-            if report.failure == nil || hasData {
+        if report.failure == nil {
+            if let envelope = report.envelope {
                 next.envelope = envelope
                 next.lastDataAt = report.finishedAt
+            }
+        } else {
+            if let envelope = report.envelope, envelope.hasDisplayableUsage {
+                next.envelope = envelope
+                next.lastDataAt = report.finishedAt
+            } else if next.envelope?.hasDisplayableUsage != true {
+                // 之前的 envelope 不含可展示用量（例如未配置账号或空配额），失败时不保留为“上次成功值”。
+                next.envelope = nil
+                next.lastDataAt = nil
             }
         }
 
         next.failureReason = report.failure
         return next
+    }
+}
+
+extension ProbeEnvelope {
+    /// 是否包含可展示的用量数据（窗口配额或余额/花费/token 指标）。
+    public var hasDisplayableUsage: Bool {
+        !windows.isEmpty || balance != nil || spend != nil || usage != nil
     }
 }
 

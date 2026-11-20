@@ -274,9 +274,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.appearance = UsageLensTheme.appkitAppearance
         panel.contentViewController = NSHostingController(
             rootView: ScaledHostingView(controller: settingsScaleController) { [weak self, launchAtLogin] in
-                SettingsPanelView(launchAtLogin: launchAtLogin) {
-                    self?.store.refresh()
-                }
+                SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    onCredentialChange: { [weak self] provider in
+                        self?.store.credentialsDidChange(for: provider)
+                    }
+                )
             }
         )
         observeScreenChange(

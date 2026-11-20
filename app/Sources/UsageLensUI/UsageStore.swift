@@ -13,6 +13,9 @@ public final class UsageStore: ObservableObject {
     private let provider: any ProbeProviding
     private let refreshInterval: TimeInterval
     private var loop: Task<Void, Never>?
+    private var activeRefreshTask: Task<Void, Never>?
+    private var credentialGenerations: [Provider: UInt64] = [:]
+    private var needsFollowUpRefresh = false
 
     public init(
         provider: any ProbeProviding = ProbeRunner(),
@@ -61,7 +64,32 @@ public final class UsageStore: ObservableObject {
     }
 
     public func refresh() {
-        Task { await refreshAll() }
+        if isRefreshing {
+            needsFollowUpRefresh = true
+            return
+        }
+        guard activeRefreshTask == nil else {
+            needsFollowUpRefresh = true
+            return
+        }
+        activeRefreshTask = Task { [weak self] in
+            await self?.refreshAll()
+        }
+    }
+
+    /// 凭据保存或删除后调用：立即作废正在进行的旧凭据刷新结果、清空该厂商旧账号状态，
+    /// 并合并触发一次使用新凭据的后续刷新，确保新凭据状态始终胜出。
+    public func credentialsDidChange(for provider: Provider) {
+        credentialGenerations[provider, default: 0] &+= 1
+        var cleared = ProviderState(provider: provider)
+        cleared.isRefreshing = true
+        states[provider] = cleared
+        needsFollowUpRefresh = true
+        if !isRefreshing && activeRefreshTask == nil {
+            activeRefreshTask = Task { [weak self] in
+                await self?.refreshAll()
+            }
+        }
     }
 
     public func stop() {
@@ -84,28 +112,46 @@ public final class UsageStore: ObservableObject {
     }
 
     public func refreshAll() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing else {
+            needsFollowUpRefresh = true
+            return
+        }
         isRefreshing = true
-        for provider in ProviderCatalog.active {
-            states[provider]?.isRefreshing = true
+        defer {
+            isRefreshing = false
+            activeRefreshTask = nil
         }
 
-        let probe = self.provider
-        let reports = await withTaskGroup(of: ProbeReport.self, returning: [ProbeReport].self) { group in
-            for provider in ProviderCatalog.active {
-                group.addTask { await probe.report(for: provider) }
+        repeat {
+            needsFollowUpRefresh = false
+            let activeProviders = ProviderCatalog.active
+            var capturedGenerations: [Provider: UInt64] = [:]
+            for provider in activeProviders {
+                capturedGenerations[provider] = credentialGenerations[provider, default: 0]
+                states[provider]?.isRefreshing = true
             }
-            var collected: [ProbeReport] = []
-            for await report in group { collected.append(report) }
-            return collected
-        }
 
-        for report in reports {
-            guard let previous = states[report.provider] else { continue }
-            states[report.provider] = ProviderReducer.apply(report, to: previous)
-        }
-        isRefreshing = false
-        debugSummaryIfRequested()
+            let probe = self.provider
+            let reports = await withTaskGroup(of: ProbeReport.self, returning: [ProbeReport].self) { group in
+                for provider in activeProviders {
+                    group.addTask { await probe.report(for: provider) }
+                }
+                var collected: [ProbeReport] = []
+                for await report in group { collected.append(report) }
+                return collected
+            }
+
+            for report in reports {
+                let currentGen = credentialGenerations[report.provider, default: 0]
+                guard capturedGenerations[report.provider] == currentGen else {
+                    // 刷新期间该厂商凭据已变更，丢弃旧凭据时代的结果，避免旧账号数据回填。
+                    continue
+                }
+                guard let previous = states[report.provider] else { continue }
+                states[report.provider] = ProviderReducer.apply(report, to: previous)
+            }
+            debugSummaryIfRequested()
+        } while needsFollowUpRefresh
     }
 
     /// DEBUG_SUMMARY 的一行文案：只有 provider / 状态 / 百分比 / 失败原因，且统一脱敏。

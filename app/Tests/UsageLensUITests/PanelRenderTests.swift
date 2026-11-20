@@ -28,6 +28,78 @@ actor SequencedProbeProvider: ProbeProviding {
     }
 }
 
+/// 可控阻塞探针：用于在单测中确定性地在 refreshAll() 飞行途中触发凭据保存/删除。
+actor GatedProbeProvider: ProbeProviding {
+    private var reportsByProvider: [Provider: [ProbeReport]]
+    private var callCounts: [Provider: Int] = [:]
+    private var gateProvider: Provider?
+    private var gateOnCall: Int?
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var didStartGatedCall = false
+    private var didReleaseGatedCall = false
+
+    init(_ reportsByProvider: [Provider: [ProbeReport]]) {
+        self.reportsByProvider = reportsByProvider
+    }
+
+    func armGate(provider: Provider, onCall: Int) {
+        gateProvider = provider
+        gateOnCall = onCall
+        didStartGatedCall = false
+        didReleaseGatedCall = false
+        startedContinuation = nil
+        releaseContinuation = nil
+    }
+
+    func waitUntilGatedCallStarts() async {
+        if didStartGatedCall { return }
+        await withCheckedContinuation { continuation in
+            startedContinuation = continuation
+        }
+    }
+
+    func releaseGatedCall() {
+        didReleaseGatedCall = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func calls(for provider: Provider) -> Int {
+        callCounts[provider, default: 0]
+    }
+
+    func report(for provider: Provider) async -> ProbeReport {
+        let callIndex = callCounts[provider, default: 0] + 1
+        callCounts[provider] = callIndex
+
+        let report: ProbeReport
+        if var list = reportsByProvider[provider], !list.isEmpty {
+            report = list.removeFirst()
+            reportsByProvider[provider] = list
+        } else {
+            report = ProbeReport(
+                provider: provider,
+                failure: "未安装探针 \(provider.probeRelativePath)",
+                isMissingProbe: true
+            )
+        }
+
+        if provider == gateProvider && callIndex == gateOnCall {
+            didStartGatedCall = true
+            startedContinuation?.resume()
+            startedContinuation = nil
+            if !didReleaseGatedCall {
+                await withCheckedContinuation { continuation in
+                    releaseContinuation = continuation
+                }
+            }
+        }
+
+        return report
+    }
+}
+
 // MARK: - 样本
 
 enum Fixtures {
@@ -286,6 +358,164 @@ final class PanelRenderTests: XCTestCase {
         Color(nsColor: .windowBackgroundColor)
     }
 
+    /// 用 AppKit NSHostingView + 离屏 NSWindow 渲染真实 SwiftUI 视图（可正确渲染 ScrollView/TextField/SecureField）。
+    @discardableResult
+    private func renderHosted(
+        _ view: some View,
+        size: CGSize,
+        appearance: NSAppearance? = nil,
+        scrollToBottom: Bool = false,
+        named name: String,
+        inspectView: ((NSView) -> Void)? = nil
+    ) throws -> (url: URL, cgImage: CGImage) {
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+        _ = NSApplication.shared
+        let hostingView = NSHostingView(rootView: view)
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        if let appearance {
+            hostingView.appearance = appearance
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: NSPoint(x: -10_000, y: -10_000), size: size),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        if let appearance {
+            window.appearance = appearance
+        }
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+        hostingView.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+        hostingView.layoutSubtreeIfNeeded()
+
+        if scrollToBottom, let scrollView = firstDescendant(ofType: NSScrollView.self, in: hostingView),
+           let documentView = scrollView.documentView {
+            let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+            let targetPoint = documentView.isFlipped ? NSPoint(x: 0, y: maxY) : NSPoint(x: 0, y: 0)
+            scrollView.contentView.scroll(to: targetPoint)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        inspectView?(hostingView)
+
+        guard let rep = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) else {
+            throw XCTSkip("无法创建 bitmapImageRep")
+        }
+        hostingView.cacheDisplay(in: hostingView.bounds, to: rep)
+        guard let cgImage = rep.cgImage,
+              let png = rep.representation(using: .png, properties: [:]) else {
+            throw XCTSkip("无法编码 hosted PNG")
+        }
+        let url = outputDirectory.appendingPathComponent("\(name).png")
+        try png.write(to: url)
+        window.orderOut(nil)
+        window.contentView = nil
+        print("rendered-hosted: \(url.path) \(cgImage.width)x\(cgImage.height)")
+        return (url, cgImage)
+    }
+
+    private func firstDescendant<T: NSView>(ofType type: T.Type, in view: NSView) -> T? {
+        if let match = view as? T { return match }
+        for subview in view.subviews {
+            if let match = firstDescendant(ofType: type, in: subview) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private func allDescendants<T: NSView>(ofType type: T.Type, in view: NSView) -> [T] {
+        var result: [T] = []
+        if let match = view as? T {
+            result.append(match)
+        }
+        for subview in view.subviews {
+            result.append(contentsOf: allDescendants(ofType: type, in: subview))
+        }
+        return result
+    }
+
+    /// 断言渲染图像非空白/非纯色/非全透明：必须存在足够多与背景色明显不同的可见像素。
+    private func assertNonBlankImage(
+        _ cgImage: CGImage,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let width = cgImage.width
+        let height = cgImage.height
+        XCTAssertGreaterThan(width, 100, "\(context): image width too small", file: file, line: line)
+        XCTAssertGreaterThan(height, 100, "\(context): image height too small", file: file, line: line)
+
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            XCTFail("\(context): failed to create CGContext for pixel check", file: file, line: line)
+            return
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        // 取左上角内缩像素作为背景基准，统计与背景显著不同的非透明像素比例。
+        let sampleX = min(4, width - 1)
+        let sampleY = min(4, height - 1)
+        let baseOffset = sampleY * bytesPerRow + sampleX * 4
+        let baseR = Int(pixels[baseOffset])
+        let baseG = Int(pixels[baseOffset + 1])
+        let baseB = Int(pixels[baseOffset + 2])
+
+        var opaqueCount = 0
+        var differingCount = 0
+        let totalPixels = width * height
+        for idx in stride(from: 0, to: pixels.count, by: 4) {
+            let r = Int(pixels[idx])
+            let g = Int(pixels[idx + 1])
+            let b = Int(pixels[idx + 2])
+            let a = Int(pixels[idx + 3])
+            if a > 10 {
+                opaqueCount += 1
+                let diff = abs(r - baseR) + abs(g - baseG) + abs(b - baseB)
+                if diff > 24 {
+                    differingCount += 1
+                }
+            }
+        }
+
+        let opaqueRatio = Double(opaqueCount) / Double(totalPixels)
+        let contentRatio = Double(differingCount) / Double(totalPixels)
+        XCTAssertGreaterThan(opaqueRatio, 0.5, "\(context): image appears transparent (opaqueRatio=\(opaqueRatio))", file: file, line: line)
+        XCTAssertGreaterThan(
+            contentRatio,
+            0.015,
+            "\(context): image appears blank or uniform (contentRatio=\(contentRatio), differing=\(differingCount)/\(totalPixels))",
+            file: file,
+            line: line
+        )
+    }
+
+    private func appearance(for theme: UsageLensTheme) -> NSAppearance? {
+        switch theme {
+        case .tech: return NSAppearance(named: .darkAqua)
+        case .anime: return NSAppearance(named: .aqua)
+        case .system: return NSAppearance(named: .aqua)
+        }
+    }
+
     func testCodexTabShowsWindows() async throws {
         let store = makeStore(SequencedProbeProvider([ProviderCatalog.codex: [Fixtures.codexReport()]]))
         await store.refreshAll()
@@ -478,7 +708,101 @@ final class PanelRenderTests: XCTestCase {
         try render(PanelView(store: staleStore), named: "13-gemini-auth-stale", background: windowBackground)
     }
 
-    func testSettingsPanelViewGeminiStatesAcrossDisplayScales() throws {
+    func testDeleteCredentialsDuringInFlightRefreshClearsAndCoalesces() async {
+        let oldReport = ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                account: ProbeAccount(label: "old-account@example.com", plan: "pro"),
+                generatedAt: Date(),
+                observedAt: Date(),
+                windows: [
+                    ProbeWindow(id: "5h", label: "5 小时", usedPercent: 45, windowSeconds: 18_000, resetsAt: Date().addingTimeInterval(3600), basis: "server"),
+                    ProbeWindow(id: "7d", label: "7 天", usedPercent: 72, windowSeconds: 604_800, resetsAt: Date().addingTimeInterval(86_400), basis: "server"),
+                ]
+            ),
+            finishedAt: Date()
+        )
+        let gated = GatedProbeProvider([
+            ProviderCatalog.gemini: [oldReport, oldReport, Fixtures.geminiNeedsAccountReport()],
+            ProviderCatalog.codex: [Fixtures.codexReport(), Fixtures.codexReport(), Fixtures.codexReport()],
+            ProviderCatalog.deepseek: [Fixtures.deepseekReport(), Fixtures.deepseekReport(), Fixtures.deepseekReport()],
+        ])
+        let store = makeStore(gated, selected: ProviderCatalog.gemini)
+
+        // 1. 首次刷新建立旧账号状态
+        await store.refreshAll()
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).accountLabel, "old-account@example.com")
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).windows.count, 2)
+
+        // 2. 第 2 次刷新中途暂停（仍持有旧账号结果）
+        await gated.armGate(provider: ProviderCatalog.gemini, onCall: 2)
+        let inFlight = Task { await store.refreshAll() }
+        await gated.waitUntilGatedCallStarts()
+
+        // 3. 在刷新飞行途中删除凭据：旧账号状态必须立即清空
+        store.credentialsDidChange(for: ProviderCatalog.gemini)
+        XCTAssertNil(store.state(for: ProviderCatalog.gemini).accountLabel)
+        XCTAssertTrue(store.state(for: ProviderCatalog.gemini).windows.isEmpty)
+        XCTAssertNil(store.state(for: ProviderCatalog.gemini).envelope)
+
+        // 4. 放行旧凭据探针结果：必须被作废，且自动合并执行第 3 次（新凭据状态）刷新
+        await gated.releaseGatedCall()
+        await inFlight.value
+
+        let calls = await gated.calls(for: ProviderCatalog.gemini)
+        XCTAssertEqual(calls, 3, "凭据删除后应合并触发一次后续刷新")
+        let finalState = store.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(finalState.status, .warning)
+        XCTAssertNil(finalState.accountLabel, "旧账号结果不得回填")
+        XCTAssertTrue(finalState.windows.isEmpty, "旧账号窗口不得残留")
+    }
+
+    func testSaveCredentialsDuringInFlightRefreshInvalidatesUnconfiguredResult() async {
+        let gated = GatedProbeProvider([
+            ProviderCatalog.gemini: [
+                Fixtures.geminiNeedsAccountReport(),
+                Fixtures.geminiNeedsAccountReport(),
+                Fixtures.geminiConfiguredReport(),
+            ],
+            ProviderCatalog.codex: [Fixtures.codexReport(), Fixtures.codexReport(), Fixtures.codexReport()],
+            ProviderCatalog.deepseek: [Fixtures.deepseekReport(), Fixtures.deepseekReport(), Fixtures.deepseekReport()],
+        ])
+        let store = makeStore(gated, selected: ProviderCatalog.gemini)
+
+        // 1. 首次刷新处于未配置状态
+        await store.refreshAll()
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).status, .warning)
+        XCTAssertNil(store.state(for: ProviderCatalog.gemini).accountLabel)
+
+        // 2. 第 2 次刷新飞行途中保存新账号
+        await gated.armGate(provider: ProviderCatalog.gemini, onCall: 2)
+        let inFlight = Task { await store.refreshAll() }
+        await gated.waitUntilGatedCallStarts()
+
+        store.credentialsDidChange(for: ProviderCatalog.gemini)
+        await gated.releaseGatedCall()
+        await inFlight.value
+
+        let calls = await gated.calls(for: ProviderCatalog.gemini)
+        XCTAssertEqual(calls, 3, "保存凭据后应合并触发一次后续刷新")
+        let finalState = store.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(finalState.status, .ok)
+        XCTAssertEqual(finalState.accountLabel, "user@gmail.com")
+        XCTAssertEqual(finalState.windows.map(\.id), ["5h", "7d"])
+        XCTAssertEqual(store.mostTense?.compactLabel, "Gemini 7d 60%")
+    }
+
+    func testSettingsAndGeminiPanelAcrossDisplayProfilesAndThemes() async throws {
+        let previousTheme = UserDefaults.standard.string(forKey: "usageLens.theme")
+        defer {
+            if let previousTheme {
+                UserDefaults.standard.set(previousTheme, forKey: "usageLens.theme")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "usageLens.theme")
+            }
+        }
+
         let launchAtLogin = LaunchAtLoginManager()
         let profiles: [(String, DisplayScaleMetrics)] = [
             ("compact", DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))),
@@ -487,22 +811,106 @@ final class PanelRenderTests: XCTestCase {
             ("monitor27", DisplayScaleMetrics.make(displaySize: CGSize(width: 1920, height: 1080), visibleSize: CGSize(width: 1920, height: 1020), physicalSizeMM: CGSize(width: 597, height: 336))),
         ]
 
-        for (label, metrics) in profiles {
-            let unconfigured = SettingsPanelView(
-                launchAtLogin: launchAtLogin,
-                hasSavedAPIKey: false,
-                savedGeminiAccountEmail: .some(nil),
-                initialExpandedProviderID: ProviderCatalog.gemini.id
-            ).environment(\.displayScaleMetrics, metrics)
-            try render(unconfigured, named: "14-settings-gemini-unconfigured-\(label)", background: windowBackground)
+        // 预备三个 Gemini 面板状态
+        let needsAccountStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiNeedsAccountReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await needsAccountStore.refreshAll()
 
-            let configured = SettingsPanelView(
-                launchAtLogin: launchAtLogin,
-                hasSavedAPIKey: false,
-                savedGeminiAccountEmail: "user@gmail.com",
-                initialExpandedProviderID: ProviderCatalog.gemini.id
-            ).environment(\.displayScaleMetrics, metrics)
-            try render(configured, named: "15-settings-gemini-configured-\(label)", background: windowBackground)
+        let configuredStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await configuredStore.refreshAll()
+
+        let authErrorStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiAuthErrorReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await authErrorStore.refreshAll()
+
+        for theme in UsageLensTheme.allCases {
+            UserDefaults.standard.set(theme.rawValue, forKey: "usageLens.theme")
+            let nsAppearance = appearance(for: theme)
+
+            for (label, metrics) in profiles {
+                // 1. Settings（未配置 Gemini 展开）：必须通过 NSHostingView 渲染 ScrollView + SecureField/TextField，且非空白
+                let unconfiguredSettings = SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    hasSavedAPIKey: false,
+                    savedGeminiAccountEmail: .some(nil),
+                    initialExpandedProviderID: ProviderCatalog.gemini.id
+                ).environment(\.displayScaleMetrics, metrics)
+                let (_, unconfiguredImg) = try renderHosted(
+                    unconfiguredSettings,
+                    size: metrics.settingsWindowSize,
+                    appearance: nsAppearance,
+                    scrollToBottom: true,
+                    named: "14-settings-gemini-unconfigured-\(theme.rawValue)-\(label)",
+                    inspectView: { root in
+                        XCTAssertNotNil(self.firstDescendant(ofType: NSScrollView.self, in: root))
+                        let secureFields = self.allDescendants(ofType: NSSecureTextField.self, in: root)
+                        XCTAssertFalse(secureFields.isEmpty, "未配置 Gemini 表单应包含 SecureField (\(theme.rawValue)/\(label))")
+                    }
+                )
+                assertNonBlankImage(unconfiguredImg, context: "settings-unconfigured-\(theme.rawValue)-\(label)")
+
+                // 2. Settings（已配置 Gemini 展开）：展示邮箱 + 固定掩码，不得回填明文令牌，且非空白
+                let configuredSettings = SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    hasSavedAPIKey: false,
+                    savedGeminiAccountEmail: "user@gmail.com",
+                    initialExpandedProviderID: ProviderCatalog.gemini.id
+                ).environment(\.displayScaleMetrics, metrics)
+                let (_, configuredImg) = try renderHosted(
+                    configuredSettings,
+                    size: metrics.settingsWindowSize,
+                    appearance: nsAppearance,
+                    scrollToBottom: true,
+                    named: "15-settings-gemini-configured-\(theme.rawValue)-\(label)",
+                    inspectView: { root in
+                        let fields = self.allDescendants(ofType: NSTextField.self, in: root)
+                        XCTAssertTrue(
+                            fields.contains { $0.stringValue == "user@gmail.com" },
+                            "已配置 Settings 应展示保存的账号邮箱 (\(theme.rawValue)/\(label))"
+                        )
+                        XCTAssertTrue(
+                            fields.contains { $0.stringValue == "****************" },
+                            "已配置 Settings 应展示固定掩码令牌 (\(theme.rawValue)/\(label))"
+                        )
+                    }
+                )
+                assertNonBlankImage(configuredImg, context: "settings-configured-\(theme.rawValue)-\(label)")
+
+                // 3. Gemini 面板三态（needs-account / configured 5h+7d / auth-error）在 4 档显示配置 × 3 主题下全部验证非空白
+                let panelHeight = metrics.scaledDimension(320, minimum: 260)
+                let panelSize = CGSize(width: metrics.panelWidth, height: panelHeight)
+
+                let (_, needsImg) = try renderHosted(
+                    PanelView(store: needsAccountStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "16-panel-gemini-needs-account-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(needsImg, context: "panel-needs-account-\(theme.rawValue)-\(label)")
+
+                let (_, okImg) = try renderHosted(
+                    PanelView(store: configuredStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "17-panel-gemini-configured-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(okImg, context: "panel-configured-\(theme.rawValue)-\(label)")
+
+                let (_, errImg) = try renderHosted(
+                    PanelView(store: authErrorStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "18-panel-gemini-auth-error-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(errImg, context: "panel-auth-error-\(theme.rawValue)-\(label)")
+            }
         }
     }
 }
