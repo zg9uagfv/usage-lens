@@ -244,7 +244,7 @@ struct ProviderDetailView: View {
                 .replacingOccurrences(of: "）", with: "")
         }
         if state.isMissingProbe {
-            return "未安装探针 \(state.provider.probeRelativePath)"
+            return state.failureReason ?? "暂未内置 \(state.provider.displayName) 探针"
         }
         if let failure = state.failureReason {
             return failure
@@ -261,7 +261,7 @@ struct ProviderDetailView: View {
                     value: UsageFormat.money(balance.amount, currency: balance.currency) ?? "未知",
                     note: UsageFormat.sourceLabel(balance.source)
                 )
-            } else if state.envelope != nil {
+            } else if state.envelope != nil, state.provider.requiresAPIKey {
                 MetricTile(title: "余额", value: "未知", note: "未获取")
             }
 

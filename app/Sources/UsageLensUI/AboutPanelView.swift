@@ -27,7 +27,7 @@ public struct AboutPanelView: View {
                 Text("\(appVersion)（构建 \(buildNumber)）")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-                Text("菜单栏用量看板 · Codex / DeepSeek")
+                Text("菜单栏用量看板 · Codex / Gemini / DeepSeek")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
             }

@@ -34,6 +34,7 @@ public enum ProbeKey: String, CodingKey {
     case today
     case todayTokens = "today_tokens"
     case window
+    case total
     case from
     case to
     case note
@@ -202,12 +203,20 @@ public struct ProbeBalance: Decodable, Sendable, Equatable {
 public struct ProbeSpend: Decodable, Sendable, Equatable {
     public var today: Double?
     public var window: Double?
+    public var total: Double?
     public var currency: String?
     public var source: String?
 
-    public init(today: Double? = nil, window: Double? = nil, currency: String? = nil, source: String? = nil) {
+    public init(
+        today: Double? = nil,
+        window: Double? = nil,
+        total: Double? = nil,
+        currency: String? = nil,
+        source: String? = nil
+    ) {
         self.today = today
         self.window = window
+        self.total = total
         self.currency = currency
         self.source = source
     }
@@ -216,6 +225,7 @@ public struct ProbeSpend: Decodable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: ProbeKey.self)
         today = container.optionalDouble(.today)
         window = container.optionalDouble(.window)
+        total = container.optionalDouble(.total)
         currency = container.optionalString(.currency)
         source = container.optionalString(.source)
     }

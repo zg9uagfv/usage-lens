@@ -131,7 +131,7 @@ public struct SettingsPanelView: View {
             }
             .disabled(addableProviders.isEmpty)
 
-            Text("管理要显示的模型厂商。模型用量来自各厂商的本地记录或探针。")
+            Text("管理要显示的模型厂商。模型用量来自各厂商的本地记录或官方接口。")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
 

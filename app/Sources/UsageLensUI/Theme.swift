@@ -96,7 +96,7 @@ enum Theme {
         case .tech: isDark = true
         case .anime: isDark = false
         case .system:
-            isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            isDark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
 
         if percent >= 90 {
@@ -117,7 +117,7 @@ enum Theme {
         switch UsageLensTheme.current {
         case .tech: dark = true
         case .anime: dark = false
-        case .system: dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        case .system: dark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
         return dark ? Color.white.opacity(0.22) : Color.black.opacity(0.15)
     }

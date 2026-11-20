@@ -120,7 +120,7 @@ final class ContractV2Tests: XCTestCase {
     }
 
     func testSchemaMismatchIsTreatedAsIncompatible() throws {
-        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let runner = ProbeRunner()
         let json = #"{"schema":"usage-lens/probe@9","provider":"codex","windows":[{"id":"5h","used_percent":88}]}"#
         let report = runner.decode(
             provider: ProviderCatalog.codex,
@@ -263,7 +263,7 @@ final class SecretRedactorTests: XCTestCase {
     }
 
     func testStderrReachingUIIsRedacted() {
-        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let runner = ProbeRunner()
         let report = runner.decode(
             provider: ProviderCatalog.codex,
             stdout: "",
@@ -525,112 +525,9 @@ final class BlockingStateTests: XCTestCase {
     }
 }
 
-final class ProbeProcessDrainTests: XCTestCase {
-    /// 审查实测：200KB stderr 会在旧实现里死锁。这里跑 1MB stdout + 200KB stderr。
-    func testLargeOutputIsFullyDrainedWithoutTimeout() async throws {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/process-tests", isDirectory: true)
-        let probes = root.appendingPathComponent("probes", isDirectory: true)
-        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
-
-        let script = probes.appendingPathComponent("big.py")
-        let json = #"{"schema": "usage-lens/probe@1", "provider": "codex", "windows": [{"id": "5h", "used_percent": 21, "window_seconds": 18000, "resets_at": "2099-01-01T00:00:00Z", "basis": "server"}]}"#
-        let scriptText = """
-        import sys
-        sys.stdout.write('\(json)' + ' ' * (1024 * 1024))
-        sys.stdout.flush()
-        sys.stderr.write('E' * (200 * 1024))
-        sys.stderr.flush()
-        """
-        try scriptText.write(to: script, atomically: true, encoding: .utf8)
-
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/big.py")
-        let runner = ProbeRunner(root: root, timeout: 5)
-
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
-
-        XCTAssertNil(report.failure)
-        XCTAssertEqual(report.envelope?.windows.first?.usedPercent, 21)
-        XCTAssertLessThan(elapsed, 4.0, "大输出不该走到超时")
-
-        switch await runner.execute(probe: script, workingDirectory: root, timeout: 5) {
-        case .output(let output):
-            XCTAssertFalse(output.timedOut)
-            XCTAssertGreaterThanOrEqual(output.stdout.count, 1024 * 1024, "stdout 必须读完整")
-            XCTAssertGreaterThanOrEqual(output.stderr.count, 200 * 1024, "stderr 必须读完整")
-        case .failedToStart(let message):
-            XCTFail("探针启动失败：\(message)")
-        }
-    }
-}
-
-final class ProbeProcessWatchdogTests: XCTestCase {
-    private func makeRoot() throws -> URL {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/watchdog-tests", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("probes", isDirectory: true),
-            withIntermediateDirectories: true
-        )
-        return root
-    }
-
-    /// 探针 fork 的子进程持有管道：report() 必须 ~3s 内返回并判失败，不能等 20s。
-    func testChildHoldingPipeDoesNotHang() async throws {
-        let root = try makeRoot()
-        let script = root.appendingPathComponent("probes/leaky.py")
-        let json = #"{"schema":"usage-lens/probe@1","provider":"codex","windows":[{"id":"5h","used_percent":21,"basis":"server"}]}"#
-        let text = """
-        import subprocess, sys
-        subprocess.Popen(["sleep", "20"])  # 继承 stdout/stderr，退出后仍持有管道
-        sys.stdout.write('\(json)')
-        sys.stdout.flush()
-        sys.stderr.write("helper spawned\\n")
-        sys.stderr.flush()
-        """
-        try text.write(to: script, atomically: true, encoding: .utf8)
-
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/leaky.py")
-        let runner = ProbeRunner(root: root, timeout: 5)
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
-
-        XCTAssertLessThan(elapsed, 4.0, "不能等子进程退出")
-        XCTAssertNotNil(report.failure)
-        XCTAssertTrue(report.failure?.contains("未正常关闭") ?? false, report.failure ?? "nil")
-        XCTAssertNil(report.envelope)
-    }
-
-    /// 死循环输出：必须被 8MB/流上限拦住并 kill，不能把内存吃穿。
-    func testInfiniteOutputIsCapped() async throws {
-        let root = try makeRoot()
-        let script = root.appendingPathComponent("probes/flood.py")
-        let text = """
-        import sys
-        while True:
-            sys.stdout.write("x" * 65536)
-            sys.stdout.flush()
-        """
-        try text.write(to: script, atomically: true, encoding: .utf8)
-
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/flood.py")
-        let runner = ProbeRunner(root: root, timeout: 10)
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
-
-        XCTAssertLessThan(elapsed, 6.0, "超限必须立刻终止，不靠超时")
-        XCTAssertTrue(report.failure?.contains("输出超限") ?? false, report.failure ?? "nil")
-        XCTAssertNil(report.envelope)
-    }
-}
-
 final class ProbeRunnerDecodeTests: XCTestCase {
     func testNonZeroExitWithJSONKeepsEnvelope() {
-        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let runner = ProbeRunner()
         let json = #"{"schema":"usage-lens/probe@1","provider":"codex","error":"日志目录不可读","warnings":["w1"]}"#
         let report = runner.decode(
             provider: ProviderCatalog.codex,
@@ -646,7 +543,7 @@ final class ProbeRunnerDecodeTests: XCTestCase {
     }
 
     func testNonZeroExitWithCleanJSONIsNotAFailure() {
-        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let runner = ProbeRunner()
         let json = #"{"schema":"usage-lens/probe@1","provider":"codex","windows":[{"id":"5h","used_percent":21,"basis":"server"}]}"#
         let report = runner.decode(
             provider: ProviderCatalog.codex,
@@ -661,7 +558,7 @@ final class ProbeRunnerDecodeTests: XCTestCase {
     }
 
     func testBrokenStdoutUsesStderrLine() {
-        let runner = ProbeRunner(root: URL(fileURLWithPath: "/tmp"))
+        let runner = ProbeRunner()
         let report = runner.decode(
             provider: ProviderCatalog.codex,
             stdout: "",

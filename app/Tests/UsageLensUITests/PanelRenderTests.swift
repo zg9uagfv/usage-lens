@@ -22,7 +22,7 @@ actor SequencedProbeProvider: ProbeProviding {
         }
         return ProbeReport(
             provider: provider,
-            failure: "未安装探针 \(provider.probeRelativePath)",
+            failure: "暂未内置 \(provider.displayName) 探针",
             isMissingProbe: true
         )
     }
@@ -73,6 +73,22 @@ enum Fixtures {
                 spend: ProbeSpend(today: 0.42, window: 3.18, currency: "CNY", source: "estimate"),
                 coverage: ProbeCoverage(from: "2026-11-01", to: "2026-11-15", note: "本地日志覆盖，非官方账单"),
                 warnings: ["余额需要 API key", "无本地用量记录，花费为 0"]
+            ),
+            finishedAt: Date()
+        )
+    }
+
+    static func geminiReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.gemini,
+            envelope: ProbeEnvelope(
+                provider: "gemini",
+                windows: [],
+                balance: nil,
+                spend: ProbeSpend(today: 0.34, window: 1.85, currency: "USD", source: "estimate"),
+                usage: ProbeUsage(todayTokens: 123_964, source: "local"),
+                coverage: ProbeCoverage(from: "2026-11-17", to: "2026-11-20", note: "按本地会话日志逐日聚合，非官方账单"),
+                warnings: ["今日另有 cache tokens 742682，不计入主数字"]
             ),
             finishedAt: Date()
         )
@@ -358,5 +374,20 @@ final class PanelRenderTests: XCTestCase {
         XCTAssertEqual(store.mostTense?.compactLabel, "Codex 5h 21%")
 
         try render(MenuBarLabel(store: store), named: "06-menubar", background: windowBackground)
+    }
+
+    func testGeminiTabShowsLocalUsageAndSpend() async throws {
+        let store = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await store.refreshAll()
+        let state = store.state(for: ProviderCatalog.gemini)
+        XCTAssertEqual(state.status, .warning)
+        XCTAssertTrue(state.windows.isEmpty)
+        XCTAssertEqual(state.envelope?.usage?.todayTokens, 123_964)
+        XCTAssertEqual(state.envelope?.spend?.currency, "USD")
+
+        try render(PanelView(store: store), named: "10-gemini", background: windowBackground)
     }
 }

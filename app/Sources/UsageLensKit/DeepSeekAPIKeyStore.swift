@@ -55,14 +55,14 @@ public enum DeepSeekAPIKeyStore {
         guard status == errSecItemNotFound else { try check(status); return }
     }
 
-    /// 在写入钥匙串前，让 DeepSeek 探针用候选密钥请求官方余额接口。
-    /// 密钥仅作为子进程环境变量存在，不会写文件或出现在错误文案中。
+    /// 在写入钥匙串前，直接用候选密钥请求 DeepSeek 官方余额接口。
+    /// 密钥仅在内存内用于本次请求，不会写文件、不经子进程，也不出现在错误文案中。
     public static func validationMessage(for rawKey: String, runner: ProbeRunner = ProbeRunner()) async -> String? {
         let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return "API Key 不能为空" }
         let report = await runner.report(
             for: ProviderCatalog.deepseek,
-            environmentOverrides: ["DEEPSEEK_API_KEY": key]
+            apiKeyOverride: key
         )
         guard report.failure == nil,
               report.envelope?.balance?.source?.lowercased() == "official" else {

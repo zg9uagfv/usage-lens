@@ -4,7 +4,7 @@
 
 **把 AI 编程工具的用量状态，放进 macOS 菜单栏。**
 
-Codex 配额与本地 token 统计 · DeepSeek 余额与花费估算 · 三种外观主题
+Codex 配额与本地 token 统计 · Gemini 本地用量与花费估算 · DeepSeek 余额与花费估算 · 三种外观主题
 
 </div>
 
@@ -26,7 +26,7 @@ Codex 配额与本地 token 统计 · DeepSeek 余额与花费估算 · 三种�
 
 ## 这个项目做什么
 
-UsageLens 是一个 SwiftUI macOS 菜单栏用量看板。它从本机 Codex 与 DeepSeek 的日志读取数据，用小面板展示配额窗口、重置时间、余额和用量；不需要打开多个开发工具，也不把本地会话日志上传到 UsageLens 服务。
+UsageLens 是一个纯 Swift / SwiftUI 原生 macOS 菜单栏用量看板。它直接从本机 Codex、Gemini 与 DeepSeek 的日志读取数据，用小面板展示配额窗口、重置时间、余额和用量；零 Python 运行时依赖，也不把本地会话日志上传到 UsageLens 服务。
 
 菜单栏图标是一双会眨眼的眼睛。点击后可以切换已启用的模型厂商、手动刷新数据，也可以打开配置页更换主题、添加或移除厂商、设置登录后启动。
 
@@ -35,9 +35,10 @@ UsageLens 是一个 SwiftUI macOS 菜单栏用量看板。它从本机 Codex 与
 | 工具 | 显示内容 | 数据来源 |
 |---|---|---|
 | **Codex** | 5 小时与 7 天配额、重置倒计时、计划类型、今日 tokens | `~/.codex/sessions/` 本地会话日志 |
+| **Gemini** | 今日 tokens、今日与近 7 天花费估算 | `~/.gemini/` 本地会话日志（Antigravity / Gemini CLI） |
 | **DeepSeek** | 账户余额、今日与近 7 天花费估算 | 官方余额接口 + 本地 DeepSeek 会话记录 |
 
-DeepSeek 余额查询需要 API Key，可在面板的齿轮配置页添加；密钥保存在 macOS 钥匙串，并只传给 DeepSeek 探针。也支持 `DEEPSEEK_API_KEY` 环境变量用于开发。UsageLens 只向 `https://api.deepseek.com` 查询余额；缺少 key 时仍会尝试展示本地花费估算。花费是根据本地 token 记录和公开牌价计算的估值，不等同于官方账单。
+DeepSeek 余额查询需要 API Key，可在面板的齿轮配置页添加；密钥保存在 macOS 钥匙串，仅在内存内用于官方余额请求。也支持 `DEEPSEEK_API_KEY` 环境变量用于开发。UsageLens 只向 `https://api.deepseek.com` 查询余额；缺少 key 时仍会尝试展示本地花费估算。花费是根据本地 token 记录和公开牌价计算的估值，不等同于官方账单。
 
 ### 界面主题
 
@@ -56,11 +57,7 @@ cd usage-lens/app
 open dist/UsageLens.app
 ```
 
-建议在仓库内运行，让 App 能找到 `probes/`。若把 App 移到其他目录，需通过 `USAGE_LENS_ROOT` 指向仓库根目录：
-
-```bash
-open --env USAGE_LENS_ROOT=/path/to/usage-lens app/dist/UsageLens.app
-```
+应用为纯 Swift 自包含 `.app`，可直接拖放到 `/Applications` 运行，无需外部脚本或 Python 环境。
 
 开发时也可以通过环境变量提供 DeepSeek API Key：
 
@@ -88,15 +85,16 @@ swift test
 ## 项目结构
 
 ```text
-probes/                 Python 探针：读取本机数据并输出统一 JSON
-app/Sources/UsageLensKit/ 契约解析、探针运行、状态归约与格式化
-app/Sources/UsageLensUI/ SwiftUI 面板、配置页与刷新状态
-app/Sources/UsageLens/   macOS 菜单栏入口
-app/Tests/               Kit 与界面渲染测试
-docs/                    需求、架构与数据来源说明
+app/Sources/UsageLensKit/
+  Probes/                 纯 Swift 原生探针（Codex / Gemini / DeepSeek）
+  ...                     契约模型、状态归约、钥匙串与格式化
+app/Sources/UsageLensUI/  SwiftUI 面板、配置页与刷新状态
+app/Sources/UsageLens/    macOS 菜单栏入口
+app/Tests/                探针、Kit 与界面渲染测试
+docs/                     需求、架构与数据来源说明
 ```
 
-每个探针输出 `usage-lens/probe@1` JSON。App 负责解析和展示，具体数据读取留在独立探针中。
+所有探针均以纯 Swift 实现在 `UsageLensKit` 中，输出统一的 `ProbeEnvelope` 契约模型。
 
 ## 文档
 
@@ -107,4 +105,4 @@ docs/                    需求、架构与数据来源说明
 
 ## 当前边界
 
-当前内置 provider 为 Codex 与 DeepSeek。自定义 provider、按模型 / 项目归因、账单报表与导出尚未实现。欢迎通过 Issue 讨论新的数据源与接入方式。
+当前内置纯 Swift 探针支持 Codex、Gemini 与 DeepSeek。自定义 provider、按模型 / 项目归因、账单报表与导出尚未实现。欢迎通过 Issue 讨论新的数据源与接入方式。

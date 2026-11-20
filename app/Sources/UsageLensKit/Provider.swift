@@ -1,48 +1,38 @@
 import Foundation
 
-/// 一个 provider = 一行配置：id / 显示名 / 探针路径。
+/// 一个 provider = 一行配置：id / 显示名 / 是否需要 API Key。
 public struct Provider: Identifiable, Hashable, Sendable {
     public let id: String
     public let displayName: String
-    public let probeRelativePath: String
     public let requiresAPIKey: Bool
 
-    public init(id: String, displayName: String, probeRelativePath: String, requiresAPIKey: Bool = false) {
+    public init(id: String, displayName: String, requiresAPIKey: Bool = false) {
         self.id = id
         self.displayName = displayName
-        self.probeRelativePath = probeRelativePath
         self.requiresAPIKey = requiresAPIKey
-    }
-
-    public var probeFileName: String {
-        (probeRelativePath as NSString).lastPathComponent
     }
 }
 
 public enum ProviderCatalog {
     public static let codex = Provider(
         id: "codex",
-        displayName: "Codex",
-        probeRelativePath: "probes/codex.py"
+        displayName: "Codex"
     )
 
     public static let deepseek = Provider(
         id: "deepseek",
         displayName: "DeepSeek",
-        probeRelativePath: "probes/deepseek.py",
         requiresAPIKey: true
     )
 
     public static let gemini = Provider(
         id: "gemini",
-        displayName: "Gemini",
-        probeRelativePath: "probes/gemini.py"
+        displayName: "Gemini"
     )
 
     public static let opencode = Provider(
         id: "opencode",
-        displayName: "OpenCode",
-        probeRelativePath: "probes/opencode.py"
+        displayName: "OpenCode"
     )
 
     /// 可添加的厂商。显示顺序由这里决定。
