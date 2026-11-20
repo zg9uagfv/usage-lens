@@ -1,28 +1,41 @@
 import AppKit
+import CoreGraphics
 import SwiftUI
 
-/// Immutable display-aware scaling metrics derived from a screen's logical size.
+/// Immutable display-aware scaling metrics derived from a screen's physical and logical size.
 ///
 /// Core math operates on plain `CGSize` values with zero `NSScreen` side effects so
 /// unit tests and offscreen `ImageRenderer` checks are 100% deterministic.
 public struct DisplayScaleMetrics: Equatable, Sendable {
+    // 13.3" 16:10 MacBook reference baseline (~337.4 mm diagonal)
     public static let referenceDisplaySize = CGSize(width: 1440, height: 900)
+    public static let referencePhysicalSizeMM = CGSize(width: 286, height: 179)
 
+    // Physical vs logical blend and logarithmic response gains
+    public static let physicalRatioWeight: CGFloat = 0.60
+    public static let sizeCurveGain: CGFloat = 1.15
+    public static let fontCurveGain: CGFloat = 1.00
+
+    // Plausible EDID physical dimension bounds (10 cm .. 300 cm)
+    public static let minValidPhysicalMillimeters: CGFloat = 100
+    public static let maxValidPhysicalMillimeters: CGFloat = 3000
+
+    // Scale clamps & readability floor
     public static let minSizeScale: CGFloat = 0.85
-    public static let maxSizeScale: CGFloat = 1.35
+    public static let maxSizeScale: CGFloat = 1.60
 
     public static let minFontScale: CGFloat = 0.88
-    public static let maxFontScale: CGFloat = 1.30
+    public static let maxFontScale: CGFloat = 1.50
     public static let minimumFontSize: CGFloat = 8.5
 
+    // Visible-frame safety ratios
     public static let maxVisibleWidthRatio: CGFloat = 0.90
     public static let maxVisibleHeightRatio: CGFloat = 0.85
 
-    // Base (1.0x) surface sizes
+    // Base (1.0x) surface sizes (Settings window and SettingsPanelView unified on 360 × 520)
     public static let basePopoverSize = CGSize(width: 340, height: 560)
     public static let baseDevelopmentPanelSize = CGSize(width: 368, height: 620)
     public static let baseSettingsWindowSize = CGSize(width: 360, height: 520)
-    public static let baseSettingsContentSize = CGSize(width: 340, height: 480)
     public static let baseAboutWindowSize = CGSize(width: 280, height: 230)
 
     public static let standard = DisplayScaleMetrics(sizeScale: 1.0, fontScale: 1.0, visibleSize: nil)
@@ -37,9 +50,28 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
         self.visibleSize = visibleSize
     }
 
-    /// Computes scaling metrics from logical display dimensions and optional usable visible area.
+    /// Validates EDID physical display dimensions in millimeters, rejecting nil, zero, negative,
+    /// non-finite, or implausible (< 100 mm or > 3000 mm) values.
+    public static func isValidPhysicalSize(_ size: CGSize?) -> Bool {
+        guard let size,
+              size.width.isFinite, size.height.isFinite,
+              size.width >= minValidPhysicalMillimeters,
+              size.height >= minValidPhysicalMillimeters,
+              size.width <= maxValidPhysicalMillimeters,
+              size.height <= maxValidPhysicalMillimeters else {
+            return false
+        }
+        return true
+    }
+
+    /// Computes scaling metrics from logical display dimensions, optional usable visible area,
+    /// and optional physical dimensions in millimeters.
     /// Falls back to `.standard` if `displaySize` is zero, negative, or non-finite.
-    public static func make(displaySize: CGSize, visibleSize: CGSize? = nil) -> DisplayScaleMetrics {
+    public static func make(
+        displaySize: CGSize,
+        visibleSize: CGSize? = nil,
+        physicalSizeMM: CGSize? = nil
+    ) -> DisplayScaleMetrics {
         guard displaySize.width.isFinite,
               displaySize.height.isFinite,
               displaySize.width > 0,
@@ -58,13 +90,31 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
             sanitizedVisibleSize = nil
         }
 
-        let widthRatio = displaySize.width / Self.referenceDisplaySize.width
-        let heightRatio = displaySize.height / Self.referenceDisplaySize.height
-        let rawRatio = min(widthRatio, heightRatio)
-        let damped = sqrt(rawRatio)
+        let logicalRatio = min(
+            displaySize.width / Self.referenceDisplaySize.width,
+            displaySize.height / Self.referenceDisplaySize.height
+        )
 
-        let sizeScale = quantize(min(max(damped, Self.minSizeScale), Self.maxSizeScale))
-        let fontScale = quantize(min(max(damped, Self.minFontScale), Self.maxFontScale))
+        let combinedRatio: CGFloat
+        if let physicalSizeMM, Self.isValidPhysicalSize(physicalSizeMM) {
+            let physicalRatio = min(
+                physicalSizeMM.width / Self.referencePhysicalSizeMM.width,
+                physicalSizeMM.height / Self.referencePhysicalSizeMM.height
+            )
+            let w = Self.physicalRatioWeight
+            combinedRatio = CGFloat(
+                pow(Double(physicalRatio), Double(w)) * pow(Double(logicalRatio), Double(1.0 - w))
+            )
+        } else {
+            combinedRatio = logicalRatio
+        }
+
+        let logRatio = CGFloat(log(Double(combinedRatio)))
+        let rawSizeScale = 1.0 + Self.sizeCurveGain * logRatio
+        let rawFontScale = 1.0 + Self.fontCurveGain * logRatio
+
+        let sizeScale = quantize(min(max(rawSizeScale, Self.minSizeScale), Self.maxSizeScale))
+        let fontScale = quantize(min(max(rawFontScale, Self.minFontScale), Self.maxFontScale))
 
         return DisplayScaleMetrics(
             sizeScale: sizeScale,
@@ -73,10 +123,51 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
         )
     }
 
-    /// Thin AppKit adapter reading `screen.frame.size` and `screen.visibleFrame.size`.
+    /// Thin AppKit/CoreGraphics adapter reading `screen.frame.size`, `screen.visibleFrame.size`,
+    /// and physical screen size in millimeters via `CGDisplayScreenSize`.
     public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
         guard let screen else { return .standard }
-        return make(displaySize: screen.frame.size, visibleSize: screen.visibleFrame.size)
+        let physicalSizeMM: CGSize?
+        if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+            let rawMM = CGDisplayScreenSize(displayID)
+            physicalSizeMM = isValidPhysicalSize(rawMM) ? rawMM : nil
+        } else {
+            physicalSizeMM = nil
+        }
+        return make(
+            displaySize: screen.frame.size,
+            visibleSize: screen.visibleFrame.size,
+            physicalSizeMM: physicalSizeMM
+        )
+    }
+
+    /// Computes a center-preserving window frame constrained completely within `visibleFrame`
+    /// so the title bar and all four edges remain visible after dynamic display resizes.
+    public static func clampedWindowFrame(
+        currentFrame: CGRect,
+        targetFrameSize: CGSize,
+        in visibleFrame: CGRect?
+    ) -> CGRect {
+        var width = targetFrameSize.width.rounded()
+        var height = targetFrameSize.height.rounded()
+        var originX = (currentFrame.midX - width / 2).rounded()
+        var originY = (currentFrame.midY - height / 2).rounded()
+
+        if let visibleFrame,
+           visibleFrame.width.isFinite, visibleFrame.height.isFinite,
+           visibleFrame.width > 0, visibleFrame.height > 0 {
+            width = min(width, floor(visibleFrame.width))
+            height = min(height, floor(visibleFrame.height))
+            let minX = visibleFrame.minX
+            let maxX = max(minX, visibleFrame.maxX - width)
+            let minY = visibleFrame.minY
+            let maxY = max(minY, visibleFrame.maxY - height)
+            originX = min(max(originX, minX), maxX).rounded()
+            originY = min(max(originY, minY), maxY).rounded()
+        }
+
+        return CGRect(x: originX, y: originY, width: width, height: height)
     }
 
     /// Scales container dimensions (widths, heights, icon frames) to integer points.
@@ -137,10 +228,6 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
 
     public var settingsWindowSize: CGSize {
         clampedSize(base: Self.baseSettingsWindowSize)
-    }
-
-    public var settingsContentSize: CGSize {
-        clampedSize(base: Self.baseSettingsContentSize)
     }
 
     public var aboutWindowSize: CGSize {

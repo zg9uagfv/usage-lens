@@ -1,7 +1,7 @@
 # Implementation Tasks: auto-scale-display-size-and-font
 
 ## 1. Core Display Scaling Model (`UsageLensUI`) — Round 2 Physical + Logical Recalibration
-- [ ] Update `app/Sources/UsageLensUI/DisplayScaling.swift`:
+- [x] Update `app/Sources/UsageLensUI/DisplayScaling.swift`:
   - Add physical reference constants `referencePhysicalSizeMM` (`286 × 179 mm`), `physicalRatioWeight` (`0.60`), `sizeCurveGain` (`1.15`), `fontCurveGain` (`1.00`), and EDID sanity bounds `minValidPhysicalMillimeters` (`100`) / `maxValidPhysicalMillimeters` (`3000`).
   - Raise upper bounds to `maxSizeScale = 1.60` and `maxFontScale = 1.50` (keeping `minSizeScale = 0.85`, `minFontScale = 0.88`, `minimumFontSize = 8.5`, `maxVisibleWidthRatio = 0.90`, `maxVisibleHeightRatio = 0.85`).
   - Add `DisplayScaleMetrics.isValidPhysicalSize(_:)` to reject `nil`, `.zero`, negative, non-finite, `< 100 mm`, or `> 3000 mm` EDID values.
@@ -15,22 +15,22 @@
   - Keep existing scaling helpers (`scaledDimension`, `scaledSpacing`, `scaledFontSize`, `font`, `clampedSize`, convenience surface size properties), `EnvironmentValues.displayScaleMetrics`, `DisplayScaleController`, and `ScaledHostingView` intact.
 
 ## 2. Scale SwiftUI Views (`UsageLensUI`)
-- [ ] Verify `app/Sources/UsageLensUI/Theme.swift`:
+- [x] Verify `app/Sources/UsageLensUI/Theme.swift`:
   - `CardBackground` reads `@Environment(\.displayScaleMetrics)` and scales `cornerRadius` via `metrics.scaledSpacing(corner)`.
-- [ ] Verify `app/Sources/UsageLensUI/PanelView.swift`:
+- [x] Verify `app/Sources/UsageLensUI/PanelView.swift`:
   - All subviews (`PanelView`, `ProviderTabBar`, `ProviderDetailView`, `WindowRowView`, `ProgressTrack`, `MetricTile`, `FooterBar`) scale cleanly up to `1.60x` size / `1.50x` font with no truncation or clipping.
-- [ ] Update `app/Sources/UsageLensUI/SettingsPanelView.swift` & verify `app/Sources/UsageLensUI/AboutPanelView.swift`:
+- [x] Update `app/Sources/UsageLensUI/SettingsPanelView.swift` & verify `app/Sources/UsageLensUI/AboutPanelView.swift`:
   - Update `SettingsPanelView`'s root `.frame(width:height:alignment:)` to use `metrics.settingsWindowSize` (unified `360 × 520` base, matching `UsageLensApp.swift`'s `settingsPanel` content size across all scales and `visibleFrame` clamps).
   - Verify paddings, spacings, icons, and all fonts scale cleanly across `0.85x–1.60x` without clipping (including clamped `visibleFrame` heights on 27" `1920 × 1080` HiDPI).
 
 ## 3. AppKit Window Sizing & Dynamic Display Observation (`UsageLens`)
-- [ ] Update `app/Sources/UsageLens/UsageLensApp.swift`:
+- [x] Update `app/Sources/UsageLens/UsageLensApp.swift`:
   - `activeStatusScreen()` and window screen observers pass the live `NSScreen` to `DisplayScaleMetrics.from(screen:)` so switching between a 16" MacBook screen and a 27" external monitor immediately updates `popover.contentSize`, window frames, and `DisplayScaleController` metrics.
   - Update `resizeWindowPreservingCenter(_:to:on:)` to route through `DisplayScaleMetrics.clampedWindowFrame(currentFrame:targetFrameSize:in:)` so dynamic resizes near any screen edge keep the full window frame (including title bar and close button) inside the target screen's `visibleFrame`, skipping no-op updates (`< 1pt` delta in origin and size) to prevent resize loops.
   - `NSStatusItem` (`withLength: 32`) and `MenuBarIcon` (`24 × 20`) remain unchanged.
 
 ## 4. Unit & Offscreen Render Tests (`UsageLensUITests`)
-- [ ] Update `app/Tests/UsageLensUITests/DisplayScalingTests.swift`:
+- [x] Update `app/Tests/UsageLensUITests/DisplayScalingTests.swift`:
   - Baseline (`1440 × 900` with `286 × 179 mm` and with `physicalSizeMM: nil`) → `1.00 / 1.00`, exact base sizes.
   - Compact 13"–14" displays (`800 × 600`, `1024 × 768`, `1280 × 800` + `286 × 179 mm`, `1512 × 982` + `302 × 196 mm`) → lower bounds (`0.85 / 0.88`) and balanced 14" sizing (`1.06 / 1.05`).
   - 16.2" MacBook Pro (`1728 × 1117` + `345 × 223 mm`) → `sizeScale == 1.21`, `fontScale == 1.19`, `panelWidth == 411pt`; and `physicalSizeMM: nil` fallback → `sizeScale == 1.21`, `fontScale == 1.18`.

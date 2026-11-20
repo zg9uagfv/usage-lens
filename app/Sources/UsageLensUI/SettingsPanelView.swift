@@ -151,8 +151,8 @@ public struct SettingsPanelView: View {
           .padding(metrics.scaledSpacing(20))
         }
         .frame(
-            width: metrics.settingsContentSize.width,
-            height: metrics.settingsContentSize.height,
+            width: metrics.settingsWindowSize.width,
+            height: metrics.settingsWindowSize.height,
             alignment: .topLeading
         )
         .background(UsageLensTheme.current.panelBackground)

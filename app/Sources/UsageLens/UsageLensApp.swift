@@ -334,23 +334,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller: DisplayScaleController,
         sizeFor: (DisplayScaleMetrics) -> CGSize
     ) {
-        let metrics = DisplayScaleMetrics.from(screen: window.screen ?? activeStatusScreen())
+        let targetScreen = window.screen ?? activeStatusScreen()
+        let metrics = DisplayScaleMetrics.from(screen: targetScreen)
         controller.update(metrics)
-        resizeWindowPreservingCenter(window, to: sizeFor(metrics))
+        resizeWindowPreservingCenter(window, to: sizeFor(metrics), on: targetScreen)
     }
 
-    private func resizeWindowPreservingCenter(_ window: NSWindow, to contentSize: NSSize) {
-        let current = window.contentRect(forFrameRect: window.frame).size
-        guard abs(current.width - contentSize.width) >= 1 || abs(current.height - contentSize.height) >= 1 else {
+    private func resizeWindowPreservingCenter(_ window: NSWindow, to contentSize: NSSize, on screen: NSScreen?) {
+        let targetFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).size
+        let visibleFrame = (screen ?? window.screen ?? activeStatusScreen())?.visibleFrame
+        let targetFrame = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: window.frame,
+            targetFrameSize: targetFrameSize,
+            in: visibleFrame
+        )
+        let old = window.frame
+        guard abs(old.origin.x - targetFrame.origin.x) >= 1
+            || abs(old.origin.y - targetFrame.origin.y) >= 1
+            || abs(old.size.width - targetFrame.size.width) >= 1
+            || abs(old.size.height - targetFrame.size.height) >= 1 else {
             return
         }
-        let oldFrame = window.frame
-        let newFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).size
-        let newOrigin = NSPoint(
-            x: oldFrame.midX - newFrameSize.width / 2,
-            y: oldFrame.midY - newFrameSize.height / 2
-        )
-        window.setFrame(NSRect(origin: newOrigin, size: newFrameSize), display: true, animate: false)
+        window.setFrame(targetFrame, display: true, animate: false)
     }
 
     private func closeRestoredSwiftUISettingsWindow() {

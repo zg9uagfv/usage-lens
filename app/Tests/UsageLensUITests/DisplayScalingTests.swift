@@ -9,43 +9,69 @@ final class DisplayScalingTests: XCTestCase {
     // MARK: - Baseline (Zero Regression)
 
     func testBaselineDisplayResolvesToOne() {
-        let metrics = DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900))
-        XCTAssertEqual(metrics.sizeScale, 1.0)
-        XCTAssertEqual(metrics.fontScale, 1.0)
-        XCTAssertEqual(metrics.panelWidth, 340)
-        XCTAssertEqual(metrics.popoverSize, CGSize(width: 340, height: 560))
-        XCTAssertEqual(metrics.developmentPanelSize, CGSize(width: 368, height: 620))
-        XCTAssertEqual(metrics.settingsWindowSize, CGSize(width: 360, height: 520))
-        XCTAssertEqual(metrics.settingsContentSize, CGSize(width: 340, height: 480))
-        XCTAssertEqual(metrics.aboutWindowSize, CGSize(width: 280, height: 230))
-        XCTAssertEqual(metrics.scaledFontSize(12), 12.0)
-        XCTAssertEqual(metrics.scaledFontSize(14), 14.0)
-        XCTAssertEqual(metrics.scaledFontSize(17), 17.0)
+        let withEDID = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 900),
+            physicalSizeMM: CGSize(width: 286, height: 179)
+        )
+        let withoutEDID = DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900))
+
+        for metrics in [withEDID, withoutEDID] {
+            XCTAssertEqual(metrics.sizeScale, 1.0)
+            XCTAssertEqual(metrics.fontScale, 1.0)
+            XCTAssertEqual(metrics.panelWidth, 340)
+            XCTAssertEqual(metrics.popoverSize, CGSize(width: 340, height: 560))
+            XCTAssertEqual(metrics.developmentPanelSize, CGSize(width: 368, height: 620))
+            XCTAssertEqual(metrics.settingsWindowSize, CGSize(width: 360, height: 520))
+            XCTAssertEqual(metrics.aboutWindowSize, CGSize(width: 280, height: 230))
+            XCTAssertEqual(metrics.scaledFontSize(12), 12.0)
+            XCTAssertEqual(metrics.scaledFontSize(14), 14.0)
+            XCTAssertEqual(metrics.scaledFontSize(17), 17.0)
+        }
     }
 
-    // MARK: - Compact / Small Displays & Lower Bounds
+    // MARK: - Compact & 13"-14" Displays
 
-    func testCompactDisplaysScaleDownAndClamp() {
-        let air13 = DisplayScaleMetrics.make(displaySize: CGSize(width: 1280, height: 800))
-        let small = DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))
+    func testCompactAndFourteenInchDisplays() {
         let tiny = DisplayScaleMetrics.make(displaySize: CGSize(width: 800, height: 600))
+        let small = DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))
+        let air13EDID = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1280, height: 800),
+            physicalSizeMM: CGSize(width: 286, height: 179)
+        )
+        let air13Logical = DisplayScaleMetrics.make(displaySize: CGSize(width: 1280, height: 800))
+        let mbp14 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1512, height: 982),
+            physicalSizeMM: CGSize(width: 302, height: 196)
+        )
 
-        XCTAssertLessThan(air13.sizeScale, 1.0)
-        XCTAssertLessThan(air13.fontScale, 1.0)
-        XCTAssertEqual(air13.sizeScale, 0.94)
-        XCTAssertEqual(air13.fontScale, 0.94)
-        XCTAssertEqual(air13.panelWidth, 320)
-        XCTAssertEqual(air13.popoverSize, CGSize(width: 320, height: 526))
+        XCTAssertEqual(tiny.sizeScale, DisplayScaleMetrics.minSizeScale)
+        XCTAssertEqual(tiny.fontScale, DisplayScaleMetrics.minFontScale)
 
         XCTAssertEqual(small.sizeScale, DisplayScaleMetrics.minSizeScale)
         XCTAssertEqual(small.fontScale, DisplayScaleMetrics.minFontScale)
         XCTAssertEqual(small.panelWidth, 289)
         XCTAssertEqual(small.popoverSize, CGSize(width: 289, height: 476))
 
-        XCTAssertEqual(tiny.sizeScale, DisplayScaleMetrics.minSizeScale)
-        XCTAssertEqual(tiny.fontScale, DisplayScaleMetrics.minFontScale)
-        XCTAssertLessThanOrEqual(small.sizeScale, air13.sizeScale)
+        XCTAssertLessThan(air13EDID.sizeScale, 1.0)
+        XCTAssertLessThan(air13EDID.fontScale, 1.0)
+        XCTAssertEqual(air13EDID.sizeScale, 0.95)
+        XCTAssertEqual(air13EDID.fontScale, 0.95)
+        XCTAssertEqual(air13EDID.panelWidth, 323)
+        XCTAssertEqual(air13EDID.popoverSize, CGSize(width: 323, height: 532))
+
+        XCTAssertLessThan(air13Logical.sizeScale, 1.0)
+        XCTAssertGreaterThanOrEqual(air13Logical.sizeScale, DisplayScaleMetrics.minSizeScale)
+        XCTAssertLessThan(air13Logical.fontScale, 1.0)
+        XCTAssertGreaterThanOrEqual(air13Logical.fontScale, DisplayScaleMetrics.minFontScale)
+
+        XCTAssertEqual(mbp14.sizeScale, 1.06)
+        XCTAssertEqual(mbp14.fontScale, 1.05)
+        XCTAssertEqual(mbp14.panelWidth, 360)
+        XCTAssertEqual(mbp14.popoverSize, CGSize(width: 360, height: 594))
+
         XCTAssertLessThanOrEqual(tiny.sizeScale, small.sizeScale)
+        XCTAssertLessThan(small.sizeScale, air13EDID.sizeScale)
+        XCTAssertLessThan(air13EDID.sizeScale, mbp14.sizeScale)
     }
 
     func testMinimumFontSizeFloor() {
@@ -55,75 +81,186 @@ final class DisplayScalingTests: XCTestCase {
         XCTAssertEqual(tiny.scaledFontSize(6.0), 8.5)
     }
 
-    // MARK: - Large Displays & Upper Bounds
+    // MARK: - 16-Inch MacBook Pro
 
-    func testLargeDisplaysScaleUpMonotonicallyAndClamp() {
-        let baseline = DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900))
-        let mbp16 = DisplayScaleMetrics.make(displaySize: CGSize(width: 1728, height: 1117))
-        let qhd27 = DisplayScaleMetrics.make(displaySize: CGSize(width: 2560, height: 1440))
-        let uhd4k = DisplayScaleMetrics.make(displaySize: CGSize(width: 3840, height: 2160))
-        let pro6k = DisplayScaleMetrics.make(displaySize: CGSize(width: 6016, height: 3384))
+    func testSixteenInchMacBookProScaling() {
+        let mbp16 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1728, height: 1117),
+            physicalSizeMM: CGSize(width: 345, height: 223)
+        )
+        XCTAssertEqual(mbp16.sizeScale, 1.21)
+        XCTAssertTrue((1.20...1.25).contains(mbp16.sizeScale))
+        XCTAssertEqual(mbp16.fontScale, 1.19)
+        XCTAssertTrue((1.18...1.22).contains(mbp16.fontScale))
+        XCTAssertEqual(mbp16.panelWidth, 411)
+        XCTAssertTrue((410...425).contains(mbp16.panelWidth))
+        XCTAssertEqual(mbp16.popoverSize, CGSize(width: 411, height: 678))
 
-        XCTAssertGreaterThan(mbp16.sizeScale, baseline.sizeScale)
-        XCTAssertGreaterThan(qhd27.sizeScale, mbp16.sizeScale)
-        XCTAssertGreaterThan(uhd4k.sizeScale, qhd27.sizeScale)
+        let mbp16NoEDID = DisplayScaleMetrics.make(displaySize: CGSize(width: 1728, height: 1117))
+        XCTAssertEqual(mbp16NoEDID.sizeScale, 1.21)
+        XCTAssertTrue((1.20...1.25).contains(mbp16NoEDID.sizeScale))
+        XCTAssertEqual(mbp16NoEDID.fontScale, 1.18)
+        XCTAssertTrue((1.18...1.22).contains(mbp16NoEDID.fontScale))
+        XCTAssertEqual(mbp16NoEDID.panelWidth, 411)
+    }
 
-        XCTAssertEqual(mbp16.sizeScale, 1.10)
-        XCTAssertEqual(qhd27.sizeScale, 1.26)
-        XCTAssertEqual(qhd27.fontScale, 1.26)
-        XCTAssertEqual(qhd27.panelWidth, 428)
-        XCTAssertEqual(qhd27.popoverSize, CGSize(width: 428, height: 706))
+    // MARK: - 27-Inch & 32-Inch External Monitors & Upper Bounds
 
-        XCTAssertEqual(uhd4k.sizeScale, DisplayScaleMetrics.maxSizeScale)
-        XCTAssertEqual(uhd4k.fontScale, DisplayScaleMetrics.maxFontScale)
-        XCTAssertEqual(pro6k.sizeScale, DisplayScaleMetrics.maxSizeScale)
-        XCTAssertEqual(pro6k.fontScale, DisplayScaleMetrics.maxFontScale)
+    func testTwentySevenInchExternalMonitorsAcrossScalingModes() {
+        let monitor27HiDPI = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1920, height: 1080),
+            visibleSize: CGSize(width: 1920, height: 1020),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
+        XCTAssertEqual(monitor27HiDPI.sizeScale, 1.52)
+        XCTAssertTrue((1.45...1.60).contains(monitor27HiDPI.sizeScale))
+        XCTAssertEqual(monitor27HiDPI.fontScale, 1.45)
+        XCTAssertTrue((1.38...1.50).contains(monitor27HiDPI.fontScale))
+        XCTAssertEqual(monitor27HiDPI.popoverSize.width, 517)
+        XCTAssertTrue((490...545).contains(monitor27HiDPI.popoverSize.width))
+        XCTAssertLessThanOrEqual(monitor27HiDPI.popoverSize.height, floor(1020 * DisplayScaleMetrics.maxVisibleHeightRatio))
+        XCTAssertEqual(monitor27HiDPI.popoverSize.height, 851)
+
+        let monitor27QHD = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 2560, height: 1440),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
+        XCTAssertEqual(monitor27QHD.sizeScale, 1.60)
+        XCTAssertEqual(monitor27QHD.fontScale, 1.50)
+        XCTAssertEqual(monitor27QHD.popoverSize, CGSize(width: 544, height: 896))
+
+        let monitor27Native4K = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 3840, height: 2160),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
+        XCTAssertEqual(monitor27Native4K.sizeScale, 1.60)
+        XCTAssertEqual(monitor27Native4K.fontScale, 1.50)
+        XCTAssertEqual(monitor27Native4K.popoverSize, CGSize(width: 544, height: 896))
+    }
+
+    func testThirtyTwoInchDisplaysClampAtUpperBounds() {
+        let monitor32HiDPI = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1920, height: 1080),
+            visibleSize: CGSize(width: 1920, height: 1020),
+            physicalSizeMM: CGSize(width: 708, height: 398)
+        )
+        let monitor32Scaled = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 3008, height: 1692),
+            physicalSizeMM: CGSize(width: 708, height: 398)
+        )
+        let pro6k = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 6016, height: 3384),
+            physicalSizeMM: CGSize(width: 708, height: 398)
+        )
+
+        XCTAssertEqual(monitor32HiDPI.sizeScale, DisplayScaleMetrics.maxSizeScale)
+        XCTAssertEqual(monitor32HiDPI.fontScale, DisplayScaleMetrics.maxFontScale)
+        XCTAssertEqual(monitor32HiDPI.popoverSize.height, 867)
+
+        for metrics in [monitor32Scaled, pro6k] {
+            XCTAssertEqual(metrics.sizeScale, DisplayScaleMetrics.maxSizeScale)
+            XCTAssertEqual(metrics.fontScale, DisplayScaleMetrics.maxFontScale)
+            XCTAssertEqual(metrics.panelWidth, 544)
+        }
+    }
+
+    // MARK: - EDID Validation & Fallback
+
+    func testInvalidPhysicalEDIDValuesFallBackToLogicalOnly() {
+        let displaySize = CGSize(width: 2560, height: 1440)
+        let expectedLogical = DisplayScaleMetrics.make(displaySize: displaySize, physicalSizeMM: nil)
+        XCTAssertEqual(expectedLogical.sizeScale, 1.54)
+        XCTAssertEqual(expectedLogical.fontScale, 1.47)
+
+        let invalidSizes: [CGSize?] = [
+            nil,
+            .zero,
+            CGSize(width: -597, height: 336),
+            CGSize(width: 597, height: -336),
+            CGSize(width: CGFloat.nan, height: 336),
+            CGSize(width: 597, height: CGFloat.nan),
+            CGSize(width: CGFloat.infinity, height: 336),
+            CGSize(width: 597, height: CGFloat.infinity),
+            CGSize(width: 16, height: 9),
+            CGSize(width: 99, height: 179),
+            CGSize(width: 5000, height: 3000),
+            CGSize(width: 3001, height: 336),
+        ]
+
+        for invalid in invalidSizes {
+            XCTAssertFalse(DisplayScaleMetrics.isValidPhysicalSize(invalid))
+            let actual = DisplayScaleMetrics.make(displaySize: displaySize, physicalSizeMM: invalid)
+            XCTAssertEqual(actual, expectedLogical)
+        }
+
+        XCTAssertTrue(DisplayScaleMetrics.isValidPhysicalSize(CGSize(width: 100, height: 100)))
+        XCTAssertTrue(DisplayScaleMetrics.isValidPhysicalSize(CGSize(width: 597, height: 336)))
+        XCTAssertTrue(DisplayScaleMetrics.isValidPhysicalSize(CGSize(width: 3000, height: 3000)))
     }
 
     // MARK: - Aspect-Ratio Safety (Ultrawide & Portrait)
 
     func testUltrawideDoesNotOverScale() {
-        let qhd = DisplayScaleMetrics.make(displaySize: CGSize(width: 2560, height: 1440))
-        let ultrawide = DisplayScaleMetrics.make(displaySize: CGSize(width: 3440, height: 1440))
-        let superUltrawide = DisplayScaleMetrics.make(displaySize: CGSize(width: 5120, height: 1440))
+        let qhd27 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 2560, height: 1440),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
+        let ultrawide34 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 3440, height: 1440),
+            physicalSizeMM: CGSize(width: 797, height: 334)
+        )
+        let superUltrawideLogical = DisplayScaleMetrics.make(displaySize: CGSize(width: 5120, height: 1440))
+        let qhdLogical = DisplayScaleMetrics.make(displaySize: CGSize(width: 2560, height: 1440))
 
-        XCTAssertEqual(ultrawide.sizeScale, qhd.sizeScale)
-        XCTAssertEqual(ultrawide.fontScale, qhd.fontScale)
-        XCTAssertEqual(superUltrawide.sizeScale, qhd.sizeScale)
-        XCTAssertEqual(superUltrawide.fontScale, qhd.fontScale)
+        XCTAssertEqual(ultrawide34.sizeScale, qhd27.sizeScale)
+        XCTAssertEqual(ultrawide34.fontScale, qhd27.fontScale)
+        XCTAssertEqual(ultrawide34.sizeScale, 1.60)
+        XCTAssertEqual(ultrawide34.fontScale, 1.50)
+
+        XCTAssertEqual(superUltrawideLogical.sizeScale, qhdLogical.sizeScale)
+        XCTAssertEqual(superUltrawideLogical.fontScale, qhdLogical.fontScale)
     }
 
     func testPortraitIsConstrainedByNarrowerWidthAxis() {
+        let portrait27 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 2560),
+            visibleSize: CGSize(width: 1440, height: 2500),
+            physicalSizeMM: CGSize(width: 336, height: 597)
+        )
         let portrait1080 = DisplayScaleMetrics.make(
             displaySize: CGSize(width: 1080, height: 1920),
             visibleSize: CGSize(width: 1080, height: 1860)
         )
-        let portrait1440 = DisplayScaleMetrics.make(
-            displaySize: CGSize(width: 1440, height: 2560),
-            visibleSize: CGSize(width: 1440, height: 2500)
-        )
 
-        // 1080 / 1440 = 0.75 -> sqrt(0.75) ≈ 0.866 -> sizeScale 0.87, fontScale 0.88
-        XCTAssertLessThan(portrait1080.sizeScale, 1.0)
-        XCTAssertEqual(portrait1080.sizeScale, 0.87)
-        XCTAssertEqual(portrait1080.fontScale, 0.88)
+        XCTAssertEqual(portrait27.sizeScale, 1.11)
+        XCTAssertEqual(portrait27.fontScale, 1.10)
+        XCTAssertEqual(portrait27.panelWidth, 377)
+        XCTAssertLessThanOrEqual(portrait27.panelWidth, floor(1440 * DisplayScaleMetrics.maxVisibleWidthRatio))
+
+        XCTAssertEqual(portrait1080.sizeScale, DisplayScaleMetrics.minSizeScale)
+        XCTAssertEqual(portrait1080.fontScale, DisplayScaleMetrics.minFontScale)
+        XCTAssertEqual(portrait1080.panelWidth, 289)
         XCTAssertLessThanOrEqual(portrait1080.panelWidth, floor(1080 * DisplayScaleMetrics.maxVisibleWidthRatio))
-
-        // 1440 / 1440 = 1.0 -> baseline 1.0 despite tall height
-        XCTAssertEqual(portrait1440.sizeScale, 1.0)
-        XCTAssertEqual(portrait1440.fontScale, 1.0)
     }
 
     // MARK: - Visible Area Clamping
 
     func testVisibleSizeClamping() {
-        let metrics = DisplayScaleMetrics.make(
+        let tinyTight = DisplayScaleMetrics.make(
             displaySize: CGSize(width: 800, height: 600),
             visibleSize: CGSize(width: 800, height: 500)
         )
-        XCTAssertLessThanOrEqual(metrics.popoverSize.width, floor(800 * DisplayScaleMetrics.maxVisibleWidthRatio))
-        XCTAssertLessThanOrEqual(metrics.popoverSize.height, floor(500 * DisplayScaleMetrics.maxVisibleHeightRatio))
-        XCTAssertEqual(metrics.popoverSize.height, 425)
+        XCTAssertLessThanOrEqual(tinyTight.popoverSize.width, floor(800 * DisplayScaleMetrics.maxVisibleWidthRatio))
+        XCTAssertLessThanOrEqual(tinyTight.popoverSize.height, floor(500 * DisplayScaleMetrics.maxVisibleHeightRatio))
+        XCTAssertEqual(tinyTight.popoverSize.height, 425)
+
+        let monitor27TallDock = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1920, height: 1080),
+            visibleSize: CGSize(width: 1920, height: 900),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
+        XCTAssertEqual(monitor27TallDock.popoverSize.width, 517)
+        XCTAssertEqual(monitor27TallDock.popoverSize.height, floor(900 * DisplayScaleMetrics.maxVisibleHeightRatio))
 
         let narrowVisible = DisplayScaleMetrics.make(
             displaySize: CGSize(width: 1440, height: 900),
@@ -135,7 +272,103 @@ final class DisplayScalingTests: XCTestCase {
         XCTAssertEqual(narrowVisible.aboutWindowSize, CGSize(width: 270, height: 230))
     }
 
-    // MARK: - Invalid / Headless Fallback
+    // MARK: - Window Frame Edge Clamping
+
+    func testClampedWindowFrameConstrainsAllFourEdgesAndCorners() {
+        let visible = CGRect(x: 0, y: 70, width: 2560, height: 1340) // maxX = 2560, maxY = 1410
+
+        // Top-left edge (reproduces Round 1 review finding: title bar pushed above maxY & left < minX)
+        let topLeft = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 50, y: 1182, width: 238, height: 228),
+            targetFrameSize: CGSize(width: 353, height: 322),
+            in: visible
+        )
+        XCTAssertGreaterThanOrEqual(topLeft.minX, visible.minX)
+        XCTAssertLessThanOrEqual(topLeft.maxX, visible.maxX)
+        XCTAssertGreaterThanOrEqual(topLeft.minY, visible.minY)
+        XCTAssertLessThanOrEqual(topLeft.maxY, visible.maxY)
+        XCTAssertEqual(topLeft.size, CGSize(width: 353, height: 322))
+
+        // Top edge (menu bar)
+        let topEdge = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 1000, y: 1200, width: 280, height: 210),
+            targetFrameSize: CGSize(width: 448, height: 368),
+            in: visible
+        )
+        XCTAssertEqual(topEdge.maxY, visible.maxY)
+        XCTAssertGreaterThanOrEqual(topEdge.minY, visible.minY)
+
+        // Bottom edge (Dock)
+        let bottomEdge = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 1000, y: 72, width: 280, height: 230),
+            targetFrameSize: CGSize(width: 448, height: 368),
+            in: visible
+        )
+        XCTAssertEqual(bottomEdge.minY, visible.minY)
+        XCTAssertLessThanOrEqual(bottomEdge.maxY, visible.maxY)
+
+        // Left edge
+        let leftEdge = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 4, y: 600, width: 280, height: 230),
+            targetFrameSize: CGSize(width: 448, height: 368),
+            in: visible
+        )
+        XCTAssertEqual(leftEdge.minX, visible.minX)
+
+        // Right edge
+        let rightEdge = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 2275, y: 600, width: 280, height: 230),
+            targetFrameSize: CGSize(width: 448, height: 368),
+            in: visible
+        )
+        XCTAssertEqual(rightEdge.maxX, visible.maxX)
+
+        // Top-right corner
+        let topRightCorner = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 2300, y: 1200, width: 260, height: 210),
+            targetFrameSize: CGSize(width: 500, height: 420),
+            in: visible
+        )
+        XCTAssertEqual(topRightCorner.maxX, visible.maxX)
+        XCTAssertEqual(topRightCorner.maxY, visible.maxY)
+
+        // Bottom-left corner
+        let bottomLeftCorner = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 0, y: 70, width: 260, height: 210),
+            targetFrameSize: CGSize(width: 500, height: 420),
+            in: visible
+        )
+        XCTAssertEqual(bottomLeftCorner.minX, visible.minX)
+        XCTAssertEqual(bottomLeftCorner.minY, visible.minY)
+
+        // Oversized target frame clamps to visibleFrame dimensions
+        let oversized = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 100, y: 100, width: 300, height: 300),
+            targetFrameSize: CGSize(width: 3000, height: 2000),
+            in: visible
+        )
+        XCTAssertEqual(oversized, visible)
+
+        // nil visibleFrame preserves center without clamping
+        let unclamped = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: CGRect(x: 50, y: 1182, width: 238, height: 228),
+            targetFrameSize: CGSize(width: 353, height: 322),
+            in: nil
+        )
+        XCTAssertEqual(unclamped.size, CGSize(width: 353, height: 322))
+        XCTAssertEqual(unclamped.origin.x, (169 - 353.0 / 2).rounded())
+        XCTAssertEqual(unclamped.origin.y, (1296 - 322.0 / 2).rounded())
+
+        // Idempotency across repeated updates
+        let repeated = DisplayScaleMetrics.clampedWindowFrame(
+            currentFrame: topLeft,
+            targetFrameSize: CGSize(width: 353, height: 322),
+            in: visible
+        )
+        XCTAssertEqual(repeated, topLeft)
+    }
+
+    // MARK: - Invalid / Headless Fallback & Controller
 
     func testInvalidAndHeadlessInputsFallbackToStandard() {
         XCTAssertEqual(DisplayScaleMetrics.from(screen: nil), .standard)
@@ -153,19 +386,33 @@ final class DisplayScalingTests: XCTestCase {
         XCTAssertEqual(controller.metrics, .standard)
         XCTAssertFalse(controller.update(.standard))
 
-        let large = DisplayScaleMetrics.make(displaySize: CGSize(width: 2560, height: 1440))
+        let large = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1920, height: 1080),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
         XCTAssertTrue(controller.update(large))
         XCTAssertEqual(controller.metrics, large)
         XCTAssertFalse(controller.update(large))
     }
 
-    // MARK: - Offscreen ImageRenderer Verification
+    // MARK: - Offscreen ImageRenderer & Unified Settings Sizing Verification
 
     @MainActor
-    func testOffscreenRenderedViewsScaleAcrossDisplayProfiles() async throws {
-        let small = DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))
-        let standard = DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900))
-        let large = DisplayScaleMetrics.make(displaySize: CGSize(width: 2560, height: 1440))
+    func testOffscreenRenderedViewsScaleAcrossFourDisplayProfiles() async throws {
+        let compact = DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))
+        let baseline = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 900),
+            physicalSizeMM: CGSize(width: 286, height: 179)
+        )
+        let mbp16 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1728, height: 1117),
+            physicalSizeMM: CGSize(width: 345, height: 223)
+        )
+        let monitor27 = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1920, height: 1080),
+            visibleSize: CGSize(width: 1920, height: 1020),
+            physicalSizeMM: CGSize(width: 597, height: 336)
+        )
 
         // 1. PanelView
         let store = UsageStore(
@@ -176,44 +423,76 @@ final class DisplayScalingTests: XCTestCase {
         )
         await store.refreshAll()
 
-        let panelSmall = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, small))
-        let panelStandard = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, standard))
-        let panelLarge = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, large))
+        let panelCompact = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, compact))
+        let panelBaseline = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, baseline))
+        let panelMBP16 = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, mbp16))
+        let panelMonitor27 = try renderImage(PanelView(store: store).environment(\.displayScaleMetrics, monitor27))
 
-        XCTAssertLessThan(panelSmall.width, panelStandard.width)
-        XCTAssertLessThan(panelStandard.width, panelLarge.width)
-        XCTAssertLessThan(panelSmall.height, panelStandard.height)
-        XCTAssertLessThan(panelStandard.height, panelLarge.height)
+        XCTAssertLessThan(panelCompact.width, panelBaseline.width)
+        XCTAssertLessThan(panelBaseline.width, panelMBP16.width)
+        XCTAssertLessThan(panelMBP16.width, panelMonitor27.width)
+        XCTAssertLessThan(panelCompact.height, panelBaseline.height)
+        XCTAssertLessThan(panelBaseline.height, panelMBP16.height)
+        XCTAssertLessThan(panelMBP16.height, panelMonitor27.height)
 
-        // 2. SettingsPanelView
+        // 2. SettingsPanelView (including unified settingsWindowSize correspondence)
         let launchAtLogin = LaunchAtLoginManager()
-        let settingsSmall = try renderImage(
+        let settingsCompact = try renderImage(
             SettingsPanelView(launchAtLogin: launchAtLogin, hasSavedAPIKey: false)
-                .environment(\.displayScaleMetrics, small)
+                .environment(\.displayScaleMetrics, compact)
         )
-        let settingsStandard = try renderImage(
+        let settingsBaseline = try renderImage(
             SettingsPanelView(launchAtLogin: launchAtLogin, hasSavedAPIKey: false)
-                .environment(\.displayScaleMetrics, standard)
+                .environment(\.displayScaleMetrics, baseline)
         )
-        let settingsLarge = try renderImage(
+        let settingsMBP16 = try renderImage(
             SettingsPanelView(launchAtLogin: launchAtLogin, hasSavedAPIKey: false)
-                .environment(\.displayScaleMetrics, large)
+                .environment(\.displayScaleMetrics, mbp16)
+        )
+        let settingsMonitor27 = try renderImage(
+            SettingsPanelView(launchAtLogin: launchAtLogin, hasSavedAPIKey: false)
+                .environment(\.displayScaleMetrics, monitor27)
         )
 
-        XCTAssertLessThan(settingsSmall.width, settingsStandard.width)
-        XCTAssertLessThan(settingsStandard.width, settingsLarge.width)
-        XCTAssertLessThan(settingsSmall.height, settingsStandard.height)
-        XCTAssertLessThan(settingsStandard.height, settingsLarge.height)
+        XCTAssertLessThan(settingsCompact.width, settingsBaseline.width)
+        XCTAssertLessThan(settingsBaseline.width, settingsMBP16.width)
+        XCTAssertLessThan(settingsMBP16.width, settingsMonitor27.width)
+        XCTAssertLessThan(settingsCompact.height, settingsBaseline.height)
+        XCTAssertLessThan(settingsBaseline.height, settingsMBP16.height)
+        XCTAssertLessThan(settingsMBP16.height, settingsMonitor27.height)
+
+        let clampedTight = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 900),
+            visibleSize: CGSize(width: 320, height: 400)
+        )
+        let settingsClamped = try renderImage(
+            SettingsPanelView(launchAtLogin: launchAtLogin, hasSavedAPIKey: false)
+                .environment(\.displayScaleMetrics, clampedTight)
+        )
+
+        for (image, profile) in [
+            (settingsCompact, compact),
+            (settingsBaseline, baseline),
+            (settingsMBP16, mbp16),
+            (settingsMonitor27, monitor27),
+            (settingsClamped, clampedTight),
+        ] {
+            XCTAssertEqual(CGFloat(image.width), profile.settingsWindowSize.width, accuracy: 1.0)
+            XCTAssertEqual(CGFloat(image.height), profile.settingsWindowSize.height, accuracy: 1.0)
+        }
 
         // 3. AboutPanelView
-        let aboutSmall = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, small))
-        let aboutStandard = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, standard))
-        let aboutLarge = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, large))
+        let aboutCompact = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, compact))
+        let aboutBaseline = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, baseline))
+        let aboutMBP16 = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, mbp16))
+        let aboutMonitor27 = try renderImage(AboutPanelView().environment(\.displayScaleMetrics, monitor27))
 
-        XCTAssertLessThan(aboutSmall.width, aboutStandard.width)
-        XCTAssertLessThan(aboutStandard.width, aboutLarge.width)
-        XCTAssertLessThan(aboutSmall.height, aboutStandard.height)
-        XCTAssertLessThan(aboutStandard.height, aboutLarge.height)
+        XCTAssertLessThan(aboutCompact.width, aboutBaseline.width)
+        XCTAssertLessThan(aboutBaseline.width, aboutMBP16.width)
+        XCTAssertLessThan(aboutMBP16.width, aboutMonitor27.width)
+        XCTAssertLessThan(aboutCompact.height, aboutBaseline.height)
+        XCTAssertLessThan(aboutBaseline.height, aboutMBP16.height)
+        XCTAssertLessThan(aboutMBP16.height, aboutMonitor27.height)
     }
 
     @MainActor
