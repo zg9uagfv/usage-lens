@@ -65,11 +65,10 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
     public static let maxVisibleWidthRatio: CGFloat = 0.90
     public static let maxVisibleHeightRatio: CGFloat = 0.85
 
-    // Base (1.0x) surface sizes
+    // Base (1.0x) surface sizes (Settings window and SettingsPanelView unified on 360 × 520)
     public static let basePopoverSize = CGSize(width: 340, height: 560)
     public static let baseDevelopmentPanelSize = CGSize(width: 368, height: 620)
     public static let baseSettingsWindowSize = CGSize(width: 360, height: 520)
-    public static let baseSettingsContentSize = CGSize(width: 340, height: 480)
     public static let baseAboutWindowSize = CGSize(width: 280, height: 230)
 }
 ```
@@ -191,9 +190,37 @@ public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
   - `panelWidth: CGFloat` (clamped against `visibleSize.width * 0.90` if `visibleSize` is set)
   - `popoverSize: CGSize` (`clampedSize(base: Self.basePopoverSize)`)
   - `developmentPanelSize: CGSize` (`clampedSize(base: Self.baseDevelopmentPanelSize)`)
-  - `settingsWindowSize: CGSize` (`clampedSize(base: Self.baseSettingsWindowSize)`)
-  - `settingsContentSize: CGSize` (`clampedSize(base: Self.baseSettingsContentSize)`)
+  - `settingsWindowSize: CGSize` (`clampedSize(base: Self.baseSettingsWindowSize)`) — used for **both** the AppKit `settingsPanel` content size and `SettingsPanelView`'s root frame (eliminating the legacy `340 × 480` vs `360 × 520` mismatch)
   - `aboutWindowSize: CGSize` (`clampedSize(base: Self.baseAboutWindowSize)`)
+- Pure window-frame clamping helper for dynamic resizes:
+  ```swift
+  public static func clampedWindowFrame(
+      currentFrame: CGRect,
+      targetFrameSize: CGSize,
+      in visibleFrame: CGRect?
+  ) -> CGRect {
+      var width = targetFrameSize.width.rounded()
+      var height = targetFrameSize.height.rounded()
+      var originX = (currentFrame.midX - width / 2).rounded()
+      var originY = (currentFrame.midY - height / 2).rounded()
+
+      if let visibleFrame,
+         visibleFrame.width.isFinite, visibleFrame.height.isFinite,
+         visibleFrame.width > 0, visibleFrame.height > 0 {
+          width = min(width, floor(visibleFrame.width))
+          height = min(height, floor(visibleFrame.height))
+          let minX = visibleFrame.minX
+          let maxX = max(minX, visibleFrame.maxX - width)
+          let minY = visibleFrame.minY
+          let maxY = max(minY, visibleFrame.maxY - height)
+          originX = min(max(originX, minX), maxX).rounded()
+          originY = min(max(originY, minY), maxY).rounded()
+      }
+
+      return CGRect(x: originX, y: originY, width: width, height: height)
+  }
+  ```
+  In AppKit coordinates (`maxY` is top under the menu bar, `minY` is bottom above the Dock), clamping `originY <= visibleFrame.maxY - height` guarantees the window title bar and close button never move offscreen when scaling up near the top of the screen, while clamping `minX`, `maxX`, and `minY` keeps all four edges completely inside `visibleFrame`.
 
 ---
 
@@ -214,7 +241,7 @@ public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
 
 ### 3.4 `app/Sources/UsageLensUI/SettingsPanelView.swift`
 - Read `@Environment(\.displayScaleMetrics) private var metrics`.
-- Replace hardcoded `.frame(width: 340, height: 480, alignment: .topLeading)` with `.frame(width: metrics.settingsContentSize.width, height: metrics.settingsContentSize.height, alignment: .topLeading)`.
+- Unify `SettingsPanelView`'s root frame with the AppKit `settingsPanel` window content size by replacing hardcoded `.frame(width: 340, height: 480, alignment: .topLeading)` with `.frame(width: metrics.settingsWindowSize.width, height: metrics.settingsWindowSize.height, alignment: .topLeading)` (matching `UsageLensApp.swift`'s `metrics.settingsWindowSize` across every scale and `visibleFrame` clamp).
 - Scale paddings, spacings, theme accent circle, card corner radii, and all font sizes (`17`, `13`, `11`, `10`, `9`).
 
 ### 3.5 `app/Sources/UsageLensUI/AboutPanelView.swift`
@@ -226,7 +253,27 @@ public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
 - Track per-surface `DisplayScaleController` instances (`popover`, `developmentPanel`, `settingsPanel`, `aboutPanel`) and clean up screen observers in `applicationWillTerminate`.
 - Resolve `activeStatusScreen()` via `statusItem?.button?.window?.screen ?? NSScreen.main ?? NSScreen.screens.first`.
 - Update popover metrics + `popover.contentSize` on `togglePopover(_:)` before `popover.show(...)`.
-- Size Settings, About, and Development windows on creation/re-open and dynamically update via `NSApplication.didChangeScreenParametersNotification` and `NSWindow.didChangeScreenNotification` using `resizeWindowPreservingCenter(_:to:)` (only when size changes by `>= 1pt` to avoid resize loops).
+- Size Settings (`metrics.settingsWindowSize`), About (`metrics.aboutWindowSize`), and Development (`metrics.developmentPanelSize`) windows on creation/re-open and dynamically update via `NSApplication.didChangeScreenParametersNotification` and `NSWindow.didChangeScreenNotification`.
+- Implement `resizeWindowPreservingCenter(_:to:on:)` using `DisplayScaleMetrics.clampedWindowFrame(currentFrame:targetFrameSize:in:)`:
+  ```swift
+  private func resizeWindowPreservingCenter(_ window: NSWindow, to contentSize: NSSize, on screen: NSScreen?) {
+      let targetFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).size
+      let visibleFrame = (screen ?? window.screen ?? activeStatusScreen())?.visibleFrame
+      let targetFrame = DisplayScaleMetrics.clampedWindowFrame(
+          currentFrame: window.frame,
+          targetFrameSize: targetFrameSize,
+          in: visibleFrame
+      )
+      let old = window.frame
+      guard abs(old.origin.x - targetFrame.origin.x) >= 1
+          || abs(old.origin.y - targetFrame.origin.y) >= 1
+          || abs(old.size.width - targetFrame.size.width) >= 1
+          || abs(old.size.height - targetFrame.size.height) >= 1 else {
+          return
+      }
+      window.setFrame(targetFrame, display: true, animate: false)
+  }
+  ```
 
 ---
 
@@ -243,7 +290,8 @@ public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
 | 34" Ultrawide (`3440 × 1440`, `797 × 334 mm`) | Minimum-axis normalization on both logical and physical ratios matches 27" QHD (`1.60 / 1.50`), preventing horizontal bloat. |
 | Portrait (`1440 × 2560` on 27" or `1080 × 1920`) | Minimum-axis normalization uses the narrower horizontal axis (`1.11 / 1.10` or `0.85 / 0.88`), preventing horizontal overflow. |
 | 32" 4K / 6K (`3008 × 1692`, `6016 × 3384`, `708 × 398 mm`) | `sizeScale` caps at `1.60`, `fontScale` caps at `1.50`. |
-| Multi-monitor drag / display switch | `NSWindow.didChangeScreenNotification` + `NSApplication.didChangeScreenParametersNotification` update only when metrics/size actually change (`>= 1pt` / quantized `0.01`). |
+| Multi-monitor drag / display switch near screen edges | `DisplayScaleMetrics.clampedWindowFrame(currentFrame:targetFrameSize:in:)` constrains all four edges (top/menu bar, bottom/Dock, left, right) within `visibleFrame` so the title bar/close control never moves offscreen; `resizeWindowPreservingCenter` skips updates under `1pt` to prevent resize loops. |
+| Settings inner view vs window size alignment | Both `settingsPanel` content size and `SettingsPanelView` root `.frame` use the single unified `metrics.settingsWindowSize` (`360 × 520` base), eliminating the legacy `340 × 480` vs `360 × 520` mismatch across all scales. |
 
 ---
 
@@ -261,6 +309,8 @@ public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
    - **EDID Fallback**: `physicalSizeMM` of `nil`, `.zero`, negative, `.nan`, `.infinity`, too-small (`16 × 9 mm`), and too-large (`5000 × 3000 mm`) all produce identical output to `physicalSizeMM: nil`.
    - **Aspect-Ratio Safety**: 34" ultrawide (`3440 × 1440`, `797 × 334 mm`) matches 27" QHD (`1.60 / 1.50`); 27" portrait (`1440 × 2560`, `336 × 597 mm`) yields `1.11 / 1.10`; narrow portrait (`1080 × 1920`, `nil`) clamps to `0.85 / 0.88`.
    - **Font Floor & Visible-Frame Clamping**: `scaledFontSize(9.0)` never drops below `8.5pt`; tight `visibleSize` (e.g., `1920 × 900` on 27" 1080p with tall Dock, or `800 × 500`) clamps `popoverSize.height <= floor(visibleSize.height * 0.85)` and `popoverSize.width <= floor(visibleSize.width * 0.90)`.
+   - **Window Frame Edge Clamping (`clampedWindowFrame`)**: Test scaling up near all four `visibleFrame` edges (top/menu bar so `maxY <= visibleFrame.maxY`, bottom/Dock so `minY >= visibleFrame.minY`, left so `minX >= visibleFrame.minX`, right so `maxX <= visibleFrame.maxX`), corner placement, oversized frame fallback, `visibleFrame == nil` pass-through, and idempotency across repeated updates.
+   - **Settings Unified Sizing**: Verify `metrics.settingsWindowSize` matches `SettingsPanelView`'s rendered `ImageRenderer` dimensions (within `<= 1pt` rounding) across compact, baseline, 16" MBP, and 27" monitor scales (including clamped `visibleSize`).
    - **Invalid/Headless Inputs**: `from(screen: nil)`, `.zero`, negative, `.nan`, `.infinity` logical sizes safely return `.standard`.
 2. **Offscreen Render Verification (`app/Tests/UsageLensUITests/DisplayScalingTests.swift`)**:
    - Render `PanelView`, `SettingsPanelView`, and `AboutPanelView` with `ImageRenderer` across compact (`1024 × 768`), baseline (`1440 × 900`), 16" MBP (`1728 × 1117`, `345 × 223 mm`), and 27" monitor (`1920 × 1080`, `597 × 336 mm`) `DisplayScaleMetrics`.

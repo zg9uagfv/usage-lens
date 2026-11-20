@@ -15,7 +15,7 @@ On a standard 13.3" reference display (`1440 × 900` logical points, `286 × 179
 - **Given** an active display with logical size `1440 × 900` and either `physicalSizeMM == CGSize(width: 286, height: 179)` or `physicalSizeMM == nil`,
 - **When** `DisplayScaleMetrics` is computed for that display,
 - **Then** `sizeScale` MUST equal `1.0` and `fontScale` MUST equal `1.0`.
-- **And** the main panel width MUST be `340pt`, popover height `560pt`, Settings content size `360 × 520pt` (`340 × 480pt` inner content), and About content size `280 × 230pt`.
+- **And** the main panel width MUST be `340pt`, popover height `560pt`, Settings window & `SettingsPanelView` content size `360 × 520pt`, and About window & `AboutPanelView` content size `280 × 230pt`.
 - **And** base typography (e.g., `12pt` window row title, `14pt` metric value, `17pt` Settings/About heading) MUST remain unchanged.
 
 ### Requirement 2: Compact & 13"–14" Display Scaling & Readability Floor
@@ -82,7 +82,7 @@ Display scaling MUST NOT over-scale on ultrawide monitors or overflow narrow por
 All primary UI surfaces MUST respond to `DisplayScaleMetrics`:
 
 - **Main Popover & `PanelView`**: Panel width, popover content size, tab bar (status dots, labels, pill padding, corner radius), detail header (account label, plan badge), stale/warning banners, empty state tile, `WindowRowView` (titles, percentages, countdown/basis, card padding, corner radius, `ProgressTrack` height), `MetricTile` (title, value, note, padding, corner radius), and `FooterBar` (refresh pill, updated timestamp, icon button sizes).
-- **Settings Window & `SettingsPanelView`**: Window content size, inner layout width/height/padding/spacing, headings, theme cards (accent dot, title, subtitle, padding, corner radius), toggle/caption text, provider rows, API key input/status text.
+- **Settings Window & `SettingsPanelView`**: Window content size and `SettingsPanelView` root frame MUST share a single unified size (`metrics.settingsWindowSize`, base `360 × 520pt`, eliminating the legacy `340 × 480` vs `360 × 520` mismatch) across all display scales and clamped `visibleFrame` sizes; inner padding/spacing, headings, theme cards (accent dot, title, subtitle, padding, corner radius), toggle/caption text, provider rows, API key input/status text MUST scale proportionally.
 - **About Window & `AboutPanelView`**: Window content size, spacing, heading, enlarged eye icon frame, app name, version, and subtitle text.
 - **Development Panel (`USAGE_LENS_SHOW_PANEL=1`)**: Panel content size and embedded `PanelView` metrics.
 - **Exclusion**: The macOS menu bar status item (`NSStatusItem` length `32` and `MenuBarIcon` `24 × 20`) MUST remain at standard macOS menu bar dimensions.
@@ -99,6 +99,7 @@ UI surfaces MUST update their dimensions and font scaling dynamically without re
 - **Given** an open Settings, About, or Development window,
 - **When** the user drags the window to another monitor (`NSWindow.didChangeScreenNotification`) OR changes display resolution / connects / disconnects a monitor (`NSApplication.didChangeScreenParametersNotification`),
 - **Then** the window MUST update its `DisplayScaleMetrics` and content size to match the new screen without triggering resize loops or losing window visibility.
+- **And** when resizing an open window near any edge of the target screen (top/menu bar, bottom/Dock, left, or right), the resulting full window frame (including title bar) MUST be constrained completely within the target screen's `visibleFrame` (`minX >= visibleFrame.minX`, `maxX <= visibleFrame.maxX`, `minY >= visibleFrame.minY`, `maxY <= visibleFrame.maxY`) so the title bar and close button never move offscreen, and repeated resize calls MUST be idempotent.
 
 ### Requirement 9: Headless Fallback, Persistence & Compatibility
 
