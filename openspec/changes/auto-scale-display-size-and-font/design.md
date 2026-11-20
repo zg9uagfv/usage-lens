@@ -2,17 +2,17 @@
 
 ## 1. Architecture Overview
 
-The feature is structured into three cleanly separated layers, adhering strictly to the zero-third-party-dependency constraint (`SwiftUI`, `AppKit`, `Foundation` only):
+The feature is structured into three cleanly separated layers, adhering strictly to the zero-third-party-dependency constraint (`SwiftUI`, `AppKit`, `CoreGraphics`, `Foundation` only):
 
 1. **Pure Scaling Model (`UsageLensUI/DisplayScaling.swift`)**:
-   - `DisplayScaleMetrics`: An immutable `Equatable, Sendable` value type that computes `sizeScale`, `fontScale`, scaled dimensions, scaled font sizes, and clamped window/popover sizes from raw `CGSize` inputs. Contains zero `NSScreen` side effects in its core math so unit tests are 100% deterministic.
-   - `DisplayScaleMetrics.from(screen: NSScreen?)`: Thin AppKit adapter reading `screen.frame.size` and `screen.visibleFrame.size` with `.standard` fallback when `screen == nil`.
-   - `DisplayScaleController` (`@MainActor ObservableObject`): Holds `@Published public var metrics: DisplayScaleMetrics` per window/surface (or shared/scoped instances) so dynamic screen changes trigger immediate SwiftUI updates.
+   - `DisplayScaleMetrics`: An immutable `Equatable, Sendable` value type that computes `sizeScale`, `fontScale`, scaled dimensions, scaled font sizes, and clamped window/popover sizes from raw `CGSize` inputs (`displaySize`, `visibleSize`, and optional `physicalSizeMM`). Contains zero `NSScreen` / CoreGraphics side effects in its core math so unit tests are 100% deterministic.
+   - `DisplayScaleMetrics.from(screen: NSScreen?)`: Thin AppKit/CoreGraphics adapter reading `screen.frame.size`, `screen.visibleFrame.size`, and physical screen size in millimeters via `CGDisplayScreenSize(displayID)` (using `screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]`), with safe EDID validation and `.standard` fallback when `screen == nil`.
+   - `DisplayScaleController` (`@MainActor ObservableObject`): Holds `@Published public var metrics: DisplayScaleMetrics` per window/surface so dynamic screen changes trigger immediate SwiftUI updates.
    - SwiftUI `@Environment(\.displayScaleMetrics)`: Propagates `DisplayScaleMetrics` down the view tree without breaking any existing `init` signatures.
 
 2. **Scaled SwiftUI Views (`UsageLensUI`)**:
    - `Theme.swift`: Keep existing base constants (`Theme.panelWidth = 340`, `Theme.cardCorner = 10`, `Theme.barHeight = 6`) as the `1.0x` reference values; update `CardBackground` to scale its corner radius via `@Environment(\.displayScaleMetrics)`.
-   - `PanelView.swift`, `SettingsPanelView.swift`, `AboutPanelView.swift`: Read `@Environment(\.displayScaleMetrics) private var metrics` and route all container frames, font sizes, paddings, spacings, icon frames, and corner radii through `metrics.scaled(_:)` / `metrics.font(_:weight:)`.
+   - `PanelView.swift`, `SettingsPanelView.swift`, `AboutPanelView.swift`: Read `@Environment(\.displayScaleMetrics) private var metrics` and route all container frames, font sizes, paddings, spacings, icon frames, and corner radii through `metrics.scaledDimension(_:)` / `metrics.scaledSpacing(_:)` / `metrics.font(_:weight:)`.
 
 3. **AppKit Window & Display Observer (`UsageLens/UsageLensApp.swift`)**:
    - Track active `DisplayScaleController` instances for `popover`, `developmentPanel`, `settingsPanel`, and `aboutPanel`.
@@ -21,21 +21,47 @@ The feature is structured into three cleanly separated layers, adhering strictly
 
 ---
 
-## 2. Scaling Formula & Clamping Bounds
+## 2. Scaling Formula & Clamping Bounds (Round 2 Recalibration)
 
-### 2.1 Reference Constants
+### 2.1 Why Round 1 Under-Scaled & How Round 2 Fixes It
+
+Round 1 used `sqrt(min(w/1440, h/900))` capped at `1.35x` size / `1.30x` font with no physical size awareness. That produced only `1.10x` (`374pt`) on a 16.2" MacBook Pro (`1728 × 1117`) and only `1.10x` (`374pt`) on a 27" 4K monitor running macOS's default `1920 × 1080` HiDPI mode (or `1.26x` on `2560 × 1440`).
+
+Round 2 fixes this with two principled improvements:
+1. **Combine physical size (`CGDisplayScreenSize`) with logical size**: Blend the axis-safe physical ratio (`min(mmW/286, mmH/179)`, referenced to a 13.3" 16:10 MacBook panel) and the axis-safe logical ratio (`min(w/1440, h/900)`) via a weighted geometric mean (`physicalWeight = 0.60`, `logicalWeight = 0.40`). This immediately recognizes a 27" monitor (`597 × 336 mm`) even when macOS runs it at `1920 × 1080` HiDPI, while still respecting logical workspace density and preserving full aspect-ratio safety on ultrawide and portrait displays.
+2. **Replace overly aggressive `sqrt` damping with a calibrated logarithmic curve & raised caps**:
+   - `rawSizeScale = 1.0 + 1.15 * log(combinedRatio)` (clamped to `[0.85, 1.60]`)
+   - `rawFontScale = 1.0 + 1.00 * log(combinedRatio)` (clamped to `[0.88, 1.50]`)
+   - At `combinedRatio == 1.0`, `log(1.0) == 0`, giving exact `1.00x` at the 13.3" baseline.
+   - Around `1.20` (16" MacBook Pro), the slope delivers a noticeable `1.21x` size / `1.19x` font (`411pt` width).
+   - Around `1.57–2.07` (27" desktop monitors across 1080p HiDPI, 1440p QHD/5K, and 4K), natural-log concavity smoothly brings scaling into `1.52x–1.60x` size / `1.45x–1.50x` font (`517–544pt` width) without runaway growth on 32" 6K displays.
+
+### 2.2 Reference Constants
 
 ```swift
 public struct DisplayScaleMetrics: Equatable, Sendable {
+    // 13.3" 16:10 MacBook reference baseline (~337.4 mm diagonal)
     public static let referenceDisplaySize = CGSize(width: 1440, height: 900)
+    public static let referencePhysicalSizeMM = CGSize(width: 286, height: 179)
 
+    // Physical vs logical blend and logarithmic response gains
+    public static let physicalRatioWeight: CGFloat = 0.60
+    public static let sizeCurveGain: CGFloat = 1.15
+    public static let fontCurveGain: CGFloat = 1.00
+
+    // Plausible EDID physical dimension bounds (10 cm .. 300 cm)
+    public static let minValidPhysicalMillimeters: CGFloat = 100
+    public static let maxValidPhysicalMillimeters: CGFloat = 3000
+
+    // Scale clamps & readability floor
     public static let minSizeScale: CGFloat = 0.85
-    public static let maxSizeScale: CGFloat = 1.35
+    public static let maxSizeScale: CGFloat = 1.60
 
     public static let minFontScale: CGFloat = 0.88
-    public static let maxFontScale: CGFloat = 1.30
+    public static let maxFontScale: CGFloat = 1.50
     public static let minimumFontSize: CGFloat = 8.5
 
+    // Visible-frame safety ratios
     public static let maxVisibleWidthRatio: CGFloat = 0.90
     public static let maxVisibleHeightRatio: CGFloat = 0.85
 
@@ -48,47 +74,103 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
 }
 ```
 
-### 2.2 Exact Calculation (`DisplayScaleMetrics.make(displaySize:visibleSize:)`)
+### 2.3 Exact Calculation (`DisplayScaleMetrics.make(displaySize:visibleSize:physicalSizeMM:)`)
 
-1. **Input validation (headless/invalid guard)**:
+1. **Logical input validation (headless/invalid guard)**:
    - If `!displaySize.width.isFinite || !displaySize.height.isFinite || displaySize.width <= 0 || displaySize.height <= 0`, return `.standard` (`sizeScale = 1.0`, `fontScale = 1.0`, `visibleSize = nil`).
-2. **Axis-safe raw ratio**:
+2. **Axis-safe logical ratio**:
    ```swift
-   let widthRatio = displaySize.width / Self.referenceDisplaySize.width
-   let heightRatio = displaySize.height / Self.referenceDisplaySize.height
-   let rawRatio = min(widthRatio, heightRatio)
+   let logicalRatio = min(
+       displaySize.width / Self.referenceDisplaySize.width,
+       displaySize.height / Self.referenceDisplaySize.height
+   )
    ```
-   Using `min(widthRatio, heightRatio)` prevents ultrawide displays (e.g., `3440 × 1440`) from over-scaling and prevents portrait displays (e.g., `1080 × 1920`) from overflowing horizontally.
-3. **Sublinear damping (square-root curve)**:
+3. **Optional EDID physical ratio & weighted geometric blend**:
    ```swift
-   let damped = sqrt(rawRatio)
+   public static func isValidPhysicalSize(_ size: CGSize?) -> Bool {
+       guard let size,
+             size.width.isFinite, size.height.isFinite,
+             size.width >= minValidPhysicalMillimeters,
+             size.height >= minValidPhysicalMillimeters,
+             size.width <= maxValidPhysicalMillimeters,
+             size.height <= maxValidPhysicalMillimeters else {
+           return false
+       }
+       return true
+   }
+
+   let combinedRatio: CGFloat
+   if let physicalSizeMM, Self.isValidPhysicalSize(physicalSizeMM) {
+       let physicalRatio = min(
+           physicalSizeMM.width / Self.referencePhysicalSizeMM.width,
+           physicalSizeMM.height / Self.referencePhysicalSizeMM.height
+       )
+       let w = Self.physicalRatioWeight
+       combinedRatio = CGFloat(pow(Double(physicalRatio), Double(w)) * pow(Double(logicalRatio), Double(1.0 - w)))
+   } else {
+       combinedRatio = logicalRatio
+   }
    ```
-   `sqrt(rawRatio)` is strictly monotonic, smooth across all resolutions, equals `1.0` at the `1440 × 900` baseline, and grows gently on high-logical-resolution external monitors so a menu bar popover remains compact and refined.
-4. **Quantization & clamping**:
-   Quantizing to `0.01` prevents floating-point jitter and eliminates unnecessary view rebuilds on negligible sub-pixel changes:
+   Using `min(widthRatio, heightRatio)` on **both** logical and physical dimensions guarantees ultrawide monitors (e.g., 34" `3440 × 1440`, `797 × 334 mm`) are governed by height (`334 / 179 = 1.866`, matching a 27" monitor) and portrait monitors (`1440 × 2560`, `336 × 597 mm`) are governed by width (`336 / 286 = 1.175`, `1440 / 1440 = 1.000`).
+4. **Logarithmic scaling curve, quantization & clamping**:
+   Quantizing to `0.01` prevents floating-point jitter and eliminates unnecessary view rebuilds:
    ```swift
+   let logRatio = CGFloat(log(Double(combinedRatio)))
+   let rawSizeScale = 1.0 + Self.sizeCurveGain * logRatio
+   let rawFontScale = 1.0 + Self.fontCurveGain * logRatio
+
    func quantize(_ value: CGFloat) -> CGFloat {
        (value * 100).rounded() / 100
    }
-   let sizeScale = quantize(min(max(damped, Self.minSizeScale), Self.maxSizeScale))
-   let fontScale = quantize(min(max(damped, Self.minFontScale), Self.maxFontScale))
+   let sizeScale = quantize(min(max(rawSizeScale, Self.minSizeScale), Self.maxSizeScale))
+   let fontScale = quantize(min(max(rawFontScale, Self.minFontScale), Self.maxFontScale))
    ```
 
-### 2.3 Reference Table Across Common macOS Displays
+### 2.4 AppKit / CoreGraphics Screen Extraction (`DisplayScaleMetrics.from(screen:)`)
 
-| Display Profile (Logical Points) | `rawRatio` | `sqrt(rawRatio)` | `sizeScale` | `fontScale` | Panel Width (`340pt`) | Popover Height (`560pt`) | Body Font (`12pt`) | Heading (`17pt`) |
-|---|---|---|---|---|---|---|---|---|
-| Tiny (`800 × 600`) | `0.556` | `0.745` | `0.85` | `0.88` | `289pt` | `476pt` (clamped ≤ `510pt`) | `10.5pt` | `15.0pt` |
-| Small (`1024 × 768`) | `0.711` | `0.843` | `0.85` | `0.88` | `289pt` | `476pt` | `10.5pt` | `15.0pt` |
-| 13" Air (`1280 × 800`) | `0.889` | `0.943` | `0.94` | `0.94` | `320pt` | `526pt` | `11.5pt` | `16.0pt` |
-| **Baseline (`1440 × 900`)** | **`1.000`** | **`1.000`** | **`1.00`** | **`1.00`** | **`340pt`** | **`560pt`** | **`12.0pt`** | **`17.0pt`** |
-| 14" MBP (`1512 × 982`) | `1.050` | `1.025` | `1.02` | `1.02` | `347pt` | `571pt` | `12.0pt` | `17.5pt` |
-| 16" MBP (`1728 × 1117`) | `1.200` | `1.095` | `1.10` | `1.10` | `374pt` | `616pt` | `13.0pt` | `18.5pt` |
-| 27" QHD/5K (`2560 × 1440`) | `1.600` | `1.265` | `1.26` | `1.26` | `428pt` | `706pt` | `15.0pt` | `21.5pt` |
-| Ultrawide (`3440 × 1440`) | `1.600` | `1.265` | `1.26` | `1.26` | `428pt` | `706pt` | `15.0pt` | `21.5pt` |
-| 4K Native (`3840 × 2160`) | `2.400` | `1.549` | `1.35` | `1.30` | `459pt` | `756pt` | `15.5pt` | `22.0pt` |
+```swift
+public static func from(screen: NSScreen?) -> DisplayScaleMetrics {
+    guard let screen else { return .standard }
+    let physicalSizeMM: CGSize?
+    if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+        let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+        let rawMM = CGDisplayScreenSize(displayID)
+        physicalSizeMM = isValidPhysicalSize(rawMM) ? rawMM : nil
+    } else {
+        physicalSizeMM = nil
+    }
+    return make(
+        displaySize: screen.frame.size,
+        visibleSize: screen.visibleFrame.size,
+        physicalSizeMM: physicalSizeMM
+    )
+}
+```
 
-### 2.4 Helper Methods on `DisplayScaleMetrics`
+### 2.5 Reference Table Across Common macOS Displays
+
+| Display Profile (Logical / Physical mm) | `combinedRatio` | `sizeScale` | `fontScale` | Panel Width (`340pt`) | Popover Height (`560pt`*) | Body Font (`12pt`) | Heading (`17pt`) |
+|---|---|---|---|---|---|---|---|
+| Tiny (`800 × 600`, no EDID) | `0.556` | `0.85` | `0.88` | `289pt` | `476pt` (≤ `85% visH`) | `10.5pt` | `15.0pt` |
+| Small (`1024 × 768`, no EDID) | `0.711` | `0.85` | `0.88` | `289pt` | `476pt` | `10.5pt` | `15.0pt` |
+| 13" Air (`1280 × 800`, `286 × 179`) | `0.954` | `0.95` | `0.95` | `323pt` | `532pt` | `11.5pt` | `16.0pt` |
+| **13.3" Baseline (`1440 × 900`, `286 × 179` or `nil`)** | **`1.000`** | **`1.00`** | **`1.00`** | **`340pt`** | **`560pt`** | **`12.0pt`** | **`17.0pt`** |
+| 14.2" MBP (`1512 × 982`, `302 × 196`) | `1.054` | `1.06` | `1.05` | `360pt` | `594pt` | `12.5pt` | `18.0pt` |
+| **16.2" MBP (`1728 × 1117`, `345 × 223`)** | **`1.204`** | **`1.21`** | **`1.19`** | **`411pt`** | **`678pt`** | **`14.5pt`** | **`20.0pt`** |
+| 16.2" MBP (`1728 × 1117`, no EDID) | `1.200` | `1.21` | `1.18` | `411pt` | `678pt` | `14.0pt` | `20.0pt` |
+| **27" 4K HiDPI (`1920 × 1080`, `597 × 336`)** | **`1.570`** | **`1.52`** | **`1.45`** | **`517pt`** | **`851pt`** (≤ `85% visH`) | **`17.5pt`** | **`24.5pt`** |
+| **27" QHD/5K (`2560 × 1440`, `597 × 336`)** | **`1.761`** | **`1.60`** | **`1.50`** | **`544pt`** | **`896pt`** | **`18.0pt`** | **`25.5pt`** |
+| **27" 4K Native (`3840 × 2160`, `597 × 336`)** | **`2.071`** | **`1.60`** | **`1.50`** | **`544pt`** | **`896pt`** | **`18.0pt`** | **`25.5pt`** |
+| 27" QHD (`2560 × 1440`, no EDID) | `1.600` | `1.54` | `1.47` | `524pt` | `862pt` | `17.5pt` | `25.0pt` |
+| 32" 4K HiDPI (`1920 × 1080`, `708 × 398`) | `1.737` | `1.60` | `1.50` | `544pt` | `867pt` (clamped on `1020 visH`) | `18.0pt` | `25.5pt` |
+| 32" 4K/6K (`3008 × 1692` / `6016 × 3384`, `708 × 398`) | `2.079+` | `1.60` | `1.50` | `544pt` | `896pt` | `18.0pt` | `25.5pt` |
+| 34" Ultrawide (`3440 × 1440`, `797 × 334`) | `1.755` | `1.60` | `1.50` | `544pt` | `896pt` | `18.0pt` | `25.5pt` |
+| 27" Portrait (`1440 × 2560`, `336 × 597`) | `1.101` | `1.11` | `1.10` | `377pt` | `622pt` | `13.0pt` | `18.5pt` |
+| Portrait (`1080 × 1920`, no EDID) | `0.750` | `0.85` | `0.88` | `289pt` | `476pt` | `10.5pt` | `15.0pt` |
+
+*\*All surface heights/widths are additionally clamped to `floor(visibleSize.width * 0.90)` and `floor(visibleSize.height * 0.85)` when `visibleSize` is provided.*
+
+### 2.6 Helper Methods on `DisplayScaleMetrics`
 
 - `public func scaledDimension(_ base: CGFloat, minimum: CGFloat = 0) -> CGFloat`:
   `max(minimum, (base * sizeScale).rounded())` — integer points for container widths/heights/frames.
@@ -117,74 +199,34 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
 
 ## 3. View-by-View Integration Plan
 
-### 3.1 `app/Sources/UsageLensUI/DisplayScaling.swift` (New File)
-- Define `DisplayScaleMetrics`, `DisplayScaleController` (`@MainActor ObservableObject`), `DisplayScaleMetricsKey` (`EnvironmentKey`), and `EnvironmentValues.displayScaleMetrics`.
-- Provide a small `ScaledHostingContainer<Content: View>: View` (or `@ObservedObject` wrapper) so `NSHostingController` roots automatically inject `.environment(\.displayScaleMetrics, controller.metrics)` whenever `controller.metrics` updates.
+### 3.1 `app/Sources/UsageLensUI/DisplayScaling.swift`
+- Implement `DisplayScaleMetrics` with the physical + logical formula, EDID validation helper `isValidPhysicalSize(_:)`, `make(displaySize:visibleSize:physicalSizeMM:)`, and `from(screen:)` using `CGDisplayScreenSize`.
+- Provide `DisplayScaleController` (`@MainActor ObservableObject`), `DisplayScaleMetricsKey` (`EnvironmentKey`), `EnvironmentValues.displayScaleMetrics`, and `ScaledHostingView<Content: View>` to inject `controller.metrics` into `NSHostingController` roots.
 
 ### 3.2 `app/Sources/UsageLensUI/Theme.swift`
 - Keep `Theme.panelWidth` (`340`), `Theme.cardCorner` (`10`), `Theme.barHeight` (`6`) as base constants.
 - Update `CardBackground` to read `@Environment(\.displayScaleMetrics) private var metrics` and apply `metrics.scaledSpacing(corner)` to `RoundedRectangle(cornerRadius:)`.
 
 ### 3.3 `app/Sources/UsageLensUI/PanelView.swift`
-- Inject `@Environment(\.displayScaleMetrics) private var metrics` into:
-  - `PanelView`: `.frame(width: metrics.panelWidth)`, detail padding `metrics.scaledSpacing(14 / 12 / 14)`.
-  - `ProviderTabBar`: dot `metrics.scaledSpacing(6)`, font `metrics.font(12, weight: ...)`, spacing/padding/corner radius scaled via `metrics.scaledSpacing(...)`.
-  - `ProviderDetailView`: `VStack(spacing: metrics.scaledSpacing(12))`, all font sizes (`11.5`, `9`, `10`, `10.5`, `11`, `18`, `12.5`) via `metrics.font(...)`, paddings & badge/banner radii scaled.
-  - `WindowRowView`: `VStack(spacing: metrics.scaledSpacing(7))`, `HStack(spacing: metrics.scaledSpacing(8 / 6))`, fonts (`12`, `10.5`), paddings (`11`, `10`).
-  - `ProgressTrack`: `.frame(height: metrics.scaledSpacing(Theme.barHeight, minimum: 4))`, min pill width `metrics.scaledSpacing(4, minimum: 3)`.
-  - `MetricTile`: `VStack(spacing: metrics.scaledSpacing(2))`, fonts (`9.5`, `14`, `9`), `.padding(metrics.scaledSpacing(9))`, `.cardBackground(corner: 9)` (scaled by `CardBackground`).
-  - `FooterBar`: `HStack(spacing: metrics.scaledSpacing(10))`, paddings (`12`, `8`), fonts (`10.5`, `10`, `9.5`), icon button frames `metrics.scaledDimension(24, minimum: 20)`, refresh pill padding scaled.
-- Note on `.id(...)` in `PanelView`: Keep `.id("panel-\(selectedTheme.rawValue)-\(themeSignal.revision)")` intact for theme refresh; SwiftUI `@Environment(\.displayScaleMetrics)` naturally triggers view updates without needing to tear down state on scale changes.
+- Inject `@Environment(\.displayScaleMetrics) private var metrics` into `PanelView`, `ProviderTabBar`, `ProviderDetailView`, `WindowRowView`, `ProgressTrack`, `MetricTile`, and `FooterBar`.
+- Route panel width (`metrics.panelWidth`), all font sizes (`metrics.font(...)`), paddings/spacings/radii (`metrics.scaledSpacing(...)`), `ProgressTrack` height (`metrics.scaledSpacing(Theme.barHeight, minimum: 4)`), and icon button frames (`metrics.scaledDimension(24, minimum: 20)`) through `metrics`.
+- Keep `.id("panel-\(selectedTheme.rawValue)-\(themeSignal.revision)")` intact for theme refresh.
 
 ### 3.4 `app/Sources/UsageLensUI/SettingsPanelView.swift`
 - Read `@Environment(\.displayScaleMetrics) private var metrics`.
-- Replace hardcoded `.frame(width: 340, height: 480, alignment: .topLeading)` with `.frame(width: metrics.settingsContentSize.width, height: metrics.settingsContentSize.height, alignment: .topLeading)` (or `minWidth` / `idealWidth` matching the scaled window so scrolling still works cleanly on compact screens).
-- Scale `VStack(spacing: 16)`, `.padding(20)`, theme accent circle (`13`), theme card padding (`8`) & corner radius (`9`), all font sizes (`17`, `13`, `11`, `10`, `9`), and spacings (`8`, `9`, `5`, `3`, `2`).
+- Replace hardcoded `.frame(width: 340, height: 480, alignment: .topLeading)` with `.frame(width: metrics.settingsContentSize.width, height: metrics.settingsContentSize.height, alignment: .topLeading)`.
+- Scale paddings, spacings, theme accent circle, card corner radii, and all font sizes (`17`, `13`, `11`, `10`, `9`).
 
 ### 3.5 `app/Sources/UsageLensUI/AboutPanelView.swift`
 - Read `@Environment(\.displayScaleMetrics) private var metrics`.
 - Replace hardcoded `.frame(width: 280, height: 230)` with `.frame(width: metrics.aboutWindowSize.width, height: metrics.aboutWindowSize.height)`.
-- Scale `VStack(spacing: 14)` and `VStack(spacing: 3)`, eye icon `.frame(width: metrics.scaledDimension(64), height: metrics.scaledDimension(54))`, and all font sizes (`17`, `15`, `11.5`, `10.5`).
+- Scale spacings, eye icon `.frame(width: metrics.scaledDimension(64), height: metrics.scaledDimension(54))`, and all font sizes (`17`, `15`, `11.5`, `10.5`).
 
 ### 3.6 `app/Sources/UsageLens/UsageLensApp.swift`
-- Add per-surface `DisplayScaleController` instances:
-  - `popoverScaleController`
-  - `developmentScaleController`
-  - `settingsScaleController`
-  - `aboutScaleController`
-- Add `screenParametersObserver: NSObjectProtocol?` and `windowScreenObservers: [NSObjectProtocol] = []` (cleaned up in `applicationWillTerminate`).
-- Screen resolution helper:
-  ```swift
-  private func activeStatusScreen() -> NSScreen? {
-      statusItem?.button?.window?.screen ?? NSScreen.main ?? NSScreen.screens.first
-  }
-  ```
-- **Popover (`togglePopover(_:)`)**:
-  - Before `popover.show(...)`, compute `let metrics = DisplayScaleMetrics.from(screen: activeStatusScreen())`.
-  - Update `popoverScaleController.update(metrics)` and `popover.contentSize = metrics.popoverSize`.
-  - Keep the existing theme refresh (`popover.appearance`, rebuilding `host.rootView` wrapped with `popoverScaleController`).
-- **Settings / About / Development Windows**:
-  - On creation: resolve `let screen = activeStatusScreen()`, compute `metrics`, set initial `contentRect` to `metrics.settingsWindowSize` / `metrics.aboutWindowSize` / `metrics.developmentPanelSize`, wrap `rootView` with the window's `DisplayScaleController`, and observe `NSWindow.didChangeScreenNotification` for that window.
-  - On re-showing an existing `settingsPanel` or `aboutPanel`: sync `panel.appearance = UsageLensTheme.appkitAppearance`, refresh metrics from `panel.screen ?? activeStatusScreen()`, and resize if needed before `makeKeyAndOrderFront(nil)`.
-  - On `NSApplication.didChangeScreenParametersNotification`:
-    - If `popover.isShown`, recompute from `activeStatusScreen()`, update `popoverScaleController` and `popover.contentSize`.
-    - For each open window (`settingsPanel`, `aboutPanel`, `developmentPanel`), recompute from `window.screen ?? activeStatusScreen()`, update its controller, and call a helper `resizeWindowPreservingCenter(_:to:)` ONLY if `newMetrics != oldMetrics` (or size changed by `>= 1pt`).
-- **Resize helper (anti-jump / anti-loop)**:
-  ```swift
-  private func resizeWindowPreservingCenter(_ window: NSWindow, to contentSize: NSSize) {
-      let current = window.contentRect(forFrameRect: window.frame).size
-      guard abs(current.width - contentSize.width) >= 1 || abs(current.height - contentSize.height) >= 1 else {
-          return
-      }
-      let oldFrame = window.frame
-      let newFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize)).size
-      let newOrigin = NSPoint(
-          x: oldFrame.midX - newFrameSize.width / 2,
-          y: oldFrame.midY - newFrameSize.height / 2
-      )
-      window.setFrame(NSRect(origin: newOrigin, size: newFrameSize), display: true, animate: false)
-  }
-  ```
+- Track per-surface `DisplayScaleController` instances (`popover`, `developmentPanel`, `settingsPanel`, `aboutPanel`) and clean up screen observers in `applicationWillTerminate`.
+- Resolve `activeStatusScreen()` via `statusItem?.button?.window?.screen ?? NSScreen.main ?? NSScreen.screens.first`.
+- Update popover metrics + `popover.contentSize` on `togglePopover(_:)` before `popover.show(...)`.
+- Size Settings, About, and Development windows on creation/re-open and dynamically update via `NSApplication.didChangeScreenParametersNotification` and `NSWindow.didChangeScreenNotification` using `resizeWindowPreservingCenter(_:to:)` (only when size changes by `>= 1pt` to avoid resize loops).
 
 ---
 
@@ -193,30 +235,36 @@ public struct DisplayScaleMetrics: Equatable, Sendable {
 | Edge Case | Handling |
 |---|---|
 | Headless CI / unit tests (`NSScreen.main == nil`) | `DisplayScaleMetrics.from(screen: nil)` returns `.standard` (`1.0 / 1.0`). |
-| Zero, negative, `NaN`, or `Infinity` display size | `DisplayScaleMetrics.make(...)` validates `isFinite && > 0` and falls back to `.standard`. |
+| Zero, negative, `NaN`, or `Infinity` logical display size | `DisplayScaleMetrics.make(...)` validates `isFinite && > 0` and falls back to `.standard`. |
+| Missing, zero, or bogus EDID (`CGDisplayScreenSize` returns `0×0`, `16×9 mm`, `5000×3000 mm`, `NaN`) | `isValidPhysicalSize` rejects `< 100 mm`, `> 3000 mm`, or non-finite values and falls back cleanly to logical-only scaling. |
+| 27" 4K monitor at macOS default `1920 × 1080` HiDPI | Physical ratio (`336/179 = 1.877`) lifts `sizeScale` to `1.52`, `fontScale` to `1.45` (`517pt` width), while `visibleFrame` clamping caps height at `<= 85%` of `visibleSize.height`. |
+| 16.2" MacBook Pro (`1728 × 1117`, `345 × 223 mm`) | Delivers `sizeScale = 1.21`, `fontScale = 1.19` (`411pt` width, `14.5pt` body font). |
 | Very small display (`800 × 600`) | `sizeScale` clamps to `0.85`, `fontScale` clamps to `0.88`, fonts floor at `8.5pt`, and `clampedSize` caps window/popover at `90% × 85%` of `visibleFrame`. |
-| Ultrawide (`3440 × 1440`, `5120 × 1440`) | `min(widthRatio, heightRatio)` uses height ratio (`1.60`), preventing horizontal bloat. |
-| Portrait (`1080 × 1920`, `1440 × 2560`) | `min(widthRatio, heightRatio)` uses width ratio, preventing horizontal overflow. |
-| 4K / 5K / 6K (`3840 × 2160`+) | `sizeScale` caps at `1.35`, `fontScale` caps at `1.30`. |
-| Multi-monitor drag / display switch | `NSWindow.didChangeScreenNotification` + `NSApplication.didChangeScreenParametersNotification` update only when metrics/size actually change (`>= 1pt` / quantized `0.01`), preventing resize loops. |
-| Theme switching while scaled | `PanelView`'s `.id(...)` rebuilds inside `ScaledHostingContainer`, preserving the current `DisplayScaleMetrics` from `DisplayScaleController`. |
+| 34" Ultrawide (`3440 × 1440`, `797 × 334 mm`) | Minimum-axis normalization on both logical and physical ratios matches 27" QHD (`1.60 / 1.50`), preventing horizontal bloat. |
+| Portrait (`1440 × 2560` on 27" or `1080 × 1920`) | Minimum-axis normalization uses the narrower horizontal axis (`1.11 / 1.10` or `0.85 / 0.88`), preventing horizontal overflow. |
+| 32" 4K / 6K (`3008 × 1692`, `6016 × 3384`, `708 × 398 mm`) | `sizeScale` caps at `1.60`, `fontScale` caps at `1.50`. |
+| Multi-monitor drag / display switch | `NSWindow.didChangeScreenNotification` + `NSApplication.didChangeScreenParametersNotification` update only when metrics/size actually change (`>= 1pt` / quantized `0.01`). |
 
 ---
 
 ## 5. Testing & Verification Strategy
 
 1. **Pure Unit Tests (`app/Tests/UsageLensUITests/DisplayScalingTests.swift`)**:
-   - Baseline `1440 × 900` yields `sizeScale == 1.0`, `fontScale == 1.0`, exact base sizes (`340 × 560`, `360 × 520`, `280 × 230`).
-   - Small displays (`1280 × 800`, `1024 × 768`, `800 × 600`) scale down monotonically and clamp at `minSizeScale` (`0.85`) / `minFontScale` (`0.88`).
-   - Font floor test: `scaledFontSize(9.0)` on smallest scale never drops below `8.5pt`.
-   - Large displays (`1728 × 1117`, `2560 × 1440`, `3840 × 2160`, `6016 × 3384`) scale up monotonically and clamp at `maxSizeScale` (`1.35`) / `maxFontScale` (`1.30`).
-   - Ultrawide (`3440 × 1440`) produces identical scales to `2560 × 1440`.
-   - Portrait (`1080 × 1920`) is constrained by width and never overflows.
-   - `visibleSize` clamping: on a small `visibleSize` (e.g. `800 × 500`), `popoverSize.height <= floor(500 * 0.85) == 425` and `popoverSize.width <= floor(800 * 0.90) == 720`.
-   - Invalid/headless inputs (`nil` screen, `.zero`, negative, `.nan`, `.infinity`) safely return `.standard`.
-2. **Offscreen Render Verification (`app/Tests/UsageLensUITests/PanelRenderTests.swift` or `DisplayScalingTests.swift`)**:
-   - Render `PanelView`, `SettingsPanelView`, and `AboutPanelView` with `ImageRenderer` under small (`1024 × 768`), standard (`1440 × 900`), and large (`2560 × 1440`) `DisplayScaleMetrics` via `.environment(\.displayScaleMetrics, ...)`.
-   - Assert rendered `CGImage` widths and heights satisfy `small < standard < large`, confirming both container dimensions and SwiftUI content actually scale.
+   - **Baseline**: `1440 × 900` with `286 × 179 mm` and with `physicalSizeMM: nil` both yield `sizeScale == 1.0`, `fontScale == 1.0`, exact base sizes (`340 × 560`, `360 × 520`, `280 × 230`).
+   - **Compact 13"–14" displays**: `800 × 600`, `1024 × 768`, `1280 × 800` (`286 × 179 mm`), and `1512 × 982` (`302 × 196 mm`) verify monotonic scaling, `0.85 / 0.88` lower clamps, and balanced 14" sizing (`1.06 / 1.05`).
+   - **16" MacBook Pro**: `1728 × 1117` with `345 × 223 mm` yields `sizeScale == 1.21` (`in 1.20...1.25`), `fontScale == 1.19` (`in 1.18...1.22`), `panelWidth == 411` (`in 410...425`); also verify `physicalSizeMM: nil` fallback yields `sizeScale == 1.21`, `fontScale == 1.18`.
+   - **27" External Monitors**:
+     - 27" 4K HiDPI (`1920 × 1080`, `597 × 336 mm`, `visibleSize: 1920 × 1020`): `sizeScale == 1.52`, `fontScale == 1.45`, `popoverSize.width == 517`, `popoverSize.height <= floor(1020 * 0.85)`.
+     - 27" QHD/5K (`2560 × 1440`, `597 × 336 mm`): `sizeScale == 1.60`, `fontScale == 1.50`, `popoverSize.width == 544`.
+     - 27" 4K Native (`3840 × 2160`, `597 × 336 mm`): `sizeScale == 1.60`, `fontScale == 1.50`, `popoverSize.width == 544`.
+   - **32" 4K/6K Upper Clamps**: `3008 × 1692` and `6016 × 3384` (`708 × 398 mm`) clamp at `maxSizeScale == 1.60`, `maxFontScale == 1.50`.
+   - **EDID Fallback**: `physicalSizeMM` of `nil`, `.zero`, negative, `.nan`, `.infinity`, too-small (`16 × 9 mm`), and too-large (`5000 × 3000 mm`) all produce identical output to `physicalSizeMM: nil`.
+   - **Aspect-Ratio Safety**: 34" ultrawide (`3440 × 1440`, `797 × 334 mm`) matches 27" QHD (`1.60 / 1.50`); 27" portrait (`1440 × 2560`, `336 × 597 mm`) yields `1.11 / 1.10`; narrow portrait (`1080 × 1920`, `nil`) clamps to `0.85 / 0.88`.
+   - **Font Floor & Visible-Frame Clamping**: `scaledFontSize(9.0)` never drops below `8.5pt`; tight `visibleSize` (e.g., `1920 × 900` on 27" 1080p with tall Dock, or `800 × 500`) clamps `popoverSize.height <= floor(visibleSize.height * 0.85)` and `popoverSize.width <= floor(visibleSize.width * 0.90)`.
+   - **Invalid/Headless Inputs**: `from(screen: nil)`, `.zero`, negative, `.nan`, `.infinity` logical sizes safely return `.standard`.
+2. **Offscreen Render Verification (`app/Tests/UsageLensUITests/DisplayScalingTests.swift`)**:
+   - Render `PanelView`, `SettingsPanelView`, and `AboutPanelView` with `ImageRenderer` across compact (`1024 × 768`), baseline (`1440 × 900`), 16" MBP (`1728 × 1117`, `345 × 223 mm`), and 27" monitor (`1920 × 1080`, `597 × 336 mm`) `DisplayScaleMetrics`.
+   - Assert rendered `CGImage` dimensions satisfy `compact < baseline < mbp16 < monitor27`.
 3. **Existing Test Suite**:
    - Run `cd app && swift build && swift test` and confirm all `UsageLensKitTests` and `UsageLensUITests` pass with zero regressions.
-   - Run `python3 -m unittest discover -s tests` (or `pytest` if installed) to ensure no unintended impact on probes.
+   - Run `python3 -m unittest discover -s tests` to ensure no unintended impact on probes.
