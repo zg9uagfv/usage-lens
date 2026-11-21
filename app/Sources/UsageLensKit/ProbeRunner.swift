@@ -335,9 +335,17 @@ public struct ProbeRunner: ProbeProviding {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        let terminationGroup = DispatchGroup()
+        let terminationState = LockedTerminationState(group: terminationGroup)
+        process.terminationHandler = { finished in
+            terminationState.markTerminated(status: finished.terminationStatus)
+        }
+
         do {
             try process.run()
         } catch {
+            process.terminationHandler = nil
+            terminationState.cancelWithoutLaunch()
             return .failedToStart(error.localizedDescription)
         }
 
@@ -353,27 +361,27 @@ public struct ProbeRunner: ProbeProviding {
         var timedOut = false
         var overflowed = false
 
-        while process.isRunning && Date() < deadline {
+        while !terminationState.hasTerminated && process.isRunning && Date() < deadline {
             if stdoutBuffer.overflows || stderrBuffer.overflows {
                 // 输出超限：立刻杀，不再等它自然结束。
                 overflowed = true
                 stdoutDrainer.stop()
                 stderrDrainer.stop()
-                Self.terminate(process)
+                await Self.terminate(process, terminationState: terminationState)
                 break
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
 
-        if !overflowed && process.isRunning {
+        if !overflowed && !terminationState.hasTerminated && process.isRunning {
             timedOut = true
-            Self.terminate(process)
+            await Self.terminate(process, terminationState: terminationState)
         }
 
         // 等 reader 收尾：有上限，到点就停读，主流程立刻继续（不会挂 20s）。
         var drainTimedOut = false
         if !overflowed {
-            let drained = await Self.waitForReaders(readers, timeout: Self.drainTimeout)
+            let drained = await Self.waitForGroup(readers, timeout: Self.drainTimeout)
             if !drained {
                 drainTimedOut = true
                 stdoutDrainer.stop()
@@ -381,15 +389,16 @@ public struct ProbeRunner: ProbeProviding {
             }
         }
 
-        if !process.isRunning {
-            process.waitUntilExit()
-        }
+        // 绝不在 Swift Concurrency 协作线程调用 Process.waitUntilExit()（会自旋 CFRunLoop 死锁）；
+        // 改用 terminationHandler + DispatchGroup 有界等待。
+        let terminated = await Self.waitForGroup(terminationGroup, timeout: Self.drainTimeout)
+        let exitStatus = terminationState.status ?? (terminated && !process.isRunning ? process.terminationStatus : -1)
 
         return .output(
             ProbeProcessOutput(
                 stdout: stdoutBuffer.snapshot,
                 stderr: stderrBuffer.snapshot,
-                status: process.isRunning ? -1 : process.terminationStatus,
+                status: exitStatus,
                 timedOut: timedOut,
                 overflowed: overflowed || stdoutBuffer.overflows || stderrBuffer.overflows,
                 drainTimedOut: drainTimedOut
@@ -397,22 +406,22 @@ public struct ProbeRunner: ProbeProviding {
         )
     }
 
-    /// terminate + 短暂等待 + SIGKILL；绝不阻塞超过 ~600ms。
-    private static func terminate(_ process: Process) {
-        guard process.isRunning else { return }
+    /// terminate + 短暂异步等待 + SIGKILL；绝不阻塞超过 ~600ms。
+    private static func terminate(_ process: Process, terminationState: LockedTerminationState) async {
+        guard !terminationState.hasTerminated && process.isRunning else { return }
         process.terminate()
         let giveUp = Date().addingTimeInterval(0.5)
-        while process.isRunning && Date() < giveUp {
-            Thread.sleep(forTimeInterval: 0.02)
+        while !terminationState.hasTerminated && process.isRunning && Date() < giveUp {
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        if process.isRunning {
+        if !terminationState.hasTerminated && process.isRunning {
             kill(process.processIdentifier, SIGKILL)
         }
     }
 
     /// 在后台线程上做 `group.wait(timeout:)`，主流程拿到结果就返回。
     /// 不能用 `withTaskGroup` + continuation：group 退出时会等那个不可取消的 continuation。
-    private static func waitForReaders(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
+    private static func waitForGroup(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let result = group.wait(timeout: .now() + timeout)
@@ -436,6 +445,52 @@ struct ProbeProcessOutput: Sendable {
 enum ProbeProcessResult: Sendable {
     case failedToStart(String)
     case output(ProbeProcessOutput)
+}
+
+/// 线程安全记录子进程终止状态并只 leave DispatchGroup 一次，避免 waitUntilExit 死锁。
+private final class LockedTerminationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private let group: DispatchGroup
+    private var terminated = false
+    private var exitStatus: Int32?
+
+    init(group: DispatchGroup) {
+        self.group = group
+        group.enter()
+    }
+
+    func markTerminated(status: Int32) {
+        lock.lock()
+        let shouldLeave = !terminated
+        terminated = true
+        exitStatus = status
+        lock.unlock()
+        if shouldLeave {
+            group.leave()
+        }
+    }
+
+    func cancelWithoutLaunch() {
+        lock.lock()
+        let shouldLeave = !terminated
+        terminated = true
+        lock.unlock()
+        if shouldLeave {
+            group.leave()
+        }
+    }
+
+    var hasTerminated: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminated
+    }
+
+    var status: Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return exitStatus
+    }
 }
 
 /// 两条管道各有一个读取器；用锁拼块，并带字节上限。
