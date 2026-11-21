@@ -306,6 +306,56 @@ enum Fixtures {
             finishedAt: Date()
         )
     }
+
+    static func agyLiveReport() -> ProbeReport {
+        let now = Date()
+        return ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: "agy.user@example.com", plan: "Google AI Pro"),
+                generatedAt: now,
+                observedAt: now,
+                windows: [
+                    ProbeWindow(
+                        id: "5h",
+                        label: "5 小时",
+                        usedPercent: 59,
+                        windowSeconds: 18_000,
+                        resetsAt: now.addingTimeInterval(2 * 3600),
+                        basis: "server"
+                    ),
+                    ProbeWindow(
+                        id: "7d",
+                        label: "7 天",
+                        usedPercent: 15,
+                        windowSeconds: 604_800,
+                        resetsAt: now.addingTimeInterval(5 * 86_400),
+                        basis: "server"
+                    ),
+                ],
+                usage: ProbeUsage(todayTokens: 1_240_500, source: "local")
+            ),
+            finishedAt: now
+        )
+    }
+
+    static func agyOfflineLocalTokensReport() -> ProbeReport {
+        let now = Date()
+        return ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: "agy.user@example.com", plan: nil),
+                generatedAt: now,
+                observedAt: now,
+                windows: [],
+                usage: ProbeUsage(todayTokens: 320_000, source: "local"),
+                warnings: ["实时查询 AGY 服务端失败（网络不可用），当前仅显示本地今日 tokens"]
+            ),
+            finishedAt: now
+        )
+    }
 }
 
 // MARK: - 离屏渲染
@@ -939,6 +989,94 @@ final class PanelRenderTests: XCTestCase {
                     named: "18-panel-gemini-auth-error-\(theme.rawValue)-\(label)"
                 )
                 assertNonBlankImage(errImg, context: "panel-auth-error-\(theme.rawValue)-\(label)")
+            }
+        }
+    }
+
+    /// 验收 AGY Codex-style 面板（5h/7d 窗口 + Google AI Pro 徽章 + 今日 tokens 卡片、离线回退）
+    /// 与 Settings 中 AGY 厂商行在 4 档 DisplayScaleMetrics × 3 主题下的真实 AppKit 离屏渲染。
+    func testAgyPanelAndSettingsHostedRenderAcrossThemesAndScales() async throws {
+        let previousTheme = UserDefaults.standard.string(forKey: "usageLens.theme")
+        let previousProviders = UserDefaults.standard.string(forKey: "usageLens.providers")
+        defer {
+            if let previousTheme {
+                UserDefaults.standard.set(previousTheme, forKey: "usageLens.theme")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "usageLens.theme")
+            }
+            if let previousProviders {
+                UserDefaults.standard.set(previousProviders, forKey: "usageLens.providers")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "usageLens.providers")
+            }
+        }
+
+        let launchAtLogin = LaunchAtLoginManager()
+        let profiles: [(String, DisplayScaleMetrics)] = [
+            ("compact", DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))),
+            ("standard", DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900), physicalSizeMM: CGSize(width: 286, height: 179))),
+            ("comfortable", DisplayScaleMetrics.make(displaySize: CGSize(width: 1728, height: 1117), physicalSizeMM: CGSize(width: 345, height: 223))),
+            ("large", DisplayScaleMetrics.make(displaySize: CGSize(width: 1920, height: 1080), visibleSize: CGSize(width: 1920, height: 1020), physicalSizeMM: CGSize(width: 597, height: 336))),
+        ]
+
+        let agyLiveStore = makeStore(
+            SequencedProbeProvider([
+                ProviderCatalog.codex: [Fixtures.codexReport()],
+                ProviderCatalog.agy: [Fixtures.agyLiveReport()],
+                ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport()],
+            ]),
+            selected: ProviderCatalog.agy
+        )
+        await agyLiveStore.refreshAll()
+
+        let agyFallbackStore = makeStore(
+            SequencedProbeProvider([
+                ProviderCatalog.agy: [Fixtures.agyOfflineLocalTokensReport()],
+            ]),
+            selected: ProviderCatalog.agy
+        )
+        await agyFallbackStore.refreshAll()
+
+        for theme in UsageLensTheme.allCases {
+            UserDefaults.standard.set(theme.rawValue, forKey: "usageLens.theme")
+            let nsAppearance = appearance(for: theme)
+
+            for (label, metrics) in profiles {
+                let panelHeight = metrics.scaledDimension(360, minimum: 280)
+                let panelSize = CGSize(width: metrics.panelWidth, height: panelHeight)
+
+                let (_, liveImg) = try renderHosted(
+                    PanelView(store: agyLiveStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "19-panel-agy-live-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(liveImg, context: "panel-agy-live-\(theme.rawValue)-\(label)")
+
+                let (_, fallbackImg) = try renderHosted(
+                    PanelView(store: agyFallbackStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "20-panel-agy-fallback-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(fallbackImg, context: "panel-agy-fallback-\(theme.rawValue)-\(label)")
+
+                let settingsView = SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    hasSavedAPIKey: false,
+                    geminiCredentialSource: .unconfigured
+                ).environment(\.displayScaleMetrics, metrics)
+                let (_, settingsImg) = try renderHosted(
+                    settingsView,
+                    size: metrics.settingsWindowSize,
+                    appearance: nsAppearance,
+                    scrollToBottom: true,
+                    named: "21-settings-agy-active-\(theme.rawValue)-\(label)",
+                    inspectView: { root in
+                        XCTAssertNotNil(self.firstDescendant(ofType: NSScrollView.self, in: root))
+                    }
+                )
+                assertNonBlankImage(settingsImg, context: "settings-agy-active-\(theme.rawValue)-\(label)")
             }
         }
     }

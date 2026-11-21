@@ -99,9 +99,10 @@ public enum RepoLocator {
 /// 定位脚本、运行并解析 stdout。凭据按厂商严格隔离，仅从钥匙串注入对应探针子进程。
 public struct ProbeRunner: ProbeProviding {
     public static let defaultTimeout: TimeInterval = 6
-    /// Gemini 本机凭据刷新 + 项目发现 + 配额查询最多串行 4 次 3s 请求，给足有界预算。
+    /// Gemini / AGY 本机凭据刷新 + 项目发现 + 配额查询最多串行 4 次 3s 请求，给足有界预算。
     public static let defaultProviderTimeouts: [String: TimeInterval] = [
         ProviderCatalog.gemini.id: 15,
+        ProviderCatalog.agy.id: 15,
     ]
 
     public var root: URL?
@@ -317,6 +318,11 @@ public struct ProbeRunner: ProbeProviding {
             environment.removeValue(forKey: "GEMINI_ACCOUNT_EMAIL")
             environment.removeValue(forKey: "GEMINI_ACCESS_TOKEN")
             environment.removeValue(forKey: "GEMINI_PROJECT_ID")
+        }
+        if provider?.id != ProviderCatalog.agy.id {
+            for key in Array(environment.keys) where key.hasPrefix("AGY_") {
+                environment.removeValue(forKey: key)
+            }
         }
         // 仅用于保存前验证候选密钥；优先级高于钥匙串，绝不落盘。
         for (name, value) in environmentOverrides {
