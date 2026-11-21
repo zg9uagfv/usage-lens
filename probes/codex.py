@@ -66,6 +66,8 @@ WINDOW_SPEC = {
 
 _SECRET_PATTERNS = (
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    re.compile(r"ya29\.[A-Za-z0-9._\-]+"),
+    re.compile(r"1//[A-Za-z0-9._\-]+"),
     re.compile(r"Bearer\s+\S+", re.IGNORECASE),
     re.compile(r"sk-[A-Za-z0-9_\-]{5,}"),
     re.compile(r"\b(?:api[_-]?key|key|token|secret|password)\b\s*[=:]\s*\S+", re.IGNORECASE),

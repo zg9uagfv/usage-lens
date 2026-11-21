@@ -729,20 +729,91 @@ class CodexLiveServerTest(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(self.module.is_official_url(url), expected)
 
-    def test_secret_redaction_strips_jwt_bearer_and_sk(self):
-        leaked = "err %s Bearer %s sk-secret123456" % (self.fake_access, self.fake_access)
-        opener = _FakeOpener(exc=RuntimeError(leaked))
+    def test_secret_redaction_strips_jwt_bearer_sk_and_google_tokens_across_channels(self):
+        google_access_short = "ya29.synthetic.short.token"
+        google_access_long = "ya29.a0.segmented.access_token-12345"
+        google_refresh = "1//syntheticRefresh1234"
+        google_refresh_seg = "1//0e.segmented.refresh_token-5678"
+        sk_token = "sk-secret123456"
+        leaked = (
+            "err %s Bearer %s %s %s %s %s %s"
+            % (
+                self.fake_access,
+                self.fake_access,
+                sk_token,
+                google_access_short,
+                google_access_long,
+                google_refresh,
+                google_refresh_seg,
+            )
+        )
+        forbidden = (
+            self.fake_access,
+            sk_token,
+            google_access_short,
+            google_access_long,
+            google_refresh,
+            google_refresh_seg,
+            "ya29.",
+            "1//",
+        )
+
+        # 1. Live URLError fallback path -> emitted JSON warnings + stderr
+        opener = _FakeOpener(exc=urllib.error.URLError(leaked))
         self._write_auth()
         self._write_local_fallback_log()
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
         with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
-             mock.patch.object(self.module, "_OPENER", opener):
-            payload = self.module.build_payload()
+             mock.patch.object(self.module, "_OPENER", opener), \
+             mock.patch.object(sys, "stdout", stdout_buf), \
+             mock.patch.object(sys, "stderr", stderr_buf):
+            rc = self.module.main(["codex.py"])
+            self.module._log(leaked)
 
-        rendered = json.dumps(payload, ensure_ascii=False)
-        self.assertNotIn(self.fake_access, rendered)
-        self.assertNotIn("sk-secret123456", rendered)
-        self.assertIn("[redacted]", rendered)
-        support.assert_no_secrets(self, rendered)
+        self.assertEqual(rc, 0)
+        stdout_text = stdout_buf.getvalue()
+        stderr_text = stderr_buf.getvalue()
+        payload = support.strict_loads(stdout_text.strip())
+        self.assertTrue(any("回退到本地会话日志" in w for w in payload["warnings"]), payload["warnings"])
+        self.assertIn("[redacted]", stdout_text)
+        self.assertIn("[redacted]", stderr_text)
+        for secret in forbidden:
+            self.assertNotIn(secret, stdout_text)
+            self.assertNotIn(secret, stderr_text)
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+        # 2. Top-level error path -> emitted JSON error + stderr
+        err_stdout = io.StringIO()
+        err_stderr = io.StringIO()
+        with mock.patch.object(self.module, "build_payload", side_effect=RuntimeError(leaked)), \
+             mock.patch.object(sys, "stdout", err_stdout), \
+             mock.patch.object(sys, "stderr", err_stderr):
+            err_rc = self.module.main(["codex.py"])
+
+        self.assertEqual(err_rc, 1)
+        err_text = err_stdout.getvalue()
+        err_payload = support.strict_loads(err_text.strip())
+        self.assertIsNotNone(err_payload["error"])
+        self.assertIn("[redacted]", err_payload["error"])
+        for secret in forbidden:
+            self.assertNotIn(secret, err_text)
+        support.assert_no_secrets(self, err_text)
+
+        # 3. Unsupported CLI argument path -> emitted JSON error + stderr
+        arg_stdout = io.StringIO()
+        arg_stderr = io.StringIO()
+        with mock.patch.object(sys, "stdout", arg_stdout), \
+             mock.patch.object(sys, "stderr", arg_stderr):
+            arg_rc = self.module.main(["codex.py", "--token=" + google_access_short])
+
+        self.assertEqual(arg_rc, 2)
+        for text in (arg_stdout.getvalue(), arg_stderr.getvalue()):
+            self.assertIn("[redacted]", text)
+            self.assertNotIn(google_access_short, text)
+            self.assertNotIn("ya29.", text)
+            support.assert_no_secrets(self, text)
 
 
 if __name__ == "__main__":

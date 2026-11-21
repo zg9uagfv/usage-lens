@@ -451,4 +451,133 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(emptyState.windows.isEmpty)
         XCTAssertEqual(emptyState.failureReason, auth403.failure)
     }
+
+    func testGeminiDelayedMultiStepRefreshSucceedsWithinDefaultBudgetAndEnforcesBoundedDeadline() async throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent(
+            "usage-lens-gemini-timeout-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let probesDir = tempRoot.appendingPathComponent("probes", isDirectory: true)
+        let tempHome = tempRoot.appendingPathComponent("home", isDirectory: true)
+        let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
+        try fm.createDirectory(at: probesDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: geminiDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let realGeminiProbe = repoRoot.appendingPathComponent("probes/gemini.py")
+        XCTAssertTrue(fm.fileExists(atPath: realGeminiProbe.path), "找不到真实 probes/gemini.py：\(realGeminiProbe.path)")
+
+        let credsJSON = """
+        {
+          "access_token": "ya29.expired_local_token_12345",
+          "refresh_token": "1//synthetic_refresh_token_12345",
+          "client_id": "synthetic-client-id.apps.googleusercontent.com",
+          "expiry_date": 1000000000000
+        }
+        """
+        try credsJSON.write(
+            to: geminiDir.appendingPathComponent("oauth_creds.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"active":"delayed.local@gmail.com","old":[]}"#.write(
+            to: geminiDir.appendingPathComponent("google_accounts.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let wrapperScript = """
+        import importlib.util, json, sys, time
+
+        spec = importlib.util.spec_from_file_location("real_gemini_probe", \(String(reflecting: realGeminiProbe.path)))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class _DelayedResponse:
+            def __init__(self, body, final_url):
+                self._body = body
+                self._final_url = final_url
+                self.headers = {"Content-Length": str(len(body))}
+            def geturl(self):
+                return self._final_url
+            def read(self, amount=-1):
+                return self._body if amount is None or amount < 0 else self._body[:amount]
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc_info):
+                return False
+
+        class _DelayedOpener:
+            def open(self, request, timeout=None):
+                assert timeout is not None and timeout <= 3.0
+                time.sleep(2.15)
+                url = request.full_url
+                if url == module.OAUTH_TOKEN_URL:
+                    body = json.dumps({"access_token": "ya29.refreshed_delayed_token_12345", "expires_in": 3600}).encode("utf-8")
+                    return _DelayedResponse(body, url)
+                if url == module.LOAD_CODE_ASSIST_URL:
+                    body = json.dumps({"cloudaicompanionProject": "proj-delayed", "currentTier": {"id": "pro"}}).encode("utf-8")
+                    return _DelayedResponse(body, url)
+                if url == module.RETRIEVE_QUOTA_URL:
+                    body = json.dumps({
+                        "buckets": [
+                            {"windowDuration": "5h", "remainingFraction": 0.75, "resetTime": "2099-01-01T05:00:00Z"},
+                            {"windowDuration": "7d", "remainingFraction": 0.60, "resetTime": "2099-01-07T00:00:00Z"},
+                        ]
+                    }).encode("utf-8")
+                    return _DelayedResponse(body, url)
+                raise AssertionError("unexpected url: " + url)
+
+        module._OPENER = _DelayedOpener()
+        sys.exit(module.main(["gemini.py"]))
+        """
+        try wrapperScript.write(
+            to: probesDir.appendingPathComponent("gemini.py"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        // 1. 默认 ProbeRunner：Gemini 享有 15s 有界预算，其他探针保持 6s 默认。
+        let defaultRunner = ProbeRunner(
+            root: tempRoot,
+            deepSeekAPIKeyLoader: { nil },
+            geminiAccountLoader: { nil }
+        )
+        XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.codex), 6)
+        XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.deepseek), 6)
+        XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.gemini), 15)
+
+        let report = await defaultRunner.report(
+            for: ProviderCatalog.gemini,
+            environmentOverrides: ["HOME": tempHome.path]
+        )
+        XCTAssertNil(report.failure, report.failure ?? "nil")
+        XCTAssertGreaterThanOrEqual(report.duration, 6.0, "3 步延迟序列总时长应超过 6s")
+        XCTAssertEqual(report.envelope?.account?.label, "delayed.local@gmail.com")
+        XCTAssertEqual(report.envelope?.account?.plan, "pro")
+        XCTAssertEqual(report.envelope?.windows.count, 2)
+        XCTAssertEqual(report.envelope?.windows.first(where: { $0.id == "5h" })?.usedPercent, 25)
+        XCTAssertEqual(report.envelope?.windows.first(where: { $0.id == "7d" })?.usedPercent, 40)
+
+        // 2. 仍严格执行有界超时，并在失败文案中报告实际截止时间。
+        let boundedRunner = ProbeRunner(
+            root: tempRoot,
+            providerTimeouts: [ProviderCatalog.gemini.id: 2],
+            deepSeekAPIKeyLoader: { nil },
+            geminiAccountLoader: { nil }
+        )
+        let timedOut = await boundedRunner.report(
+            for: ProviderCatalog.gemini,
+            environmentOverrides: ["HOME": tempHome.path]
+        )
+        XCTAssertNil(timedOut.envelope)
+        XCTAssertEqual(timedOut.failure, "探针超时（>2s）")
+        XCTAssertLessThan(timedOut.duration, 5.0)
+    }
 }

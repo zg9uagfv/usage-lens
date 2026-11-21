@@ -98,21 +98,34 @@ public enum RepoLocator {
 
 /// 定位脚本、运行并解析 stdout。凭据按厂商严格隔离，仅从钥匙串注入对应探针子进程。
 public struct ProbeRunner: ProbeProviding {
+    public static let defaultTimeout: TimeInterval = 6
+    /// Gemini 本机凭据刷新 + 项目发现 + 配额查询最多串行 4 次 3s 请求，给足有界预算。
+    public static let defaultProviderTimeouts: [String: TimeInterval] = [
+        ProviderCatalog.gemini.id: 15,
+    ]
+
     public var root: URL?
     public var timeout: TimeInterval
+    public var providerTimeouts: [String: TimeInterval]
     private let deepSeekAPIKeyLoader: @Sendable () -> String?
     private let geminiAccountLoader: @Sendable () -> GeminiAccount?
 
     public init(
         root: URL? = nil,
-        timeout: TimeInterval = 6,
+        timeout: TimeInterval = defaultTimeout,
+        providerTimeouts: [String: TimeInterval] = defaultProviderTimeouts,
         deepSeekAPIKeyLoader: @escaping @Sendable () -> String? = { DeepSeekAPIKeyStore.load() },
         geminiAccountLoader: @escaping @Sendable () -> GeminiAccount? = { GeminiAccountStore.load() }
     ) {
         self.root = root
         self.timeout = timeout
+        self.providerTimeouts = providerTimeouts
         self.deepSeekAPIKeyLoader = deepSeekAPIKeyLoader
         self.geminiAccountLoader = geminiAccountLoader
+    }
+
+    public func effectiveTimeout(for provider: Provider) -> TimeInterval {
+        providerTimeouts[provider.id] ?? timeout
     }
 
     public func report(for provider: Provider) async -> ProbeReport {
@@ -146,10 +159,11 @@ public struct ProbeRunner: ProbeProviding {
             )
         }
 
+        let effectiveTimeout = effectiveTimeout(for: provider)
         let execution = await execute(
             probe: probeURL,
             workingDirectory: resolvedRoot,
-            timeout: timeout,
+            timeout: effectiveTimeout,
             provider: provider,
             environmentOverrides: environmentOverrides
         )
@@ -168,7 +182,12 @@ public struct ProbeRunner: ProbeProviding {
                 )
             }
             if output.timedOut {
-                return ProbeReport(provider: provider, failure: "探针超时（>\(Int(timeout))s）", finishedAt: Date(), duration: duration)
+                return ProbeReport(
+                    provider: provider,
+                    failure: "探针超时（>\(Self.formattedTimeoutSeconds(effectiveTimeout))s）",
+                    finishedAt: Date(),
+                    duration: duration
+                )
             }
             if output.drainTimedOut {
                 return ProbeReport(
@@ -245,6 +264,13 @@ public struct ProbeRunner: ProbeProviding {
     static let outputLimit = 8 * 1024 * 1024
     /// 进程退出后等读端收尾的上限；到点直接停掉读取，主流程不再等。
     static let drainTimeout: TimeInterval = 2
+
+    private static func formattedTimeoutSeconds(_ seconds: TimeInterval) -> String {
+        if seconds.rounded() == seconds {
+            return "\(Int(seconds))"
+        }
+        return String(format: "%.1f", seconds)
+    }
 
     /// 边跑边排空两条管道，再等进程退出 + 超时。
     /// 关键点：
