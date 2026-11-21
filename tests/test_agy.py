@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -448,6 +449,59 @@ class AgyProbeTest(unittest.TestCase):
             )
         self.assertTrue(any("末尾 4MB" in w for w in warnings))
         self.assertIsNotNone(tokens)
+
+    # 4b. UTC vs local date boundary aggregates today's local tokens accurately
+    def test_utc_local_date_boundary_aggregates_local_today_tokens(self):
+        probe = load_probe()
+        # 2026-11-21T18:30:00Z is 2026-11-22 02:30:00+08:00 (UTC date != local date)
+        boundary_now = datetime.datetime(2026, 11, 21, 18, 30, 0, tzinfo=datetime.timezone.utc)
+        today_local_iso = "2026-11-21T18:20:00Z"  # 2026-11-22 02:20+08:00 (local today)
+        yesterday_local_iso = "2026-11-21T15:00:00Z"  # 2026-11-21 23:00+08:00 (local yesterday, same UTC date)
+
+        transcript_path = write_transcript(
+            self.brain_cli,
+            "conv-tz-boundary",
+            [
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": yesterday_local_iso,
+                    "input_tokens": 9000,
+                    "output_tokens": 1000,
+                    "cache_read_tokens": 0,
+                },
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": today_local_iso,
+                    "input_tokens": 400,
+                    "output_tokens": 150,
+                    "cache_read_tokens": 50,
+                },
+            ],
+        )
+        boundary_epoch = boundary_now.timestamp()
+        os.utime(transcript_path, (boundary_epoch, boundary_epoch))
+
+        prev_tz = os.environ.get("TZ")
+        try:
+            with mock.patch.object(probe, "utc_now", return_value=boundary_now):
+                os.environ["TZ"] = "Asia/Shanghai"
+                if hasattr(time, "tzset"):
+                    time.tzset()
+                code, payload, _, _ = self._run_in_process(
+                    probe,
+                    env={"AGY_DISABLE_LOCAL_AUTH": "1", "TZ": "Asia/Shanghai"},
+                    opener=FakeOpener(),
+                )
+        finally:
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["usage"], {"today_tokens": 600, "source": "local"})
 
     # 5a. Proactive in-memory OAuth refresh (zero writes)
     def test_proactive_in_memory_oauth_refresh_zero_writes(self):

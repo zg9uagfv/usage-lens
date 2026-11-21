@@ -14,6 +14,7 @@ retrieveUserQuota），并按保守最大原则归一化为标准 5h / 7d 窗口
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
 import json
 import math
@@ -25,7 +26,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -82,6 +83,7 @@ _SUFFIX_DURATION_RE = re.compile(
     r"^(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$",
     re.IGNORECASE,
 )
+_DURATION_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
 def redact(text: str) -> str:
@@ -95,6 +97,14 @@ def redact(text: str) -> str:
 
 def _log(message: str) -> None:
     sys.stderr.write("usage-lens/agy: %s\n" % redact(message))
+
+
+def _non_empty_str(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
 
 
 def utc_now() -> datetime.datetime:
@@ -111,9 +121,9 @@ def utc_iso_now() -> str:
 
 def parse_iso_epoch(text: Any) -> Optional[float]:
     """ISO8601 / RFC3339 字符串 -> UTC epoch 秒；无法解析返回 None。"""
-    if not isinstance(text, str) or not text.strip():
+    raw = _non_empty_str(text)
+    if raw is None:
         return None
-    raw = text.strip()
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
     frac_match = re.match(
@@ -122,8 +132,7 @@ def parse_iso_epoch(text: Any) -> Optional[float]:
     )
     if frac_match:
         prefix, frac, tz = frac_match.groups()
-        frac = (frac[:6]).ljust(6, "0")
-        raw = "%s.%s%s" % (prefix, frac, tz or "")
+        raw = "%s.%s%s" % (prefix, (frac[:6]).ljust(6, "0"), tz or "")
     try:
         moment = datetime.datetime.fromisoformat(raw)
     except ValueError:
@@ -137,10 +146,9 @@ def epoch_to_iso(epoch_seconds: Optional[float]) -> Optional[str]:
     if epoch_seconds is None or not math.isfinite(epoch_seconds) or epoch_seconds <= 0:
         return None
     try:
-        moment = datetime.datetime.fromtimestamp(epoch_seconds, datetime.timezone.utc)
+        return to_utc_iso(datetime.datetime.fromtimestamp(epoch_seconds, datetime.timezone.utc))
     except (OverflowError, OSError, ValueError):
         return None
-    return to_utc_iso(moment)
 
 
 def _as_finite_float(value: Any) -> Optional[float]:
@@ -158,9 +166,7 @@ def _as_finite_float(value: Any) -> Optional[float]:
             return None
     else:
         return None
-    if not math.isfinite(number):
-        return None
-    return number
+    return number if math.isfinite(number) else None
 
 
 def _human_age(seconds: float) -> str:
@@ -191,19 +197,16 @@ def _is_pinned_https_url(url: str, expected_host: str) -> bool:
         return False
     try:
         parts = urllib.parse.urlsplit(url)
-    except ValueError:
-        return False
-    if parts.scheme != OFFICIAL_SCHEME:
-        return False
-    if parts.username is not None or parts.password is not None:
-        return False
-    if (parts.hostname or "").lower() != expected_host:
-        return False
-    try:
         port = parts.port
     except ValueError:
         return False
-    return port in (None, 443)
+    return (
+        parts.scheme == OFFICIAL_SCHEME
+        and parts.username is None
+        and parts.password is None
+        and (parts.hostname or "").lower() == expected_host
+        and port in (None, 443)
+    )
 
 
 def is_official_url(url: str) -> bool:
@@ -216,70 +219,83 @@ def is_official_oauth_url(url: str) -> bool:
     return _is_pinned_https_url(url, OAUTH_TOKEN_HOST)
 
 
-def _http_error_reason(exc: urlerror.HTTPError, source: str = "local") -> str:
-    code = exc.code
+def _http_error_reason(code: int, source: str = "local", oauth: bool = False) -> str:
+    if oauth and code in (400, 401, 403):
+        return "本机 AGY 登录态已过期或刷新失败（HTTP %d），请先运行 agy 刷新登录态" % code
+    prefix = "刷新本机 AGY 登录态失败：" if oauth else ""
     if code in (301, 302, 303, 307, 308):
-        return "接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
+        return prefix + ("接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code)
     if code in (401, 403):
         if source == "local":
             return "本机 AGY 登录态无效或已过期（HTTP %d），请先运行 agy 刷新登录态" % code
         return "AGY 凭据无效或已过期（HTTP %d）" % code
     if code == 429:
-        return "请求被限流（HTTP 429），请稍后重试"
+        return prefix + "请求被限流（HTTP 429），请稍后重试"
     if 500 <= code < 600:
-        return "服务暂时不可用（HTTP %d），请稍后重试" % code
-    return "HTTP %d" % code
+        return prefix + ("服务暂时不可用（HTTP %d），请稍后重试" % code)
+    return prefix + ("HTTP %d" % code)
+
+
+def _post_pinned_json(
+    url: str,
+    raw_body: bytes,
+    headers: Dict[str, str],
+    url_validator: Callable[[str], bool],
+    http_error_formatter: Callable[[int], str],
+    error_prefix: str = "",
+) -> Tuple[Optional[dict], Optional[str], Optional[int]]:
+    """统一执行域名绑定、禁重定向、1MB 上限的 HTTPS POST，并解析 JSON 字典。"""
+    request = urlrequest.Request(url, data=raw_body, headers=headers, method="POST")
+    try:
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            if not url_validator(response.geturl()):
+                return None, error_prefix + "响应最终地址不是官方域名，已拒绝使用", None
+            length = response.headers.get("Content-Length") if response.headers else None
+            if length is not None:
+                try:
+                    if int(length) > HTTP_MAX_BYTES:
+                        return None, error_prefix + ("响应体过大（%s 字节），已拒绝读取" % length), None
+                except (TypeError, ValueError):
+                    pass
+            body = response.read(HTTP_MAX_BYTES + 1)
+            if len(body) > HTTP_MAX_BYTES:
+                return None, error_prefix + "响应体超过 1MB 上限，已拒绝读取", None
+    except urlerror.HTTPError as exc:
+        code = exc.code
+        with contextlib.suppress(Exception):
+            exc.close()
+        return None, redact(http_error_formatter(code)), code
+    except urlerror.URLError as exc:
+        return None, redact(error_prefix + ("网络不可用（%s）" % exc.reason)), None
+    except (TimeoutError, OSError) as exc:
+        return None, redact(error_prefix + ("请求超时或中断（%s）" % exc)), None
+    except Exception as exc:
+        return None, redact(error_prefix + str(exc)), None
+
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None, error_prefix + "接口返回不是合法 JSON", None
+    if not isinstance(data, dict):
+        return None, error_prefix + "接口返回格式异常", None
+    return data, None, 200
 
 
 def _post_json_with_status(
-    url: str,
-    access_token: str,
-    body_obj: dict,
-    source: str = "local",
+    url: str, access_token: str, body_obj: dict, source: str = "local"
 ) -> Tuple[Optional[dict], Optional[str], Optional[int]]:
     """向 AGY 官方接口发送 JSON POST；返回 (data, 脱敏中文原因, HTTP 状态码)。"""
-    raw_body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
-    request = urlrequest.Request(
-        url,
-        data=raw_body,
+    return _post_pinned_json(
+        url=url,
+        raw_body=json.dumps(body_obj, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": "Bearer " + access_token,
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
-        method="POST",
+        url_validator=is_official_url,
+        http_error_formatter=lambda code: _http_error_reason(code, source=source),
     )
-    try:
-        with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            final_url = response.geturl()
-            if not is_official_url(final_url):
-                return None, "响应最终地址不是官方域名，已拒绝使用", None
-            length = response.headers.get("Content-Length") if response.headers else None
-            if length is not None:
-                try:
-                    if int(length) > HTTP_MAX_BYTES:
-                        return None, "响应体过大（%s 字节），已拒绝读取" % length, None
-                except (TypeError, ValueError):
-                    pass
-            body = response.read(HTTP_MAX_BYTES + 1)
-            if len(body) > HTTP_MAX_BYTES:
-                return None, "响应体超过 1MB 上限，已拒绝读取", None
-    except urlerror.HTTPError as exc:
-        return None, redact(_http_error_reason(exc, source=source)), exc.code
-    except urlerror.URLError as exc:
-        return None, redact("网络不可用（%s）" % exc.reason), None
-    except (TimeoutError, OSError) as exc:
-        return None, redact("请求超时或中断（%s）" % exc), None
-    except Exception as exc:
-        return None, redact(str(exc)), None
-
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except ValueError:
-        return None, "接口返回不是合法 JSON", None
-    if not isinstance(data, dict):
-        return None, "接口返回格式异常", None
-    return data, None, 200
 
 
 # ---------------------------------------------------------------- 凭据发现与内存刷新
@@ -310,86 +326,55 @@ def _parse_expiry_epoch(value: Any) -> Optional[float]:
     num = _as_finite_float(value)
     if num is None or num <= 0:
         return None
-    if num > 1e11:
-        return num / 1000.0
-    return num
+    return num / 1000.0 if num > 1e11 else num
 
 
 def _decode_keyring_payload(raw: str) -> Optional[dict]:
     """解码 go-keyring-base64: 载荷或纯 JSON 载荷，返回规范化凭据字典。"""
-    if not isinstance(raw, str):
-        return None
-    text = raw.strip()
-    if not text:
+    text = _non_empty_str(raw)
+    if text is None:
         return None
 
-    if text.startswith(GO_KEYRING_B64_PREFIX):
-        encoded = text[len(GO_KEYRING_B64_PREFIX):].strip()
-        try:
-            decoded_bytes = base64.b64decode(encoded)
-            data = json.loads(decoded_bytes.decode("utf-8"))
-        except (ValueError, TypeError, UnicodeDecodeError):
-            return None
-    else:
-        try:
+    try:
+        if text.startswith(GO_KEYRING_B64_PREFIX):
+            decoded = base64.b64decode(text[len(GO_KEYRING_B64_PREFIX):].strip())
+            data = json.loads(decoded.decode("utf-8"))
+        else:
             data = json.loads(text)
-        except ValueError:
-            return None
-
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
     if not isinstance(data, dict):
         return None
 
-    token_obj = data.get("token")
-    if not isinstance(token_obj, dict):
-        token_obj = data
-
-    raw_access = token_obj.get("access_token")
-    access_token = raw_access.strip() if isinstance(raw_access, str) and raw_access.strip() else None
-
-    raw_refresh = token_obj.get("refresh_token")
-    refresh_token = raw_refresh.strip() if isinstance(raw_refresh, str) and raw_refresh.strip() else None
-
+    token_obj = data.get("token") if isinstance(data.get("token"), dict) else data
+    access_token = _non_empty_str(token_obj.get("access_token"))
+    refresh_token = _non_empty_str(token_obj.get("refresh_token"))
     if not access_token and not refresh_token:
         return None
 
-    expiry_epoch = _parse_expiry_epoch(
-        token_obj.get("expiry") if token_obj.get("expiry") is not None else token_obj.get("expiry_date")
-    )
+    expiry_val = token_obj.get("expiry")
+    if expiry_val is None:
+        expiry_val = token_obj.get("expiry_date")
 
-    email: Optional[str] = None
-    raw_email = data.get("id_token_email") or data.get("email")
-    if isinstance(raw_email, str) and raw_email.strip():
-        email = raw_email.strip()
-    else:
+    email = _non_empty_str(data.get("id_token_email")) or _non_empty_str(data.get("email"))
+    if email is None:
         claims = _decode_jwt_payload(token_obj.get("id_token") or data.get("id_token"))
-        if claims is not None:
-            claim_email = claims.get("email")
-            if isinstance(claim_email, str) and claim_email.strip():
-                email = claim_email.strip()
+        email = _non_empty_str(claims.get("email")) if claims is not None else None
 
-    raw_client_id = data.get("client_id") or token_obj.get("client_id")
     client_id = (
-        raw_client_id.strip()
-        if isinstance(raw_client_id, str) and raw_client_id.strip()
-        else ((os.environ.get("AGY_OAUTH_CLIENT_ID") or "").strip() or None)
+        _non_empty_str(data.get("client_id"))
+        or _non_empty_str(token_obj.get("client_id"))
+        or _non_empty_str(os.environ.get("AGY_OAUTH_CLIENT_ID"))
     )
-
-    raw_client_secret = data.get("client_secret") or token_obj.get("client_secret")
     client_secret = (
-        raw_client_secret.strip()
-        if isinstance(raw_client_secret, str) and raw_client_secret.strip()
-        else ((os.environ.get("AGY_OAUTH_CLIENT_SECRET") or "").strip() or None)
+        _non_empty_str(data.get("client_secret"))
+        or _non_empty_str(token_obj.get("client_secret"))
+        or _non_empty_str(os.environ.get("AGY_OAUTH_CLIENT_SECRET"))
     )
-
     return {
-        "source": "local",
-        "email": email,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expiry_epoch": expiry_epoch,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "project_id": None,
+        "source": "local", "email": email, "access_token": access_token,
+        "refresh_token": refresh_token, "expiry_epoch": _parse_expiry_epoch(expiry_val),
+        "client_id": client_id, "client_secret": client_secret, "project_id": None,
     }
 
 
@@ -399,67 +384,45 @@ def _is_home_isolated() -> bool:
         real_pw_home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
     except KeyError:
         return True
-    current_home = os.path.realpath(str(Path.home()))
-    return current_home != real_pw_home
+    return os.path.realpath(str(Path.home())) != real_pw_home
 
 
 def _local_auth_file_path() -> Path:
     if LOCAL_AUTH_FILE is not None:
         return LOCAL_AUTH_FILE
-    env_path = (os.environ.get("AGY_AUTH_FILE") or "").strip()
-    if env_path:
-        return Path(env_path)
-    return Path.home() / ".gemini" / "antigravity-cli" / "auth.json"
+    env_path = _non_empty_str(os.environ.get("AGY_AUTH_FILE"))
+    return Path(env_path) if env_path else Path.home() / ".gemini" / "antigravity-cli" / "auth.json"
 
 
 def _load_keychain_credentials() -> Optional[dict]:
     """只读读取 macOS 登录钥匙串中的 AGY go-keyring 凭据。"""
-    if sys.platform != "darwin":
+    if sys.platform != "darwin" or _is_home_isolated():
         return None
-    if _is_home_isolated():
-        return None
+    cmd = [
+        "/usr/bin/security", "find-generic-password",
+        "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w",
+    ]
     try:
         completed = subprocess.run(
-            [
-                "/usr/bin/security",
-                "find-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                KEYCHAIN_ACCOUNT,
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=KEYCHAIN_TIMEOUT_SECONDS,
-            check=False,
+            cmd, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT_SECONDS, check=False
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if completed.returncode != 0:
-        return None
-    raw = (completed.stdout or "").strip()
-    if not raw:
-        return None
-    return _decode_keyring_payload(raw)
+    raw = _non_empty_str(completed.stdout) if completed.returncode == 0 else None
+    return _decode_keyring_payload(raw) if raw else None
 
 
 def _resolve_credentials() -> Optional[dict]:
     """只读解析 AGY 凭据：AGY_ACCESS_TOKEN > DISABLE 门控 > 本地 auth.json > macOS 钥匙串。"""
-    env_token = (os.environ.get("AGY_ACCESS_TOKEN") or "").strip()
-    env_email = (os.environ.get("AGY_ACCOUNT_EMAIL") or "").strip() or None
-    env_project = (os.environ.get("AGY_PROJECT_ID") or "").strip() or None
+    env_token = _non_empty_str(os.environ.get("AGY_ACCESS_TOKEN"))
+    env_email = _non_empty_str(os.environ.get("AGY_ACCOUNT_EMAIL"))
+    env_project = _non_empty_str(os.environ.get("AGY_PROJECT_ID"))
 
     if env_token:
         return {
-            "source": "manual",
-            "email": env_email,
-            "access_token": env_token,
-            "refresh_token": None,
-            "expiry_epoch": None,
-            "client_id": None,
-            "client_secret": None,
-            "project_id": env_project,
+            "source": "manual", "email": env_email, "access_token": env_token,
+            "refresh_token": None, "expiry_epoch": None, "client_id": None,
+            "client_secret": None, "project_id": env_project,
         }
 
     if (os.environ.get("AGY_DISABLE_LOCAL_AUTH") or "").strip() == "1":
@@ -468,15 +431,11 @@ def _resolve_credentials() -> Optional[dict]:
     local: Optional[dict] = None
     auth_path = _local_auth_file_path()
     if auth_path.is_file():
-        try:
-            raw = auth_path.read_text(encoding="utf-8")
-            local = _decode_keyring_payload(raw)
-        except (OSError, UnicodeDecodeError):
-            local = None
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            local = _decode_keyring_payload(auth_path.read_text(encoding="utf-8"))
 
     if local is None:
         local = _load_keychain_credentials()
-
     if local is None:
         return None
 
@@ -500,59 +459,24 @@ def _refresh_access_token(creds: dict) -> Tuple[Optional[str], Optional[str]]:
     if creds.get("client_secret"):
         form_fields["client_secret"] = creds["client_secret"]
 
-    raw_body = urllib.parse.urlencode(form_fields).encode("utf-8")
-    request = urlrequest.Request(
-        OAUTH_TOKEN_URL,
-        data=raw_body,
+    data, err, _ = _post_pinned_json(
+        url=OAUTH_TOKEN_URL,
+        raw_body=urllib.parse.urlencode(form_fields).encode("utf-8"),
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
         },
-        method="POST",
+        url_validator=is_official_oauth_url,
+        http_error_formatter=lambda code: _http_error_reason(code, oauth=True),
+        error_prefix="刷新本机 AGY 登录态失败：",
     )
-    try:
-        with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            final_url = response.geturl()
-            if not is_official_oauth_url(final_url):
-                return None, "刷新本机 AGY 登录态失败：响应最终地址不是官方域名，已拒绝使用"
-            length = response.headers.get("Content-Length") if response.headers else None
-            if length is not None:
-                try:
-                    if int(length) > HTTP_MAX_BYTES:
-                        return None, "刷新本机 AGY 登录态失败：响应体过大（%s 字节），已拒绝读取" % length
-                except (TypeError, ValueError):
-                    pass
-            body = response.read(HTTP_MAX_BYTES + 1)
-            if len(body) > HTTP_MAX_BYTES:
-                return None, "刷新本机 AGY 登录态失败：响应体超过 1MB 上限，已拒绝读取"
-    except urlerror.HTTPError as exc:
-        code = exc.code
-        if code in (301, 302, 303, 307, 308):
-            return None, "刷新本机 AGY 登录态失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
-        if code in (400, 401, 403):
-            return None, "本机 AGY 登录态已过期或刷新失败（HTTP %d），请先运行 agy 刷新登录态" % code
-        if code == 429:
-            return None, "刷新本机 AGY 登录态失败：请求被限流（HTTP 429），请稍后重试"
-        if 500 <= code < 600:
-            return None, "刷新本机 AGY 登录态失败：服务暂时不可用（HTTP %d），请稍后重试" % code
-        return None, "刷新本机 AGY 登录态失败：HTTP %d" % code
-    except urlerror.URLError as exc:
-        return None, redact("刷新本机 AGY 登录态失败：网络不可用（%s）" % exc.reason)
-    except (TimeoutError, OSError) as exc:
-        return None, redact("刷新本机 AGY 登录态失败：请求超时或中断（%s）" % exc)
-    except Exception as exc:
-        return None, redact("刷新本机 AGY 登录态失败：%s" % exc)
-
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except ValueError:
-        return None, "刷新本机 AGY 登录态失败：接口返回不是合法 JSON"
-    if not isinstance(data, dict):
-        return None, "刷新本机 AGY 登录态失败：接口返回格式异常"
-    raw_token = data.get("access_token")
-    if not isinstance(raw_token, str) or not raw_token.strip():
+    if err is not None:
+        return None, err
+    assert data is not None
+    token = _non_empty_str(data.get("access_token"))
+    if token is None:
         return None, "刷新本机 AGY 登录态失败：接口未返回有效访问令牌"
-    return raw_token.strip(), None
+    return token, None
 
 
 # ---------------------------------------------------------------- 窗口归类与归一化
@@ -564,69 +488,45 @@ def _parse_duration_seconds(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         secs = float(value)
         return secs if math.isfinite(secs) and secs > 0 else None
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
+    text = _non_empty_str(value)
+    if text is None:
         return None
 
     iso_match = _ISO_DURATION_RE.match(text)
     if iso_match and any(iso_match.groups()):
-        days = int(iso_match.group("days") or 0)
-        hours = int(iso_match.group("hours") or 0)
-        minutes = int(iso_match.group("minutes") or 0)
-        seconds = float(iso_match.group("seconds") or 0.0)
-        total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+        total = (
+            int(iso_match.group("days") or 0) * 86400
+            + int(iso_match.group("hours") or 0) * 3600
+            + int(iso_match.group("minutes") or 0) * 60
+            + float(iso_match.group("seconds") or 0.0)
+        )
         return total if total > 0 else None
 
     suffix_match = _SUFFIX_DURATION_RE.match(text)
     if suffix_match:
         val = float(suffix_match.group("value"))
-        unit = suffix_match.group("unit").lower()
-        if unit.startswith("d"):
-            return val * 86400
-        if unit.startswith("h"):
-            return val * 3600
-        if unit.startswith("m"):
-            return val * 60
-        return val
+        return val * _DURATION_UNIT_SECONDS[suffix_match.group("unit")[0].lower()]
 
     plain = _as_finite_float(text)
-    if plain is not None and plain > 0:
-        return plain
-    return None
+    return plain if plain is not None and plain > 0 else None
+
+
+_WINDOW_CLASSIFY_KEYS = (
+    "window", "bucketId", "windowDuration", "quotaDuration",
+    "duration", "period", "windowSeconds", "window_seconds", "id",
+)
 
 
 def _classify_window(bucket: dict, resets_epoch: Optional[float], now_epoch: float) -> Optional[str]:
-    for key in (
-        "window",
-        "bucketId",
-        "windowDuration",
-        "quotaDuration",
-        "duration",
-        "period",
-        "windowSeconds",
-        "window_seconds",
-        "id",
-    ):
+    for key in _WINDOW_CLASSIFY_KEYS:
         raw = bucket.get(key)
         if raw is None:
             continue
         if isinstance(raw, str):
             norm = raw.strip().lower()
-            if (
-                norm in ("5h", "five_hour", "5 小时", "5小时")
-                or norm.endswith("-5h")
-                or norm.endswith("_5h")
-            ):
+            if norm in ("5h", "five_hour", "5 小时", "5小时") or norm.endswith(("-5h", "_5h")):
                 return "5h"
-            if (
-                norm in ("weekly", "7d", "7 天", "7天")
-                or norm.endswith("-weekly")
-                or norm.endswith("_weekly")
-                or norm.endswith("-7d")
-                or norm.endswith("_7d")
-            ):
+            if norm in ("weekly", "7d", "7 天", "7天") or norm.endswith(("-weekly", "_weekly", "-7d", "_7d")):
                 return "7d"
         secs = _parse_duration_seconds(raw)
         if secs is not None:
@@ -636,16 +536,12 @@ def _classify_window(bucket: dict, resets_epoch: Optional[float], now_epoch: flo
                 return "7d"
 
     if resets_epoch is not None:
-        delta = resets_epoch - now_epoch
-        if delta <= 24 * 3600:
-            return "5h"
-        return "7d"
-
+        return "5h" if (resets_epoch - now_epoch) <= 24 * 3600 else "7d"
     return None
 
 
 def _used_percent_from_bucket(bucket: dict, label: str, warnings: List[str]) -> Optional[float]:
-    if "remainingFraction" in bucket and bucket["remainingFraction"] is not None:
+    if bucket.get("remainingFraction") is not None:
         rem = _as_finite_float(bucket["remainingFraction"])
         if rem is None or rem < 0.0 or rem > 1.0:
             warnings.append("%s的 remainingFraction 数值异常，已置空" % label)
@@ -653,13 +549,12 @@ def _used_percent_from_bucket(bucket: dict, label: str, warnings: List[str]) -> 
         return round((1.0 - rem) * 100.0, 2)
 
     for key in ("usedPercent", "used_percent"):
-        if key in bucket and bucket[key] is not None:
+        if bucket.get(key) is not None:
             pct = _as_finite_float(bucket[key])
             if pct is None or pct < 0.0 or pct > 100.0:
                 warnings.append("%s的 used_percent 数值异常，已置空" % label)
                 return None
             return round(pct, 2)
-
     return None
 
 
@@ -667,34 +562,24 @@ def _extract_plan(load_data: dict) -> Optional[str]:
     for tier_key in ("paidTier", "currentTier"):
         tier = load_data.get(tier_key)
         if isinstance(tier, dict):
-            for field in ("name", "id"):
-                val = tier.get(field)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-        elif isinstance(tier, str) and tier.strip():
-            return tier.strip()
+            plan = _non_empty_str(tier.get("name")) or _non_empty_str(tier.get("id"))
+            if plan:
+                return plan
+        else:
+            plan = _non_empty_str(tier)
+            if plan:
+                return plan
     return None
 
 
 def _collect_buckets(summary_data: Optional[dict], quota_data: Optional[dict]) -> List[dict]:
     collected: List[dict] = []
     if isinstance(summary_data, dict):
-        groups = summary_data.get("groups")
-        if isinstance(groups, list):
-            for group in groups:
-                if not isinstance(group, dict):
-                    continue
-                buckets = group.get("buckets")
-                if isinstance(buckets, list):
-                    for bucket in buckets:
-                        if isinstance(bucket, dict):
-                            collected.append(bucket)
+        for group in summary_data.get("groups") or []:
+            if isinstance(group, dict):
+                collected.extend(b for b in (group.get("buckets") or []) if isinstance(b, dict))
     if isinstance(quota_data, dict):
-        buckets = quota_data.get("buckets")
-        if isinstance(buckets, list):
-            for bucket in buckets:
-                if isinstance(bucket, dict):
-                    collected.append(bucket)
+        collected.extend(b for b in (quota_data.get("buckets") or []) if isinstance(b, dict))
     return collected
 
 
@@ -714,10 +599,9 @@ def _normalize_buckets(
         if window_id not in grouped:
             continue
         spec = WINDOW_SPEC[window_id]
-        used_percent = _used_percent_from_bucket(item, spec["label"], warnings)
         grouped[window_id].append(
             {
-                "used_percent": used_percent,
+                "used_percent": _used_percent_from_bucket(item, spec["label"], warnings),
                 "resets_epoch": resets_epoch,
                 "resets_at": epoch_to_iso(resets_epoch),
             }
@@ -733,10 +617,7 @@ def _normalize_buckets(
         if valid:
             chosen = max(
                 valid,
-                key=lambda c: (
-                    c["used_percent"],
-                    -(c["resets_epoch"] if c["resets_epoch"] is not None else float("inf")),
-                ),
+                key=lambda c: (c["used_percent"], -(c["resets_epoch"] if c["resets_epoch"] is not None else float("inf"))),
             )
         else:
             chosen = min(
@@ -745,12 +626,9 @@ def _normalize_buckets(
             )
 
         resets_epoch = chosen["resets_epoch"]
-        expired = False
-        if resets_epoch is not None and resets_epoch < now_epoch:
-            expired = True
-            warnings.append(
-                "%s窗口已于 %s重置" % (spec["label"], _human_age(now_epoch - resets_epoch))
-            )
+        expired = resets_epoch is not None and resets_epoch < now_epoch
+        if expired:
+            warnings.append("%s窗口已于 %s重置" % (spec["label"], _human_age(now_epoch - resets_epoch)))
 
         windows.append(
             {
@@ -772,7 +650,6 @@ def _normalize_buckets(
             warnings.append("AGY 接口未返回 5 小时配额窗口")
         if "7d" not in present:
             warnings.append("AGY 接口未返回 7 天配额窗口")
-
     return windows
 
 
@@ -783,10 +660,7 @@ def _brain_dirs() -> List[Path]:
     if BRAIN_DIRS is not None:
         return list(BRAIN_DIRS)
     home = Path.home()
-    return [
-        home / ".gemini" / "antigravity-cli" / "brain",
-        home / ".gemini" / "antigravity" / "brain",
-    ]
+    return [home / ".gemini" / "antigravity-cli" / "brain", home / ".gemini" / "antigravity" / "brain"]
 
 
 def _iter_lines_reverse(path: Path) -> Iterator[bytes]:
@@ -815,9 +689,7 @@ def _non_negative_int(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    if not math.isfinite(number) or number < 0:
-        return None
-    return int(number)
+    return int(number) if math.isfinite(number) and number >= 0 else None
 
 
 def _today_token_record(raw: bytes, today: datetime.date) -> Optional[int]:
@@ -826,15 +698,11 @@ def _today_token_record(raw: bytes, today: datetime.date) -> Optional[int]:
         record = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(record, dict):
-        return None
-    if record.get("type") != "PLANNER_RESPONSE":
+    if not isinstance(record, dict) or record.get("type") != "PLANNER_RESPONSE":
         return None
 
     epoch = parse_iso_epoch(record.get("created_at"))
-    if epoch is None:
-        return None
-    if datetime.datetime.fromtimestamp(epoch).date() != today:
+    if epoch is None or datetime.datetime.fromtimestamp(epoch).date() != today:
         return None
 
     subtotal = 0
@@ -859,7 +727,7 @@ def find_today_tokens(
     for base in dirs:
         if not base.is_dir():
             continue
-        try:
+        with contextlib.suppress(OSError):
             for path in base.glob("*/.system_generated/logs/transcript.jsonl"):
                 if not path.is_file():
                     continue
@@ -867,23 +735,17 @@ def find_today_tokens(
                 if resolved in seen_paths:
                     continue
                 seen_paths.add(resolved)
-                try:
+                with contextlib.suppress(OSError):
                     candidates.append((path.stat().st_mtime, path))
-                except OSError:
-                    continue
-        except OSError:
-            continue
 
     if not candidates:
         return None, []
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    candidates = candidates[:TODAY_TOKEN_SCAN_FILES]
-
     total = 0
     found = False
     truncated = 0
-    for mtime, path in candidates:
+    for mtime, path in candidates[:TODAY_TOKEN_SCAN_FILES]:
         try:
             if datetime.datetime.fromtimestamp(mtime).date() < today:
                 break
@@ -897,9 +759,11 @@ def find_today_tokens(
         except OSError:
             continue
 
-    warnings: List[str] = []
-    if truncated:
-        warnings.append("今日 tokens 仅扫描了 %d 个大日志的末尾 4MB，统计可能不完整" % truncated)
+    warnings = (
+        ["今日 tokens 仅扫描了 %d 个大日志的末尾 4MB，统计可能不完整" % truncated]
+        if truncated
+        else []
+    )
     return (total if found else None), warnings
 
 
@@ -909,19 +773,10 @@ def find_today_tokens(
 def _empty_payload(now_iso: Optional[str] = None) -> dict:
     stamp = now_iso or utc_iso_now()
     return {
-        "schema": SCHEMA,
-        "provider": PROVIDER,
-        "account": {"label": None, "plan": None},
-        "generated_at": stamp,
-        "observed_at": stamp,
-        "stale": False,
-        "windows": [],
-        "balance": None,
-        "spend": None,
-        "usage": None,
-        "coverage": None,
-        "warnings": [],
-        "error": None,
+        "schema": SCHEMA, "provider": PROVIDER, "account": {"label": None, "plan": None},
+        "generated_at": stamp, "observed_at": stamp, "stale": False, "windows": [],
+        "balance": None, "spend": None, "usage": None, "coverage": None,
+        "warnings": [], "error": None,
     }
 
 
@@ -941,12 +796,8 @@ def build_payload() -> dict:
     now = utc_now()
     now_iso = to_utc_iso(now)
 
-    today_tokens, token_warnings = find_today_tokens(now.date())
-    usage_obj = (
-        {"today_tokens": today_tokens, "source": "local"}
-        if today_tokens is not None
-        else None
-    )
+    today_tokens, token_warnings = find_today_tokens(now.astimezone().date())
+    usage_obj = {"today_tokens": today_tokens, "source": "local"} if today_tokens is not None else None
 
     creds = _resolve_credentials()
     if creds is None:
@@ -968,15 +819,15 @@ def build_payload() -> dict:
         if usage_obj is not None:
             payload["usage"] = usage_obj
             payload["warnings"] = _dedupe_redacted(
-                ["实时查询 AGY 服务端失败（%s），当前仅显示本地今日 tokens" % clean_reason]
-                + token_warnings
+                ["实时查询 AGY 服务端失败（%s），当前仅显示本地今日 tokens" % clean_reason] + token_warnings
             )
             return payload
         payload["warnings"] = _dedupe_redacted(token_warnings)
-        if clean_reason.startswith("查询 AGY 用量失败："):
-            payload["error"] = clean_reason
-        else:
-            payload["error"] = redact("查询 AGY 用量失败：%s" % clean_reason)
+        payload["error"] = (
+            clean_reason
+            if clean_reason.startswith("查询 AGY 用量失败：")
+            else redact("查询 AGY 用量失败：%s" % clean_reason)
+        )
         return payload
 
     if source == "local":
@@ -1009,34 +860,20 @@ def build_payload() -> dict:
 
     plan: Optional[str] = None
     if not project_id:
-        load_body = {
-            "metadata": {
-                "ideType": "IDE_UNSPECIFIED",
-                "platform": "PLATFORM_UNSPECIFIED",
-                "pluginType": "GEMINI",
-            }
-        }
+        load_body = {"metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}}
         load_data, load_err, _ = _post_with_retry(LOAD_CODE_ASSIST_URL, load_body)
         if load_err is not None:
             return _fail_payload(load_err)
         assert load_data is not None
-        raw_project = load_data.get("cloudaicompanionProject")
-        if isinstance(raw_project, str) and raw_project.strip():
-            project_id = raw_project.strip()
+        project_id = _non_empty_str(load_data.get("cloudaicompanionProject")) or ""
         plan = _extract_plan(load_data)
 
     quota_req = {"project": project_id} if project_id else {}
-    summary_data, summary_err, summary_refresh_failed = _post_with_retry(
-        RETRIEVE_QUOTA_SUMMARY_URL,
-        quota_req,
-    )
+    summary_data, summary_err, summary_refresh_failed = _post_with_retry(RETRIEVE_QUOTA_SUMMARY_URL, quota_req)
     if summary_refresh_failed and summary_err is not None:
         return _fail_payload(summary_err, plan_value=plan)
 
-    quota_data, quota_err, quota_refresh_failed = _post_with_retry(
-        RETRIEVE_QUOTA_URL,
-        quota_req,
-    )
+    quota_data, quota_err, quota_refresh_failed = _post_with_retry(RETRIEVE_QUOTA_URL, quota_req)
     if quota_refresh_failed and quota_err is not None:
         return _fail_payload(quota_err, plan_value=plan)
 
@@ -1049,24 +886,12 @@ def build_payload() -> dict:
     elif quota_err is not None and summary_data is not None:
         warnings.append("AGY 模型配额接口查询失败（%s），仅使用配额汇总数据" % quota_err)
 
-    buckets = _collect_buckets(summary_data, quota_data)
-    windows = _normalize_buckets(buckets, now, warnings)
-
-    payload = {
-        "schema": SCHEMA,
-        "provider": PROVIDER,
-        "account": {"label": email or None, "plan": plan},
-        "generated_at": now_iso,
-        "observed_at": now_iso,
-        "stale": False,
-        "windows": windows,
-        "balance": None,
-        "spend": None,
-        "usage": usage_obj,
-        "coverage": None,
-        "warnings": _dedupe_redacted(warnings + token_warnings),
-        "error": None,
-    }
+    windows = _normalize_buckets(_collect_buckets(summary_data, quota_data), now, warnings)
+    payload = _empty_payload(now_iso)
+    payload["account"] = {"label": email or None, "plan": plan}
+    payload["windows"] = windows
+    payload["usage"] = usage_obj
+    payload["warnings"] = _dedupe_redacted(warnings + token_warnings)
     _log("耗时 %.0fms（实时服务端查询成功）" % ((time.time() - started) * 1000))
     return payload
 
