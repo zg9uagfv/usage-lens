@@ -856,11 +856,11 @@ final class PanelRenderTests: XCTestCase {
                 )
                 assertNonBlankImage(unconfiguredImg, context: "settings-unconfigured-\(theme.rawValue)-\(label)")
 
-                // 2. Settings（已配置 Gemini 展开）：展示邮箱 + 固定掩码，不得回填明文令牌，且非空白
+                // 2. Settings（已手动配置 Gemini 展开）：展示邮箱 + 固定掩码，不得回填明文令牌，且非空白
                 let configuredSettings = SettingsPanelView(
                     launchAtLogin: launchAtLogin,
                     hasSavedAPIKey: false,
-                    savedGeminiAccountEmail: "user@gmail.com",
+                    geminiCredentialSource: .manualKeychain(email: "user@gmail.com"),
                     initialExpandedProviderID: ProviderCatalog.gemini.id
                 ).environment(\.displayScaleMetrics, metrics)
                 let (_, configuredImg) = try renderHosted(
@@ -882,6 +882,35 @@ final class PanelRenderTests: XCTestCase {
                     }
                 )
                 assertNonBlankImage(configuredImg, context: "settings-configured-\(theme.rawValue)-\(label)")
+
+                // 2b. Settings（自动复用本机登录态展开）：展示检测到的本机邮箱 + 手动覆盖表单，且非空白
+                let localCLISettings = SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    hasSavedAPIKey: false,
+                    geminiCredentialSource: .localCLI(email: "local@gmail.com"),
+                    initialExpandedProviderID: ProviderCatalog.gemini.id
+                ).environment(\.displayScaleMetrics, metrics)
+                let (_, localCLIImg) = try renderHosted(
+                    localCLISettings,
+                    size: metrics.settingsWindowSize,
+                    appearance: nsAppearance,
+                    scrollToBottom: true,
+                    named: "15b-settings-gemini-local-cli-\(theme.rawValue)-\(label)",
+                    inspectView: { root in
+                        XCTAssertNotNil(self.firstDescendant(ofType: NSScrollView.self, in: root))
+                        let fields = self.allDescendants(ofType: NSTextField.self, in: root)
+                        XCTAssertTrue(
+                            fields.contains { $0.stringValue == "local@gmail.com" },
+                            "本机复用 Settings 应展示检测到的本机账号邮箱 (\(theme.rawValue)/\(label))"
+                        )
+                        let secureFields = self.allDescendants(ofType: NSSecureTextField.self, in: root)
+                        XCTAssertFalse(
+                            secureFields.isEmpty,
+                            "本机复用 Settings 应保留手动覆盖表单的 SecureField (\(theme.rawValue)/\(label))"
+                        )
+                    }
+                )
+                assertNonBlankImage(localCLIImg, context: "settings-local-cli-\(theme.rawValue)-\(label)")
 
                 // 3. Gemini 面板三态（needs-account / configured 5h+7d / auth-error）在 4 档显示配置 × 3 主题下全部验证非空白
                 let panelHeight = metrics.scaledDimension(320, minimum: 260)

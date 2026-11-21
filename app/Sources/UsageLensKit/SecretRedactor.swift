@@ -6,6 +6,7 @@ import Foundation
 public enum SecretRedactor {
     /// 顺序有意义：先打具体形态，再兜底长随机串。
     private static let rules: [(pattern: String, replacement: String, options: NSRegularExpression.Options)] = [
+        (#"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#, "***", []),
         (#"ya29\.[A-Za-z0-9._-]+"#, "***", []),
         (#"1//[A-Za-z0-9._-]{16,}"#, "***", []),
         (#"sk-[A-Za-z0-9_-]{8,}"#, "***", []),

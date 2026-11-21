@@ -1,36 +1,50 @@
 #!/usr/bin/env python3
 """usage-lens Codex 探针。
 
-只读本机 Codex 会话日志，输出 usage-lens/probe@1 JSON 到 stdout。
-契约见 docs/ARCHITECTURE.md 第 1 节。
+优先复用本机 Codex 登录态（~/.codex/auth.json）实时查询官方服务端用量接口；
+未登录或服务端查询失败时，自动回退到只读本机 Codex 会话日志。
+输出 usage-lens/probe@1 JSON 到 stdout。契约见 docs/ARCHITECTURE.md 第 1 节。
 
-数据来源：~/.codex/sessions/**/rollout-*.jsonl
-每条 event_msg/token_count 里的 rate_limits 是服务端给的窗口状态；
-当天 token_usage_record.usage.total_tokens 是本地的「今日 tokens」统计。
+数据来源：
+1. 实时服务端：GET https://chatgpt.com/backend-api/wham/usage（只读 ~/.codex/auth.json）
+2. 本地回退与今日 tokens：~/.codex/sessions/**/rollout-*.jsonl
 
 选帧规则（可复核）：在所有候选日志里取「事件时间戳最大」的 rate_limits 帧。
 文件按 mtime 倒序扫，一旦已命中帧且某文件 mtime 早于该帧时间，就不必再往后看。
 这样即使两个文件 mtime 相同，结果也只由内容决定，不依赖目录枚举顺序。
 
-v1 不读 ~/.codex/auth.json，account.label 恒为 null。
-仅用标准库，兼容 Python 3.9。
+只读，不落盘，不打印令牌；禁止跟随重定向（3xx 一律拒绝），严格绑定官方域名。
+仅用标准库，兼容 Python 3.9+。
 """
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import math
 import os
+import re
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Iterator, List, Optional, Tuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 SCHEMA = "usage-lens/probe@1"
 PROVIDER = "codex"
 
 SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+AUTH_FILE: Optional[Path] = None
+
+OFFICIAL_SCHEME = "https"
+OFFICIAL_HOST = "chatgpt.com"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+HTTP_TIMEOUT_SECONDS = 3.0
+HTTP_MAX_BYTES = 1024 * 1024
 
 # 从文件尾部往前读的块大小；避免为了最后一帧全量扫几十 MB 日志。
 TAIL_CHUNK_BYTES = 256 * 1024
@@ -44,15 +58,32 @@ MAX_CANDIDATE_FILES = 50
 TODAY_TOKEN_SCAN_FILES = 50
 
 # 契约固定：primary = 5 小时，secondary = 7 天。
-# 日志里的 window_minutes 优先（换算成秒），缺失时才用这里的兜底值。
+# 服务端 limit_window_seconds 或日志里的 window_minutes 优先，缺失时才用这里的兜底值。
 WINDOW_SPEC = {
     "primary": {"id": "5h", "label": "5 小时", "window_seconds": 18000},
     "secondary": {"id": "7d", "label": "7 天", "window_seconds": 604800},
 }
 
+_SECRET_PATTERNS = (
+    re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    re.compile(r"Bearer\s+\S+", re.IGNORECASE),
+    re.compile(r"sk-[A-Za-z0-9_\-]{5,}"),
+    re.compile(r"\b(?:api[_-]?key|key|token|secret|password)\b\s*[=:]\s*\S+", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-])"),
+)
+
+
+def redact(text: str) -> str:
+    """把任何形似凭据的串抹掉，保证 warning / error / stderr 不泄露敏感信息。"""
+    if not text:
+        return text
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
 
 def _log(message: str) -> None:
-    sys.stderr.write("usage-lens/codex: %s\n" % message)
+    sys.stderr.write("usage-lens/codex: %s\n" % redact(message))
 
 
 def utc_now() -> datetime.datetime:
@@ -367,21 +398,303 @@ def _window_entry(key: str, rate_limits: dict, now: datetime.datetime,
     }
 
 
+# ---------------------------------------------------------------- 实时服务端查询（只读 auth.json）
+
+
+class _RejectRedirect(urlrequest.HTTPRedirectHandler):
+    """任何 3xx 一律不跟随：避免 Authorization / ChatGPT-Account-Id 被带到重定向目标。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urlrequest.build_opener(_RejectRedirect())
+
+
+def is_official_url(url: str) -> bool:
+    """只认 https + chatgpt.com（默认端口 443）。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != OFFICIAL_SCHEME:
+        return False
+    if (parts.hostname or "").lower() != OFFICIAL_HOST:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port in (None, 443)
+
+
+def _decode_jwt_payload(token: Any) -> Optional[dict]:
+    """只读解码 JWT payload（仅提取非敏感元数据，绝不打印或落盘令牌）。"""
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    segment = parts[1]
+    padding = "=" * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((segment + padding).encode("ascii"))
+        claims = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _auth_file_path() -> Path:
+    if AUTH_FILE is not None:
+        return AUTH_FILE
+    return Path.home() / ".codex" / "auth.json"
+
+
+def _load_codex_auth(auth_path: Optional[Path] = None) -> Optional[dict]:
+    """只读加载 Codex 凭据：优先环境变量覆盖，其次 ~/.codex/auth.json。"""
+    env_token = (os.environ.get("CODEX_ACCESS_TOKEN") or "").strip()
+    if env_token:
+        env_account_id = (os.environ.get("CODEX_ACCOUNT_ID") or "").strip() or None
+        env_email = (os.environ.get("CODEX_ACCOUNT_EMAIL") or "").strip() or None
+        return {
+            "access_token": env_token,
+            "account_id": env_account_id,
+            "email": env_email,
+            "plan": None,
+        }
+
+    path = auth_path if auth_path is not None else _auth_file_path()
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    raw_access = tokens.get("access_token")
+    if not isinstance(raw_access, str) or not raw_access.strip():
+        return None
+
+    raw_account_id = tokens.get("account_id")
+    account_id = raw_account_id.strip() if isinstance(raw_account_id, str) and raw_account_id.strip() else None
+
+    email: Optional[str] = None
+    claim_plan: Optional[str] = None
+    claims = _decode_jwt_payload(tokens.get("id_token"))
+    if claims is not None:
+        raw_email = claims.get("email")
+        if isinstance(raw_email, str) and raw_email.strip():
+            email = raw_email.strip()
+        auth_claims = claims.get("https://api.openai.com/auth")
+        if isinstance(auth_claims, dict):
+            if account_id is None:
+                raw_claim_acc = auth_claims.get("chatgpt_account_id")
+                if isinstance(raw_claim_acc, str) and raw_claim_acc.strip():
+                    account_id = raw_claim_acc.strip()
+            raw_claim_plan = auth_claims.get("chatgpt_plan_type")
+            if isinstance(raw_claim_plan, str) and raw_claim_plan.strip():
+                claim_plan = raw_claim_plan.strip()
+
+    return {
+        "access_token": raw_access.strip(),
+        "account_id": account_id,
+        "email": email,
+        "plan": claim_plan,
+    }
+
+
+def _http_error_reason(exc: urlerror.HTTPError) -> str:
+    code = exc.code
+    if code in (301, 302, 303, 307, 308):
+        return "接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
+    if code in (401, 403):
+        return "登录态已过期或无效（HTTP %d）" % code
+    if code == 429:
+        return "请求被限流（HTTP 429）"
+    if 500 <= code < 600:
+        return "服务暂时不可用（HTTP %d）" % code
+    return "HTTP %d" % code
+
+
+def _fetch_live_usage(auth: dict) -> Tuple[Optional[dict], Optional[str]]:
+    """查询官方 Codex 实时配额接口；任何错误返回 (None, 脱敏中文原因)。"""
+    headers = {
+        "Authorization": "Bearer " + auth["access_token"],
+        "Accept": "application/json",
+        "User-Agent": "usage-lens/1",
+    }
+    if auth.get("account_id"):
+        headers["ChatGPT-Account-Id"] = auth["account_id"]
+
+    request = urlrequest.Request(CODEX_USAGE_URL, headers=headers, method="GET")
+    try:
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            if not is_official_url(final_url):
+                return None, "响应最终地址不是官方域名，已拒绝使用"
+            length = response.headers.get("Content-Length") if response.headers else None
+            if length is not None:
+                try:
+                    if int(length) > HTTP_MAX_BYTES:
+                        return None, "响应体过大（%s 字节），已拒绝读取" % length
+                except (TypeError, ValueError):
+                    pass
+            body = response.read(HTTP_MAX_BYTES + 1)
+            if len(body) > HTTP_MAX_BYTES:
+                return None, "响应体超过 1MB 上限，已拒绝读取"
+    except urlerror.HTTPError as exc:
+        return None, redact(_http_error_reason(exc))
+    except urlerror.URLError as exc:
+        return None, redact("网络不可用（%s）" % exc.reason)
+    except (TimeoutError, OSError) as exc:
+        return None, redact("请求超时或中断（%s）" % exc)
+    except Exception as exc:
+        return None, redact(str(exc))
+
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None, "接口返回不是合法 JSON"
+    if not isinstance(data, dict):
+        return None, "接口返回格式异常"
+    return data, None
+
+
+def _windows_from_live_response(
+    data: dict,
+    now: datetime.datetime,
+    warnings: List[str],
+) -> Tuple[Optional[List[dict]], Optional[str]]:
+    """把服务端 wham/usage JSON 归一化为标准 5h/7d 窗口数组。"""
+    rate_limit = data.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return None, None
+
+    raw_plan = data.get("plan_type")
+    live_plan = raw_plan.strip() if isinstance(raw_plan, str) and raw_plan.strip() else None
+
+    windows: List[dict] = []
+    for live_key, spec_key in (("primary_window", "primary"), ("secondary_window", "secondary")):
+        raw = rate_limit.get(live_key)
+        if not isinstance(raw, dict):
+            continue
+        spec = WINDOW_SPEC[spec_key]
+
+        window_seconds = spec["window_seconds"]
+        limit_secs = raw.get("limit_window_seconds")
+        if isinstance(limit_secs, (int, float)) and not isinstance(limit_secs, bool):
+            if math.isfinite(float(limit_secs)) and float(limit_secs) > 0:
+                window_seconds = int(limit_secs)
+        else:
+            minutes = raw.get("window_minutes")
+            if isinstance(minutes, (int, float)) and not isinstance(minutes, bool):
+                if math.isfinite(float(minutes)) and float(minutes) > 0:
+                    window_seconds = int(minutes * 60)
+
+        resets_epoch: Optional[float] = None
+        for reset_key in ("reset_at", "resets_at"):
+            resets_raw = raw.get(reset_key)
+            if isinstance(resets_raw, (int, float)) and not isinstance(resets_raw, bool):
+                candidate = float(resets_raw)
+                if math.isfinite(candidate) and candidate > 0:
+                    resets_epoch = candidate
+                    break
+            elif isinstance(resets_raw, str):
+                parsed = parse_iso_epoch(resets_raw)
+                if parsed is not None:
+                    resets_epoch = parsed
+                    break
+
+        if resets_epoch is None:
+            reset_after = raw.get("reset_after_seconds")
+            if isinstance(reset_after, (int, float)) and not isinstance(reset_after, bool):
+                candidate = float(reset_after)
+                if math.isfinite(candidate) and candidate > 0:
+                    resets_epoch = now.timestamp() + candidate
+
+        resets_at = epoch_to_iso(resets_epoch)
+        expired = False
+        if resets_epoch is not None and resets_epoch < now.timestamp():
+            expired = True
+            warnings.append(
+                "%s窗口已于 %s重置" % (spec["label"], _human_age(now.timestamp() - resets_epoch))
+            )
+
+        windows.append({
+            "id": spec["id"],
+            "label": spec["label"],
+            "used_percent": _clean_percent(raw.get("used_percent"), spec["label"], warnings),
+            "window_seconds": window_seconds,
+            "resets_at": resets_at,
+            "expired": expired,
+            "basis": "server",
+        })
+
+    return windows, live_plan
+
+
 def build_payload() -> dict:
     started = time.time()
-    warnings: List[str] = []
-    frame, scan_warnings, scanned = find_latest_frame(SESSIONS_DIR)
-    warnings.extend(scan_warnings)
-
     now = utc_now()
     generated_at = to_utc_iso(now)
+    warnings: List[str] = []
+
+    today_tokens, token_warnings = find_today_tokens(SESSIONS_DIR, now.date())
+    auth = _load_codex_auth()
+
+    if auth is not None:
+        live_data, live_err = _fetch_live_usage(auth)
+        if live_err is None and live_data is not None:
+            live_warnings: List[str] = []
+            live_windows, live_plan = _windows_from_live_response(live_data, now, live_warnings)
+            if live_windows is None:
+                warnings.append(redact("实时查询 Codex 服务端失败（接口返回格式异常），已回退到本地会话日志"))
+            elif not live_windows:
+                warnings.append(redact("实时查询 Codex 服务端未返回配额窗口，已回退到本地会话日志"))
+            else:
+                all_warnings = [redact(item) for item in (live_warnings + token_warnings)]
+                payload = {
+                    "schema": SCHEMA,
+                    "provider": PROVIDER,
+                    "account": {
+                        "label": auth.get("email"),
+                        "plan": live_plan or auth.get("plan"),
+                    },
+                    "generated_at": generated_at,
+                    "observed_at": generated_at,
+                    "stale": False,
+                    "windows": live_windows,
+                    "balance": None,
+                    "spend": None,
+                    "usage": (
+                        {"today_tokens": today_tokens, "source": "local"}
+                        if today_tokens is not None else None
+                    ),
+                    "coverage": None,
+                    "warnings": all_warnings,
+                    "error": None,
+                }
+                _log("耗时 %.0fms（实时服务端查询成功）" % ((time.time() - started) * 1000))
+                return payload
+        else:
+            warnings.append(redact("实时查询 Codex 服务端失败（%s），已回退到本地会话日志" % (live_err or "未知错误")))
+
+    frame, scan_warnings, scanned = find_latest_frame(SESSIONS_DIR)
+    warnings.extend(scan_warnings)
+    warnings.extend(token_warnings)
+
     observed_at = generated_at
     windows: List[dict] = []
     plan = None
     coverage = None
     stale = False
-    today_tokens, token_warnings = find_today_tokens(SESSIONS_DIR, now.date())
-    warnings.extend(token_warnings)
 
     if frame is not None:
         rate_limits = frame["rate_limits"]
@@ -413,7 +726,10 @@ def build_payload() -> dict:
     payload = {
         "schema": SCHEMA,
         "provider": PROVIDER,
-        "account": {"label": None, "plan": plan},
+        "account": {
+            "label": auth.get("email") if auth else None,
+            "plan": plan or (auth.get("plan") if auth else None),
+        },
         "generated_at": generated_at,
         "observed_at": observed_at,
         "stale": stale,
@@ -425,7 +741,7 @@ def build_payload() -> dict:
             if today_tokens is not None else None
         ),
         "coverage": coverage,
-        "warnings": warnings,
+        "warnings": [redact(item) for item in warnings],
         "error": None,
     }
     _log("耗时 %.0fms（检查 %d 个文件）" % ((time.time() - started) * 1000, scanned))
@@ -470,7 +786,7 @@ def main(argv: List[str]) -> int:
     for arg in argv[1:]:
         if arg != "--json":
             payload = _empty_payload()
-            payload["error"] = "不支持的参数：%s（只接受无参数或 --json）" % arg
+            payload["error"] = redact("不支持的参数：%s（只接受无参数或 --json）" % arg)
             emit(payload)
             _log(payload["error"])
             return 2
@@ -479,7 +795,7 @@ def main(argv: List[str]) -> int:
         payload = build_payload()
     except Exception as exc:  # 兜底：任何意外都给出 JSON，不崩在 App 面前
         payload = _empty_payload()
-        payload["error"] = "读取 Codex 用量失败：%s" % exc
+        payload["error"] = redact("读取 Codex 用量失败：%s" % exc)
 
     if not emit(payload):
         return 1

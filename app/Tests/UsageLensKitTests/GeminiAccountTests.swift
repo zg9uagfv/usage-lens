@@ -186,6 +186,120 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(refresh.contains("***"))
         XCTAssertFalse(refresh.contains("1//"))
         XCTAssertTrue(refresh.contains("end"))
+
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.syntheticSignature_12345"
+        let redactedJWT = SecretRedactor.redact("token \(jwt) failed")
+        XCTAssertTrue(redactedJWT.contains("***"))
+        XCTAssertFalse(redactedJWT.contains("eyJhbGciOiJSUzI1NiJ9"))
+        XCTAssertTrue(redactedJWT.contains("failed"))
+    }
+
+    func testDetectLocalCLIAuthAndCredentialSourcePriority() throws {
+        let fm = FileManager.default
+        let tempHome = fm.temporaryDirectory.appendingPathComponent("usage-lens-gemini-local-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempHome, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempHome) }
+
+        let storage = InMemoryGeminiKeychainStorage()
+
+        // 1. 无本机文件且无钥匙串 -> unconfigured
+        XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
+        XCTAssertEqual(GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome), .unconfigured)
+
+        // 2. 写入畸形 JSON -> nil
+        let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
+        try fm.createDirectory(at: geminiDir, withIntermediateDirectories: true)
+        let credsURL = geminiDir.appendingPathComponent("oauth_creds.json")
+        try "{bad json".write(to: credsURL, atomically: true, encoding: .utf8)
+        XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
+
+        // 3. 空令牌 -> nil
+        try #"{"access_token":"   ","refresh_token":""}"#.write(to: credsURL, atomically: true, encoding: .utf8)
+        XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
+
+        // 4. 有效本机令牌 + id_token JWT email 回退
+        let jwtPayloadData = Data(#"{"email":"jwt.user@gmail.com"}"#.utf8)
+        let jwtPayloadB64 = jwtPayloadData.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let fakeIDToken = "eyJhbGciOiJSUzI1NiJ9.\(jwtPayloadB64).fakesig"
+        let credsWithJWT = """
+        {"access_token":"ya29.local_test_token_only","id_token":"\(fakeIDToken)"}
+        """
+        try credsWithJWT.write(to: credsURL, atomically: true, encoding: .utf8)
+        XCTAssertEqual(
+            GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome),
+            GeminiLocalAuthInfo(email: "jwt.user@gmail.com")
+        )
+        XCTAssertEqual(
+            GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
+            .localCLI(email: "jwt.user@gmail.com")
+        )
+
+        // 5. google_accounts.json 的 active 优先于 id_token
+        let accountsURL = geminiDir.appendingPathComponent("google_accounts.json")
+        try #"{"active":"active.local@gmail.com","old":[]}"#.write(to: accountsURL, atomically: true, encoding: .utf8)
+        XCTAssertEqual(
+            GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome),
+            GeminiLocalAuthInfo(email: "active.local@gmail.com")
+        )
+        XCTAssertEqual(
+            GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
+            .localCLI(email: "active.local@gmail.com")
+        )
+
+        // 6. 保存手动钥匙串账号 -> 最高优先级 (.manualKeychain)
+        try GeminiAccountStore.save(email: "manual@gmail.com", accessToken: "ya29.manual_token", storage: storage)
+        XCTAssertEqual(
+            GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
+            .manualKeychain(email: "manual@gmail.com")
+        )
+
+        // 7. 删除手动钥匙串账号 -> 自动回落到 .localCLI
+        try GeminiAccountStore.delete(storage: storage)
+        XCTAssertEqual(
+            GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
+            .localCLI(email: "active.local@gmail.com")
+        )
+    }
+
+    func testValidationMessagePassesDisableLocalAuthEnv() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".cache/gemini-disable-local-auth-tests", isDirectory: true)
+        let probes = root.appendingPathComponent("probes", isDirectory: true)
+        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
+
+        let script = probes.appendingPathComponent("gemini.py")
+        let scriptText = """
+        import json, os, sys
+        disabled = os.environ.get("GEMINI_DISABLE_LOCAL_AUTH")
+        if disabled != "1":
+            print(json.dumps({"schema": "usage-lens/probe@1", "provider": "gemini", "windows": [], "error": "missing GEMINI_DISABLE_LOCAL_AUTH"}))
+            sys.exit(1)
+        print(json.dumps({
+            "schema": "usage-lens/probe@1",
+            "provider": "gemini",
+            "account": {"label": os.environ.get("GEMINI_ACCOUNT_EMAIL"), "plan": "pro"},
+            "windows": [{"id": "5h", "label": "5 小时", "used_percent": 10, "window_seconds": 18000, "basis": "server"}],
+            "warnings": [],
+            "error": None
+        }))
+        """
+        try scriptText.write(to: script, atomically: true, encoding: .utf8)
+
+        let runner = ProbeRunner(
+            root: root,
+            timeout: 5,
+            deepSeekAPIKeyLoader: { nil },
+            geminiAccountLoader: { nil }
+        )
+        let msg = await GeminiAccountStore.validationMessage(
+            email: "user@gmail.com",
+            accessToken: "ya29.candidate_token",
+            runner: runner
+        )
+        XCTAssertNil(msg)
     }
 
     func testGeminiStateTransitionsAndMenuBarTension() {

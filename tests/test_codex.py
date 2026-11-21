@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
+import importlib.util
+import io
 import json
 import os
 import re
@@ -15,13 +18,69 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import support
 
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def _make_fake_jwt(claims: dict) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode("ascii").rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
+    return "%s.%s.fakesig_test_only_12345" % (header, payload)
+
+
+def _load_codex_probe():
+    path = support.PROBES / "codex.py"
+    spec = importlib.util.spec_from_file_location("probe_codex_under_test", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes, final_url: str, headers=None):
+        self._body = body
+        self._final_url = final_url
+        self.headers = headers or {}
+
+    def geturl(self) -> str:
+        return self._final_url
+
+    def read(self, amount: int = -1) -> bytes:
+        if amount is None or amount < 0:
+            return self._body
+        return self._body[:amount]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _FakeOpener:
+    def __init__(self, responses=None, exc=None):
+        self.calls = []
+        self._responses = list(responses or [])
+        self._exc = exc
+
+    def open(self, request, timeout=None):
+        self.calls.append((request, timeout))
+        if self._exc is not None:
+            raise self._exc
+        if not self._responses:
+            raise AssertionError("未预期的网络请求：%s" % request.full_url)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def now_utc() -> datetime.datetime:
@@ -429,6 +488,261 @@ class CodexProbeTest(unittest.TestCase):
         payload = support.parse_stdout(completed)
         self.assertIn("不支持的参数", payload["error"])
         self.assertEqual(payload["windows"], [])
+
+
+class CodexLiveServerTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.home = support.make_home(self.tmp)
+        self.sessions = self.home / ".codex" / "sessions"
+        self.auth_file = self.home / ".codex" / "auth.json"
+        self.module = _load_codex_probe()
+        self.module.SESSIONS_DIR = self.sessions
+        self.module.AUTH_FILE = self.auth_file
+        self.fake_access = _make_fake_jwt({"sub": "user-1", "scope": "model.read"})
+        self.fake_id = _make_fake_jwt({
+            "email": "codex.user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-claim-123",
+                "chatgpt_plan_type": "plus",
+            },
+        })
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_auth(self, account_id: str = "acct-uuid-999"):
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text(
+            json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": self.fake_access,
+                    "id_token": self.fake_id,
+                    "refresh_token": "rt_synthetic_refresh_token_test_only",
+                    "account_id": account_id,
+                },
+            }),
+            encoding="utf-8",
+        )
+
+    def _write_local_fallback_log(self, primary_pct=41.0, secondary_pct=22.0, today_tokens=250):
+        moment = now_utc() - datetime.timedelta(seconds=30)
+        resets = int(now_utc().timestamp()) + 3600
+        lines = [
+            support.token_usage_record_line(today_tokens, iso_ms(moment), current_shape=True),
+            support.token_count_line(primary_pct, secondary_pct, resets, resets + 86400, timestamp=iso_ms(moment)),
+        ]
+        support.write_rollout(
+            self.sessions / "2026/11/21/rollout-local.jsonl",
+            lines,
+            mtime=int(moment.timestamp()),
+        )
+
+    def _clean_env(self, extra=None):
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID", "CODEX_ACCOUNT_EMAIL")
+        }
+        env["HOME"] = str(self.home)
+        if extra:
+            env.update(extra)
+        return env
+
+    def test_live_200_success_returns_realtime_windows_account_and_today_tokens(self):
+        self._write_auth()
+        self._write_local_fallback_log(primary_pct=99.0, secondary_pct=88.0, today_tokens=321)
+        before = support.fingerprint(self.home)
+
+        reset_5h = int(now_utc().timestamp()) + 7200
+        reset_7d = int(now_utc().timestamp()) + 5 * 86400
+        live_body = json.dumps({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+                "primary_window": {
+                    "used_percent": 15.5,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 7200,
+                    "reset_at": reset_5h,
+                },
+                "secondary_window": {
+                    "used_percent": 12.0,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 5 * 86400,
+                    "reset_at": reset_7d,
+                },
+            },
+        }).encode("utf-8")
+
+        opener = _FakeOpener(responses=[_FakeResponse(live_body, CODEX_USAGE_URL)])
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+             mock.patch.object(self.module, "_OPENER", opener):
+            payload = self.module.build_payload()
+
+        self.assertEqual(set(payload), support.HEADER_KEYS)
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["provider"], "codex")
+        self.assertEqual(payload["account"], {"label": "codex.user@example.com", "plan": "pro"})
+        self.assertEqual(payload["observed_at"], payload["generated_at"])
+        self.assertFalse(payload["stale"])
+        self.assertIsNone(payload["coverage"])
+        self.assertEqual(payload["warnings"], [])
+        self.assertEqual(payload["usage"], {"today_tokens": 321, "source": "local"})
+        self.assertEqual(len(payload["windows"]), 2)
+        self.assertEqual(payload["windows"][0]["id"], "5h")
+        self.assertEqual(payload["windows"][0]["used_percent"], 15.5)
+        self.assertEqual(payload["windows"][0]["resets_at"], epoch_iso(reset_5h))
+        self.assertEqual(payload["windows"][1]["id"], "7d")
+        self.assertEqual(payload["windows"][1]["used_percent"], 12.0)
+        self.assertEqual(payload["windows"][1]["resets_at"], epoch_iso(reset_7d))
+
+        self.assertEqual(len(opener.calls), 1)
+        req, timeout = opener.calls[0]
+        self.assertEqual(req.full_url, CODEX_USAGE_URL)
+        self.assertEqual(req.get_header("Authorization"), "Bearer " + self.fake_access)
+        self.assertEqual(req.get_header("Chatgpt-account-id"), "acct-uuid-999")
+        self.assertLessEqual(timeout, 3.0)
+
+        rendered = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        self.assertNotIn(self.fake_access, rendered)
+        self.assertNotIn(self.fake_id, rendered)
+        support.assert_no_secrets(self, rendered)
+        self.assertEqual(support.fingerprint(self.home), before)
+
+    def test_live_invalid_nan_and_expired_values_stay_strict_json(self):
+        self._write_auth()
+        past_reset = int(now_utc().timestamp()) - 1800
+        live_body = (
+            '{"plan_type":"plus","rate_limit":{"primary_window":'
+            '{"used_percent":NaN,"limit_window_seconds":18000,"reset_at":%d},'
+            '"secondary_window":{"used_percent":150,"limit_window_seconds":604800,"reset_after_seconds":3600}}}'
+        ) % past_reset
+        opener = _FakeOpener(responses=[_FakeResponse(live_body.encode("utf-8"), CODEX_USAGE_URL)])
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+             mock.patch.object(self.module, "_OPENER", opener):
+            payload = self.module.build_payload()
+
+        strict_text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        parsed = support.strict_loads(strict_text)
+        self.assertIsNone(parsed["windows"][0]["used_percent"])
+        self.assertTrue(parsed["windows"][0]["expired"])
+        self.assertIsNone(parsed["windows"][1]["used_percent"])
+        self.assertFalse(parsed["windows"][1]["expired"])
+        self.assertTrue(any("数值异常" in w for w in parsed["warnings"]))
+        self.assertTrue(any("重置" in w for w in parsed["warnings"]))
+
+    def test_live_failures_gracefully_fallback_to_local_logs(self):
+        self._write_auth()
+        self._write_local_fallback_log(primary_pct=41.0, secondary_pct=22.0, today_tokens=180)
+        before = support.fingerprint(self.home)
+
+        cases = [
+            ("http_401", _FakeOpener(exc=urllib.error.HTTPError(CODEX_USAGE_URL, 401, "unauth", {}, None)), "401"),
+            ("http_403", _FakeOpener(exc=urllib.error.HTTPError(CODEX_USAGE_URL, 403, "forbid", {}, None)), "403"),
+            ("http_429", _FakeOpener(exc=urllib.error.HTTPError(CODEX_USAGE_URL, 429, "limit", {}, None)), "限流"),
+            ("http_500", _FakeOpener(exc=urllib.error.HTTPError(CODEX_USAGE_URL, 500, "err", {}, None)), "500"),
+            ("timeout", _FakeOpener(exc=TimeoutError("timed out")), "超时"),
+            ("malformed", _FakeOpener(responses=[_FakeResponse(b"<html>bad</html>", CODEX_USAGE_URL)]), "合法 JSON"),
+            (
+                "oversized",
+                _FakeOpener(responses=[_FakeResponse(b"{}", CODEX_USAGE_URL, headers={"Content-Length": str(2 * 1024 * 1024)})]),
+                "过大",
+            ),
+            ("non_official", _FakeOpener(responses=[_FakeResponse(b"{}", "https://evil.example/wham")]), "官方域名"),
+            ("empty_windows", _FakeOpener(responses=[_FakeResponse(b'{"rate_limit":{}}', CODEX_USAGE_URL)]), "未返回配额窗口"),
+        ]
+
+        for label, opener, expected_fragment in cases:
+            with self.subTest(case=label):
+                stdout_buf = io.StringIO()
+                stderr_buf = io.StringIO()
+                with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+                     mock.patch.object(self.module, "_OPENER", opener), \
+                     mock.patch.object(sys, "stdout", stdout_buf), \
+                     mock.patch.object(sys, "stderr", stderr_buf):
+                    rc = self.module.main(["codex.py"])
+
+                self.assertEqual(rc, 0)
+                payload = support.strict_loads(stdout_buf.getvalue().strip())
+                self.assertIsNone(payload["error"])
+                self.assertEqual([w["used_percent"] for w in payload["windows"]], [41.0, 22.0])
+                self.assertEqual(payload["account"]["label"], "codex.user@example.com")
+                self.assertEqual(payload["usage"], {"today_tokens": 180, "source": "local"})
+                self.assertTrue(
+                    any("回退到本地会话日志" in w and expected_fragment in w for w in payload["warnings"]),
+                    payload["warnings"],
+                )
+                self.assertNotIn(self.fake_access, stdout_buf.getvalue())
+                self.assertNotIn(self.fake_access, stderr_buf.getvalue())
+                support.assert_no_secrets(self, stdout_buf.getvalue())
+
+        self.assertEqual(support.fingerprint(self.home), before)
+
+    def test_live_failure_with_empty_local_logs_exits_zero_with_both_warnings(self):
+        self._write_auth()
+        opener = _FakeOpener(exc=urllib.error.HTTPError(CODEX_USAGE_URL, 401, "unauth", {}, None))
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+             mock.patch.object(self.module, "_OPENER", opener):
+            payload = self.module.build_payload()
+
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["windows"], [])
+        self.assertTrue(any("回退到本地会话日志" in w for w in payload["warnings"]))
+        self.assertTrue(any("没有 rollout" in w for w in payload["warnings"]))
+
+    def test_redirect_refused_and_never_leaks_headers(self):
+        self._write_auth()
+        self._write_local_fallback_log(primary_pct=33.0, secondary_pct=19.0)
+        target = support.LocalServer(lambda path: (200, {}, b"{}"))
+        source = support.LocalServer(lambda path: (302, {"Location": target.url + "/steal"}, b""))
+        self.addCleanup(target.close)
+        self.addCleanup(source.close)
+
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+             mock.patch.object(self.module, "CODEX_USAGE_URL", source.url + "/wham/usage"):
+            payload = self.module.build_payload()
+
+        self.assertEqual(target.requests, [], "重定向目标绝不能收到任何请求")
+        self.assertEqual(len(source.requests), 1)
+        self.assertEqual([w["used_percent"] for w in payload["windows"]], [33.0, 19.0])
+        self.assertTrue(
+            any(("拒绝跟随" in w or "官方域名" in w) and "回退到本地会话日志" in w for w in payload["warnings"]),
+            payload["warnings"],
+        )
+        self.assertNotIn(self.fake_access, json.dumps(payload, ensure_ascii=False))
+
+    def test_is_official_url_unit(self):
+        cases = {
+            CODEX_USAGE_URL: True,
+            "https://chatgpt.com:443/backend-api/wham/usage": True,
+            "http://chatgpt.com/backend-api/wham/usage": False,
+            "https://chatgpt.com.evil.com/backend-api/wham/usage": False,
+            "https://evil.com/chatgpt.com": False,
+            "https://chatgpt.com:8443/backend-api/wham/usage": False,
+            "https://chatgpt.com@evil.com/backend-api/wham/usage": False,
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(self.module.is_official_url(url), expected)
+
+    def test_secret_redaction_strips_jwt_bearer_and_sk(self):
+        leaked = "err %s Bearer %s sk-secret123456" % (self.fake_access, self.fake_access)
+        opener = _FakeOpener(exc=RuntimeError(leaked))
+        self._write_auth()
+        self._write_local_fallback_log()
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True), \
+             mock.patch.object(self.module, "_OPENER", opener):
+            payload = self.module.build_payload()
+
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(self.fake_access, rendered)
+        self.assertNotIn("sk-secret123456", rendered)
+        self.assertIn("[redacted]", rendered)
+        support.assert_no_secrets(self, rendered)
 
 
 if __name__ == "__main__":

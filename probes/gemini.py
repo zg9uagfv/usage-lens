@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """usage-lens Gemini 探针。
 
-账号门控：必须通过 GEMINI_ACCESS_TOKEN（及 GEMINI_ACCOUNT_EMAIL）提供 Gemini 账号后，
-才查询 Google 官方 Cloud Code Assist 配额接口并输出 5 小时与 7 天使用量窗口。
-未配置账号时零网络请求、零文件写入，退出码 0，windows 为空数组并给出中文引导。
+三级凭据优先级：
+1. 手动配置（钥匙串 / 环境变量 GEMINI_ACCESS_TOKEN、GEMINI_ACCOUNT_EMAIL、GEMINI_PROJECT_ID）
+2. 自动复用本机 Gemini CLI / AGY 登录态（只读 ~/.gemini/oauth_creds.json + ~/.gemini/google_accounts.json），
+   必要时仅在内存中通过官方 https://oauth2.googleapis.com/token 刷新 access_token（零写盘）
+3. 零网络账号门控：两者均无时零网络请求、零文件写入，退出码 0，windows 为空数组并给出中文引导。
 
 只读，不落盘，不打印令牌；禁止跟随重定向（3xx 一律报错），严格绑定官方域名。
 仅用标准库，兼容 Python 3.9+。
@@ -11,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import math
@@ -18,6 +21,7 @@ import os
 import re
 import sys
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -30,6 +34,13 @@ OFFICIAL_HOST = "cloudcode-pa.googleapis.com"
 LOAD_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 RETRIEVE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
 
+OAUTH_TOKEN_HOST = "oauth2.googleapis.com"
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+PROACTIVE_REFRESH_SKEW_SECONDS = 60.0
+
+LOCAL_OAUTH_CREDS_FILE: Optional[Path] = None
+LOCAL_GOOGLE_ACCOUNTS_FILE: Optional[Path] = None
+
 HTTP_TIMEOUT_SECONDS = 3.0
 HTTP_MAX_BYTES = 1024 * 1024
 
@@ -41,6 +52,7 @@ WINDOW_SPEC = {
 }
 
 _SECRET_PATTERNS = (
+    re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     re.compile(r"ya29\.[A-Za-z0-9._\-]+"),
     re.compile(r"1//[A-Za-z0-9._\-]{8,}"),
     re.compile(r"Bearer\s+\S+", re.IGNORECASE),
@@ -176,11 +188,30 @@ def is_official_url(url: str) -> bool:
     return port in (None, 443)
 
 
-def _http_error_message(exc: urlerror.HTTPError) -> str:
+def is_official_oauth_url(url: str) -> bool:
+    """只认 https + oauth2.googleapis.com（默认端口 443）。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != OFFICIAL_SCHEME:
+        return False
+    if (parts.hostname or "").lower() != OAUTH_TOKEN_HOST:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port in (None, 443)
+
+
+def _http_error_message(exc: urlerror.HTTPError, source: str = "manual") -> str:
     code = exc.code
     if code in (301, 302, 303, 307, 308):
         return "查询 Gemini 用量失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
     if code in (401, 403):
+        if source == "local":
+            return "本机 Gemini 登录态无效或已过期（HTTP %d），请在 Gemini CLI 重新登录或在配置中手动提供账号" % code
         return "Gemini 账号凭据无效或已过期（HTTP %d），请在配置中重新提供账号" % code
     if code == 429:
         return "查询 Gemini 用量失败：请求被限流（HTTP 429），请稍后重试"
@@ -189,8 +220,13 @@ def _http_error_message(exc: urlerror.HTTPError) -> str:
     return "查询 Gemini 用量失败：HTTP %d" % code
 
 
-def _post_json(url: str, access_token: str, body_obj: dict) -> Tuple[Optional[dict], Optional[str]]:
-    """向官方接口发送 JSON POST；任何错误都返回 (None, 中文脱敏错误信息)。"""
+def _post_json_with_status(
+    url: str,
+    access_token: str,
+    body_obj: dict,
+    source: str = "manual",
+) -> Tuple[Optional[dict], Optional[str], Optional[int]]:
+    """向官方接口发送 JSON POST；返回 (data, 脱敏中文错误, HTTP 状态码)。"""
     raw_body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
     request = urlrequest.Request(
         url,
@@ -206,33 +242,252 @@ def _post_json(url: str, access_token: str, body_obj: dict) -> Tuple[Optional[di
         with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             final_url = response.geturl()
             if not is_official_url(final_url):
-                return None, "查询 Gemini 用量失败：响应最终地址不是官方域名，已拒绝使用"
+                return None, "查询 Gemini 用量失败：响应最终地址不是官方域名，已拒绝使用", None
             length = response.headers.get("Content-Length") if response.headers else None
             if length is not None:
                 try:
                     if int(length) > HTTP_MAX_BYTES:
-                        return None, "查询 Gemini 用量失败：响应体过大（%s 字节），已拒绝读取" % length
+                        return None, "查询 Gemini 用量失败：响应体过大（%s 字节），已拒绝读取" % length, None
                 except (TypeError, ValueError):
                     pass
             body = response.read(HTTP_MAX_BYTES + 1)
             if len(body) > HTTP_MAX_BYTES:
-                return None, "查询 Gemini 用量失败：响应体超过 1MB 上限，已拒绝读取"
+                return None, "查询 Gemini 用量失败：响应体超过 1MB 上限，已拒绝读取", None
     except urlerror.HTTPError as exc:
-        return None, redact(_http_error_message(exc))
+        return None, redact(_http_error_message(exc, source=source)), exc.code
     except urlerror.URLError as exc:
-        return None, redact("查询 Gemini 用量失败：网络不可用（%s）" % exc.reason)
+        return None, redact("查询 Gemini 用量失败：网络不可用（%s）" % exc.reason), None
     except (TimeoutError, OSError) as exc:
-        return None, redact("查询 Gemini 用量失败：请求超时或中断（%s）" % exc)
+        return None, redact("查询 Gemini 用量失败：请求超时或中断（%s）" % exc), None
     except Exception as exc:
-        return None, redact("查询 Gemini 用量失败：%s" % exc)
+        return None, redact("查询 Gemini 用量失败：%s" % exc), None
 
     try:
         data = json.loads(body.decode("utf-8", "replace"))
     except ValueError:
-        return None, "查询 Gemini 用量失败：接口返回不是合法 JSON"
+        return None, "查询 Gemini 用量失败：接口返回不是合法 JSON", None
     if not isinstance(data, dict):
-        return None, "查询 Gemini 用量失败：接口返回格式异常"
-    return data, None
+        return None, "查询 Gemini 用量失败：接口返回格式异常", None
+    return data, None, 200
+
+
+def _post_json(url: str, access_token: str, body_obj: dict) -> Tuple[Optional[dict], Optional[str]]:
+    """向官方接口发送 JSON POST；任何错误都返回 (None, 中文脱敏错误信息)。"""
+    data, err, _ = _post_json_with_status(url, access_token, body_obj, source="manual")
+    return data, err
+
+
+# ---------------------------------------------------------------- 本机凭据发现与内存刷新
+
+
+def _decode_jwt_payload(token: Any) -> Optional[dict]:
+    """只读解码 JWT payload（仅提取非敏感 email，绝不打印或落盘令牌）。"""
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    segment = parts[1]
+    padding = "=" * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((segment + padding).encode("ascii"))
+        claims = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _parse_expiry_epoch(value: Any) -> Optional[float]:
+    num = _as_finite_float(value)
+    if num is None or num <= 0:
+        return None
+    if num > 1e11:
+        return num / 1000.0
+    return num
+
+
+def _local_oauth_creds_path() -> Path:
+    if LOCAL_OAUTH_CREDS_FILE is not None:
+        return LOCAL_OAUTH_CREDS_FILE
+    return Path.home() / ".gemini" / "oauth_creds.json"
+
+
+def _local_google_accounts_path() -> Path:
+    if LOCAL_GOOGLE_ACCOUNTS_FILE is not None:
+        return LOCAL_GOOGLE_ACCOUNTS_FILE
+    return Path.home() / ".gemini" / "google_accounts.json"
+
+
+def _load_local_credentials(
+    creds_path: Optional[Path] = None,
+    accounts_path: Optional[Path] = None,
+) -> Optional[dict]:
+    """只读发现本机 Gemini CLI OAuth 凭据（~/.gemini/oauth_creds.json）。"""
+    c_path = creds_path if creds_path is not None else _local_oauth_creds_path()
+    if not c_path.is_file():
+        return None
+    try:
+        with c_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    raw_access = data.get("access_token")
+    access_token = raw_access.strip() if isinstance(raw_access, str) and raw_access.strip() else None
+
+    raw_refresh = data.get("refresh_token")
+    refresh_token = raw_refresh.strip() if isinstance(raw_refresh, str) and raw_refresh.strip() else None
+
+    if not access_token and not refresh_token:
+        return None
+
+    expiry_epoch = _parse_expiry_epoch(data.get("expiry_date"))
+
+    raw_client_id = data.get("client_id")
+    client_id = (
+        raw_client_id.strip()
+        if isinstance(raw_client_id, str) and raw_client_id.strip()
+        else ((os.environ.get("GEMINI_OAUTH_CLIENT_ID") or "").strip() or None)
+    )
+    raw_client_secret = data.get("client_secret")
+    client_secret = (
+        raw_client_secret.strip()
+        if isinstance(raw_client_secret, str) and raw_client_secret.strip()
+        else ((os.environ.get("GEMINI_OAUTH_CLIENT_SECRET") or "").strip() or None)
+    )
+
+    email: Optional[str] = None
+    a_path = accounts_path if accounts_path is not None else _local_google_accounts_path()
+    if a_path.is_file():
+        try:
+            with a_path.open("r", encoding="utf-8") as handle:
+                acc_data = json.load(handle)
+            if isinstance(acc_data, dict):
+                raw_active = acc_data.get("active")
+                if isinstance(raw_active, str) and raw_active.strip():
+                    email = raw_active.strip()
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+
+    if email is None:
+        claims = _decode_jwt_payload(data.get("id_token"))
+        if claims is not None:
+            raw_email = claims.get("email")
+            if isinstance(raw_email, str) and raw_email.strip():
+                email = raw_email.strip()
+
+    return {
+        "source": "local",
+        "email": email,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expiry_epoch": expiry_epoch,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "project_id": None,
+    }
+
+
+def _resolve_credentials() -> Optional[dict]:
+    """严格按 3 级优先级解析凭据：手动 env > 本机 CLI（只读）> None（零网络门控）。"""
+    env_token = (os.environ.get("GEMINI_ACCESS_TOKEN") or "").strip()
+    env_email = (os.environ.get("GEMINI_ACCOUNT_EMAIL") or "").strip() or None
+    env_project = (os.environ.get("GEMINI_PROJECT_ID") or "").strip() or None
+
+    if env_token:
+        return {
+            "source": "manual",
+            "email": env_email,
+            "access_token": env_token,
+            "refresh_token": None,
+            "expiry_epoch": None,
+            "client_id": None,
+            "client_secret": None,
+            "project_id": env_project,
+        }
+
+    if (os.environ.get("GEMINI_DISABLE_LOCAL_AUTH") or "").strip() == "1":
+        return None
+
+    local = _load_local_credentials()
+    if local is None:
+        return None
+
+    local["email"] = env_email or local["email"]
+    local["project_id"] = env_project
+    return local
+
+
+def _refresh_access_token(creds: dict) -> Tuple[Optional[str], Optional[str]]:
+    """仅在内存中通过官方 https://oauth2.googleapis.com/token 刷新 access_token（零写盘）。"""
+    refresh_token = creds.get("refresh_token")
+    client_id = creds.get("client_id")
+    if not refresh_token or not client_id:
+        return None, "本机 Gemini 登录态已过期且缺少刷新凭据，请在 Gemini CLI 重新登录或在配置中手动提供账号"
+
+    form_fields = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if creds.get("client_secret"):
+        form_fields["client_secret"] = creds["client_secret"]
+
+    raw_body = urllib.parse.urlencode(form_fields).encode("utf-8")
+    request = urlrequest.Request(
+        OAUTH_TOKEN_URL,
+        data=raw_body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            if not is_official_oauth_url(final_url):
+                return None, "刷新本机 Gemini 登录态失败：响应最终地址不是官方域名，已拒绝使用"
+            length = response.headers.get("Content-Length") if response.headers else None
+            if length is not None:
+                try:
+                    if int(length) > HTTP_MAX_BYTES:
+                        return None, "刷新本机 Gemini 登录态失败：响应体过大（%s 字节），已拒绝读取" % length
+                except (TypeError, ValueError):
+                    pass
+            body = response.read(HTTP_MAX_BYTES + 1)
+            if len(body) > HTTP_MAX_BYTES:
+                return None, "刷新本机 Gemini 登录态失败：响应体超过 1MB 上限，已拒绝读取"
+    except urlerror.HTTPError as exc:
+        code = exc.code
+        if code in (301, 302, 303, 307, 308):
+            return None, "刷新本机 Gemini 登录态失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
+        if code in (400, 401, 403):
+            return None, "本机 Gemini 登录态已过期或刷新失败（HTTP %d），请在 Gemini CLI 重新登录或在配置中手动提供账号" % code
+        if code == 429:
+            return None, "刷新本机 Gemini 登录态失败：请求被限流（HTTP 429），请稍后重试"
+        if 500 <= code < 600:
+            return None, "刷新本机 Gemini 登录态失败：服务暂时不可用（HTTP %d），请稍后重试" % code
+        return None, "刷新本机 Gemini 登录态失败：HTTP %d" % code
+    except urlerror.URLError as exc:
+        return None, redact("刷新本机 Gemini 登录态失败：网络不可用（%s）" % exc.reason)
+    except (TimeoutError, OSError) as exc:
+        return None, redact("刷新本机 Gemini 登录态失败：请求超时或中断（%s）" % exc)
+    except Exception as exc:
+        return None, redact("刷新本机 Gemini 登录态失败：%s" % exc)
+
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None, "刷新本机 Gemini 登录态失败：接口返回不是合法 JSON"
+    if not isinstance(data, dict):
+        return None, "刷新本机 Gemini 登录态失败：接口返回格式异常"
+    raw_token = data.get("access_token")
+    if not isinstance(raw_token, str) or not raw_token.strip():
+        return None, "刷新本机 Gemini 登录态失败：接口未返回有效访问令牌"
+    return raw_token.strip(), None
 
 
 # ---------------------------------------------------------------- 窗口归类与归一化
@@ -463,28 +718,64 @@ def build_payload() -> dict:
     now = utc_now()
     now_iso = to_utc_iso(now)
 
-    email = (os.environ.get("GEMINI_ACCOUNT_EMAIL") or "").strip()
-    access_token = (os.environ.get("GEMINI_ACCESS_TOKEN") or "").strip()
-    project_id = (os.environ.get("GEMINI_PROJECT_ID") or "").strip()
-
-    # 账号门控：未提供访问令牌时零网络请求，直接返回引导文案。
-    if not access_token:
+    creds = _resolve_credentials()
+    # 账号门控：手动配置与本机登录态均不存在时零网络请求，直接返回引导文案。
+    if creds is None:
         payload = _empty_payload(now_iso)
         payload["warnings"] = [ACCOUNT_REQUIRED_WARNING]
         return payload
 
+    source = creds["source"]
+    email = creds.get("email")
+    access_token = creds.get("access_token")
+    project_id = creds.get("project_id") or ""
+    refreshed_once = False
+
+    def _error_payload(message: str, plan_value: Optional[str] = None) -> dict:
+        payload = _empty_payload(now_iso)
+        payload["account"] = {"label": email or None, "plan": plan_value}
+        payload["error"] = redact(message)
+        return payload
+
+    # 仅本机凭据允许主动/被动内存刷新（绝不修改磁盘文件）
+    if source == "local":
+        expiry_epoch = creds.get("expiry_epoch")
+        needs_proactive = (not access_token) or (
+            expiry_epoch is not None and expiry_epoch <= now.timestamp() + PROACTIVE_REFRESH_SKEW_SECONDS
+        )
+        if needs_proactive:
+            new_token, refresh_err = _refresh_access_token(creds)
+            if refresh_err is not None:
+                return _error_payload(refresh_err)
+            access_token = new_token
+            refreshed_once = True
+
+    assert access_token is not None
+
     plan: Optional[str] = None
     if not project_id:
-        load_data, load_err = _post_json(
+        load_body = {"metadata": {"ideType": "GEMINI_CLI", "platform": "MACOS"}}
+        load_data, load_err, load_status = _post_json_with_status(
             LOAD_CODE_ASSIST_URL,
             access_token,
-            {"metadata": {"ideType": "GEMINI_CLI", "platform": "MACOS"}},
+            load_body,
+            source=source,
         )
+        if load_status == 401 and source == "local" and not refreshed_once:
+            new_token, refresh_err = _refresh_access_token(creds)
+            if refresh_err is not None:
+                return _error_payload(refresh_err)
+            assert new_token is not None
+            access_token = new_token
+            refreshed_once = True
+            load_data, load_err, _ = _post_json_with_status(
+                LOAD_CODE_ASSIST_URL,
+                access_token,
+                load_body,
+                source=source,
+            )
         if load_err is not None:
-            payload = _empty_payload(now_iso)
-            payload["account"] = {"label": email or None, "plan": None}
-            payload["error"] = redact(load_err)
-            return payload
+            return _error_payload(load_err)
         assert load_data is not None
         raw_project = load_data.get("cloudaicompanionProject")
         if isinstance(raw_project, str) and raw_project.strip():
@@ -492,12 +783,27 @@ def build_payload() -> dict:
         plan = _extract_plan(load_data)
 
     quota_req = {"project": project_id} if project_id else {}
-    quota_data, quota_err = _post_json(RETRIEVE_QUOTA_URL, access_token, quota_req)
+    quota_data, quota_err, quota_status = _post_json_with_status(
+        RETRIEVE_QUOTA_URL,
+        access_token,
+        quota_req,
+        source=source,
+    )
+    if quota_status == 401 and source == "local" and not refreshed_once:
+        new_token, refresh_err = _refresh_access_token(creds)
+        if refresh_err is not None:
+            return _error_payload(refresh_err, plan_value=plan)
+        assert new_token is not None
+        access_token = new_token
+        refreshed_once = True
+        quota_data, quota_err, _ = _post_json_with_status(
+            RETRIEVE_QUOTA_URL,
+            access_token,
+            quota_req,
+            source=source,
+        )
     if quota_err is not None:
-        payload = _empty_payload(now_iso)
-        payload["account"] = {"label": email or None, "plan": plan}
-        payload["error"] = redact(quota_err)
-        return payload
+        return _error_payload(quota_err, plan_value=plan)
 
     assert quota_data is not None
     warnings: List[str] = []

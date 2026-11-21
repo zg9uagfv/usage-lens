@@ -17,7 +17,7 @@ public struct SettingsPanelView: View {
     @State private var geminiEmailDraft = ""
     @State private var geminiTokenDraft = ""
     @State private var geminiProjectIDDraft = ""
-    @State private var savedGeminiAccountEmail: String?
+    @State private var geminiCredentialSource: GeminiCredentialSource
     @State private var geminiAccountStatus: String?
     @State private var isVerifyingGeminiAccount = false
 
@@ -28,21 +28,28 @@ public struct SettingsPanelView: View {
         launchAtLogin: LaunchAtLoginManager,
         hasSavedAPIKey: Bool? = nil,
         savedGeminiAccountEmail: String?? = nil,
+        geminiCredentialSource: GeminiCredentialSource? = nil,
         initialExpandedProviderID: String? = nil,
         onCredentialChange: ((Provider) -> Void)? = nil,
         onAPIKeyChange: @escaping () -> Void = {}
     ) {
         self.launchAtLogin = launchAtLogin
         _hasSavedAPIKey = State(initialValue: hasSavedAPIKey ?? DeepSeekAPIKeyStore.hasSavedKey)
-        let resolvedGeminiEmail: String?
-        if let override = savedGeminiAccountEmail {
-            resolvedGeminiEmail = override
+        let resolvedGeminiSource: GeminiCredentialSource
+        if let explicitSource = geminiCredentialSource {
+            resolvedGeminiSource = explicitSource
+        } else if let override = savedGeminiAccountEmail {
+            if let email = override {
+                resolvedGeminiSource = .manualKeychain(email: email)
+            } else {
+                resolvedGeminiSource = .unconfigured
+            }
         } else if hasSavedAPIKey != nil {
-            resolvedGeminiEmail = nil
+            resolvedGeminiSource = .unconfigured
         } else {
-            resolvedGeminiEmail = GeminiAccountStore.savedAccountEmail()
+            resolvedGeminiSource = GeminiAccountStore.credentialSource()
         }
-        _savedGeminiAccountEmail = State(initialValue: resolvedGeminiEmail)
+        _geminiCredentialSource = State(initialValue: resolvedGeminiSource)
         _expandedCredentialProviderID = State(initialValue: initialExpandedProviderID)
         self.onCredentialChange = onCredentialChange
         self.onAPIKeyChange = onAPIKeyChange
@@ -129,12 +136,12 @@ public struct SettingsPanelView: View {
                                         .foregroundStyle(.secondary)
                                 } else if provider.requiresAccount {
                                     Image(
-                                        systemName: savedGeminiAccountEmail != nil
+                                        systemName: isGeminiCredentialActive
                                             ? "person.crop.circle.badge.checkmark"
                                             : "person.crop.circle"
                                     )
                                     .font(metrics.font(11))
-                                    .foregroundStyle(savedGeminiAccountEmail != nil ? Color.green : Color.secondary)
+                                    .foregroundStyle(isGeminiCredentialActive ? Color.green : Color.secondary)
                                 }
                                 Spacer(minLength: metrics.scaledSpacing(4))
                             }
@@ -295,13 +302,63 @@ public struct SettingsPanelView: View {
         }
     }
 
+    private var isGeminiCredentialActive: Bool {
+        switch geminiCredentialSource {
+        case .manualKeychain, .localCLI:
+            return true
+        case .unconfigured:
+            return false
+        }
+    }
+
+    @ViewBuilder
+    private func geminiManualConfigForm(caption: String) -> some View {
+        TextField(
+            "Gemini 账号邮箱（例如 user@gmail.com）",
+            text: $geminiEmailDraft
+        )
+        .font(metrics.font(12))
+        .textFieldStyle(.roundedBorder)
+
+        SecureField(
+            "粘贴 Gemini 访问令牌 (OAuth Access Token)",
+            text: $geminiTokenDraft
+        )
+        .font(metrics.font(12))
+        .textFieldStyle(.roundedBorder)
+        .onSubmit(saveGeminiAccount)
+
+        TextField(
+            "项目 ID（可选，留空自动获取）",
+            text: $geminiProjectIDDraft
+        )
+        .font(metrics.font(12))
+        .textFieldStyle(.roundedBorder)
+
+        HStack(spacing: metrics.scaledSpacing(8)) {
+            Button(isVerifyingGeminiAccount ? "正在验证…" : "验证并保存", action: saveGeminiAccount)
+                .font(metrics.font(12))
+                .disabled(trimmedGeminiEmail.isEmpty || trimmedGeminiToken.isEmpty || isVerifyingGeminiAccount)
+            Spacer(minLength: 0)
+        }
+        Text(caption)
+            .font(metrics.font(10))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     @ViewBuilder
     private func geminiAccountSettings(for provider: Provider) -> some View {
         VStack(alignment: .leading, spacing: metrics.scaledSpacing(8)) {
             Text("\(provider.displayName) 账号")
                 .font(metrics.font(13, weight: .semibold))
 
-            if let email = savedGeminiAccountEmail {
+            switch geminiCredentialSource {
+            case .manualKeychain(let email):
+                Label("已手动配置账号", systemImage: "checkmark.circle.fill")
+                    .font(metrics.font(10, weight: .medium))
+                    .foregroundStyle(.green)
+
                 // 仅展示非敏感邮箱标签；访问令牌永不回填到 UI。
                 TextField("", text: .constant(email))
                     .font(metrics.font(12))
@@ -324,39 +381,33 @@ public struct SettingsPanelView: View {
                     .font(metrics.font(10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else {
-                TextField(
-                    "Gemini 账号邮箱（例如 user@gmail.com）",
-                    text: $geminiEmailDraft
-                )
-                .font(metrics.font(12))
-                .textFieldStyle(.roundedBorder)
 
-                SecureField(
-                    "粘贴 Gemini 访问令牌 (OAuth Access Token)",
-                    text: $geminiTokenDraft
-                )
-                .font(metrics.font(12))
-                .textFieldStyle(.roundedBorder)
-                .onSubmit(saveGeminiAccount)
+            case .localCLI(let email):
+                Label("自动复用本机登录态", systemImage: "checkmark.circle.fill")
+                    .font(metrics.font(10, weight: .medium))
+                    .foregroundStyle(.green)
 
-                TextField(
-                    "项目 ID（可选，留空自动获取）",
-                    text: $geminiProjectIDDraft
-                )
-                .font(metrics.font(12))
-                .textFieldStyle(.roundedBorder)
-
-                HStack(spacing: metrics.scaledSpacing(8)) {
-                    Button(isVerifyingGeminiAccount ? "正在验证…" : "验证并保存", action: saveGeminiAccount)
+                if let email, !email.isEmpty {
+                    TextField("", text: .constant(email))
                         .font(metrics.font(12))
-                        .disabled(trimmedGeminiEmail.isEmpty || trimmedGeminiToken.isEmpty || isVerifyingGeminiAccount)
-                    Spacer(minLength: 0)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(true)
+                        .accessibilityLabel("本机复用的 \(provider.displayName) 账号")
                 }
-                Text("提供 Gemini 账号以查看 5 小时与 7 天使用量；令牌全程以掩码输入，仅验证成功后写入本机钥匙串。")
+
+                Text("正在只读复用本机 ~/.gemini/oauth_creds.json；如需覆盖，可在下方手动配置账号。")
                     .font(metrics.font(10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                geminiManualConfigForm(
+                    caption: "手动保存的账号具有最高优先级；令牌全程以掩码输入，仅验证成功后写入本机钥匙串。"
+                )
+
+            case .unconfigured:
+                geminiManualConfigForm(
+                    caption: "提供 Gemini 账号以查看 5 小时与 7 天使用量；本机已登录 Gemini CLI（~/.gemini/oauth_creds.json）时也会自动复用。令牌全程以掩码输入，仅验证成功后写入本机钥匙串。"
+                )
             }
 
             if let geminiAccountStatus {
@@ -425,7 +476,7 @@ public struct SettingsPanelView: View {
             }
             do {
                 try GeminiAccountStore.save(email: email, accessToken: token, projectID: projectID)
-                savedGeminiAccountEmail = email
+                geminiCredentialSource = .manualKeychain(email: email)
                 geminiEmailDraft = ""
                 geminiTokenDraft = ""
                 geminiProjectIDDraft = ""
@@ -441,7 +492,7 @@ public struct SettingsPanelView: View {
     private func deleteGeminiAccount() {
         do {
             try GeminiAccountStore.delete()
-            savedGeminiAccountEmail = nil
+            geminiCredentialSource = GeminiAccountStore.credentialSource()
             geminiEmailDraft = ""
             geminiTokenDraft = ""
             geminiProjectIDDraft = ""
