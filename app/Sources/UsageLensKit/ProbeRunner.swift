@@ -4,13 +4,13 @@ import Foundation
 
 public struct ProbeReport: Sendable {
     public var provider: Provider
-    /// 能解析出来的 JSON（即使探针 exit 非 0 也可能有，带着 error / warnings）。
+    /// 能解析出来的 JSON（即使探针失败也可能带 error / warnings）。
     public var envelope: ProbeEnvelope?
     /// 人话失败原因；nil = 这次探针成功。
     public var failure: String?
     public var warnings: [String]
     public var finishedAt: Date
-    /// 探针脚本本身不存在 —— 按「无数据」处理，不算错误。
+    /// 探针本身未安装/未接入 —— 按「无数据」处理，不算错误。
     public var isMissingProbe: Bool
     /// schema 不是 usage-lens/probe@1：整份输出作废，不展示任何数字。
     public var isIncompatibleSchema: Bool
@@ -28,9 +28,9 @@ public struct ProbeReport: Sendable {
     ) {
         self.provider = provider
         self.envelope = envelope
-        // 进 UI 的失败文案与 warnings 统一在这里脱敏（stderr 也经由 failure 进来）。
+        // 进 UI 的失败文案与 warnings 统一在这里脱敏。
         self.failure = failure.map(SecretRedactor.redact)
-        // 没显式给 warnings 时沿用 JSON 里的，避免调用方漏传。
+        // 没显式给 warnings 时沿用 envelope 里的，避免调用方漏传。
         let rawWarnings = warnings.isEmpty ? (envelope?.warnings ?? []) : warnings
         self.warnings = rawWarnings.map(SecretRedactor.redact)
         self.finishedAt = finishedAt
@@ -40,16 +40,13 @@ public struct ProbeReport: Sendable {
     }
 }
 
-/// 探针数据来源的抽象：正常运行是 ProbeRunner，测试里可以喂固定结果。
+/// 探针数据来源的抽象：正常运行是原生 Swift ProbeRunner，测试里可注入假实现。
 public protocol ProbeProviding: Sendable {
     func report(for provider: Provider) async -> ProbeReport
 }
 
-// MARK: - 仓库根定位
+// MARK: - 仓库根定位（仅兼容旧工具/测试接口，原生运行时不再依赖外部 Python 脚本）
 
-/// 按仓库根相对定位探针：从 App bundle / 可执行文件所在位置向上找，
-/// 找到含 `probes/` 或 `docs/ARCHITECTURE.md` 的目录为止。
-/// 不硬编码任何用户家目录；`USAGE_LENS_ROOT` 仅供开发与测试指定根目录。
 public enum RepoLocator {
     public static func locate(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -94,9 +91,9 @@ public enum RepoLocator {
     }
 }
 
-// MARK: - 执行探针
+// MARK: - 原生 Swift 探针编排器（零 Python 子进程）
 
-/// 定位脚本、运行并解析 stdout。凭据按厂商严格隔离，仅从钥匙串注入对应探针子进程。
+/// 按厂商调度原生 Swift 探针并强制执行凭据/环境变量边界隔离。
 public struct ProbeRunner: ProbeProviding {
     public static let defaultTimeout: TimeInterval = 6
     /// Gemini / AGY 本机凭据刷新 + 项目发现 + 配额查询最多串行 4 次 3s 请求，给足有界预算。
@@ -110,19 +107,51 @@ public struct ProbeRunner: ProbeProviding {
     public var providerTimeouts: [String: TimeInterval]
     private let deepSeekAPIKeyLoader: @Sendable () -> String?
     private let geminiAccountLoader: @Sendable () -> GeminiAccount?
+    private let baseEnvironmentProvider: @Sendable () -> [String: String]
+    private let codexProbe: CodexNativeProbe
+    private let agyProbe: AgyNativeProbe
+    private let geminiProbe: GeminiNativeProbe
+    private let deepSeekProbe: DeepSeekNativeProbe
+    private let openCodeProbe: OpenCodeNativeProbe
 
     public init(
         root: URL? = nil,
         timeout: TimeInterval = defaultTimeout,
         providerTimeouts: [String: TimeInterval] = defaultProviderTimeouts,
         deepSeekAPIKeyLoader: @escaping @Sendable () -> String? = { DeepSeekAPIKeyStore.load() },
-        geminiAccountLoader: @escaping @Sendable () -> GeminiAccount? = { GeminiAccountStore.load() }
+        geminiAccountLoader: @escaping @Sendable () -> GeminiAccount? = { GeminiAccountStore.load() },
+        baseEnvironmentProvider: @escaping @Sendable () -> [String: String] = { ProcessInfo.processInfo.environment },
+        transport: any NativeHTTPTransport = PinnedURLSessionTransport(),
+        agyKeychain: any AgyKeychainReading = SystemAgyKeychainReader(),
+        agyKeychainWriter: (any AgyKeychainWriting)? = nil,
+        realUserHomeOverride: URL? = nil,
+        agyKeychainTimeout: TimeInterval = AgyNativeProbe.defaultKeychainTimeoutSeconds,
+        deepSeekZstdBinaryOverride: String? = nil,
+        deepSeekZstdTimeout: TimeInterval = DeepSeekNativeProbe.zstdTimeoutSeconds,
+        deepSeekScanBudget: TimeInterval = DeepSeekNativeProbe.spendScanBudgetSeconds
     ) {
         self.root = root
         self.timeout = timeout
         self.providerTimeouts = providerTimeouts
         self.deepSeekAPIKeyLoader = deepSeekAPIKeyLoader
         self.geminiAccountLoader = geminiAccountLoader
+        self.baseEnvironmentProvider = baseEnvironmentProvider
+        self.codexProbe = CodexNativeProbe(transport: transport)
+        self.agyProbe = AgyNativeProbe(
+            transport: transport,
+            keychain: agyKeychain,
+            keychainWriter: agyKeychainWriter,
+            realUserHomeOverride: realUserHomeOverride,
+            keychainTimeoutSeconds: agyKeychainTimeout
+        )
+        self.geminiProbe = GeminiNativeProbe(transport: transport)
+        self.deepSeekProbe = DeepSeekNativeProbe(
+            transport: transport,
+            zstdBinaryOverride: deepSeekZstdBinaryOverride,
+            zstdTimeoutSeconds: deepSeekZstdTimeout,
+            spendScanBudgetSeconds: deepSeekScanBudget
+        )
+        self.openCodeProbe = OpenCodeNativeProbe()
     }
 
     public func effectiveTimeout(for provider: Provider) -> TimeInterval {
@@ -133,83 +162,205 @@ public struct ProbeRunner: ProbeProviding {
         await report(for: provider, environmentOverrides: [:])
     }
 
-    /// 候选密钥验证时传入仅供本次子进程使用的环境变量，不会写入钥匙串。
+    /// 候选凭据验证与单测时传入仅供本次执行的隔离环境变量，绝不落盘、绝不跨厂商泄露。
     public func report(
         for provider: Provider,
         environmentOverrides: [String: String]
     ) async -> ProbeReport {
         let started = Date()
-        let resolvedRoot = root ?? RepoLocator.locate()
-
-        guard let resolvedRoot else {
-            return ProbeReport(
-                provider: provider,
-                failure: "未找到仓库根目录（probes/ 不在其中）",
-                finishedAt: started,
-                isMissingProbe: true
-            )
-        }
-
-        let probeURL = resolvedRoot.appendingPathComponent(provider.probeRelativePath)
-        guard FileManager.default.fileExists(atPath: probeURL.path) else {
-            return ProbeReport(
-                provider: provider,
-                failure: "未安装探针 \(provider.probeRelativePath)",
-                finishedAt: started,
-                isMissingProbe: true
-            )
-        }
-
         let effectiveTimeout = effectiveTimeout(for: provider)
-        let execution = await execute(
-            probe: probeURL,
-            workingDirectory: resolvedRoot,
-            timeout: effectiveTimeout,
-            provider: provider,
-            environmentOverrides: environmentOverrides
+        let scopedEnv = buildEnvironment(
+            baseEnvironment: baseEnvironmentProvider(),
+            for: provider,
+            overrides: environmentOverrides
         )
-        let duration = Date().timeIntervalSince(started)
 
-        switch execution {
-        case .failedToStart(let message):
-            return ProbeReport(provider: provider, failure: "探针无法启动：\(message)", finishedAt: Date(), duration: duration)
-        case .output(let output):
-            if output.overflowed {
-                return ProbeReport(
-                    provider: provider,
-                    failure: "探针输出超限（>8MB/流），已终止",
-                    finishedAt: Date(),
-                    duration: duration
-                )
-            }
-            if output.timedOut {
-                return ProbeReport(
-                    provider: provider,
-                    failure: "探针超时（>\(Self.formattedTimeoutSeconds(effectiveTimeout))s）",
-                    finishedAt: Date(),
-                    duration: duration
-                )
-            }
-            if output.drainTimedOut {
-                return ProbeReport(
-                    provider: provider,
-                    failure: "探针输出未正常关闭（子进程仍持有管道），本次结果不可信",
-                    finishedAt: Date(),
-                    duration: duration
-                )
-            }
-            return decode(
+        let report = await runWithTimeout(seconds: effectiveTimeout, provider: provider, started: started) {
+            await self.dispatchNativeProbe(for: provider, environment: scopedEnv)
+        }
+        return report
+    }
+
+    private func dispatchNativeProbe(
+        for provider: Provider,
+        environment: [String: String]
+    ) async -> ProbeReport {
+        switch provider.id {
+        case ProviderCatalog.codex.id:
+            return await codexProbe.run(environment: environment)
+        case ProviderCatalog.agy.id:
+            return await agyProbe.run(environment: environment)
+        case ProviderCatalog.gemini.id:
+            return await geminiProbe.run(environment: environment)
+        case ProviderCatalog.deepseek.id:
+            return await deepSeekProbe.run(environment: environment)
+        case ProviderCatalog.opencode.id:
+            return await openCodeProbe.run(environment: environment)
+        default:
+            return ProbeReport(
                 provider: provider,
-                stdout: String(decoding: output.stdout, as: UTF8.self),
-                stderr: String(decoding: output.stderr, as: UTF8.self),
-                status: output.status,
+                failure: "未安装原生探针 \(provider.id)",
                 finishedAt: Date(),
-                duration: duration
+                isMissingProbe: true
             )
         }
     }
 
-    // MARK: 解析
+    internal func runWithTimeout(
+        seconds: TimeInterval,
+        provider: Provider,
+        started: Date,
+        onBeforeAttachTimer: (@Sendable () -> Void)? = nil,
+        onBeforeAttachWorkTask: (@Sendable () -> Void)? = nil,
+        operation: @escaping @Sendable () async -> ProbeReport
+    ) async -> ProbeReport {
+        let finiteSeconds = seconds.isFinite ? seconds : Self.defaultTimeout
+        let boundedSeconds = min(max(finiteSeconds, 0.05), 3_600)
+
+        if Task.isCancelled {
+            return ProbeReport(
+                provider: provider,
+                failure: "探针已取消",
+                finishedAt: Date(),
+                duration: Date().timeIntervalSince(started)
+            )
+        }
+
+        let stateBox = LockedProbeRunBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let once = LockedOnceProbeContinuation(continuation)
+                guard stateBox.register(once) else {
+                    once.finish(
+                        with: ProbeReport(
+                            provider: provider,
+                            failure: "探针已取消",
+                            finishedAt: Date(),
+                            duration: Date().timeIntervalSince(started)
+                        ),
+                        cancelWork: true
+                    )
+                    return
+                }
+
+                // 先完整配置看门狗定时器并原子挂载/激活，再启动非结构化任务，
+                // 确保操作运行期间始终存在活跃看门狗，且不会释放未激活的 DispatchSourceTimer。
+                let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+                let deadlineNs = Int(min(boundedSeconds * 1_000_000_000, Double(Int.max / 2)))
+                timer.schedule(deadline: .now() + .nanoseconds(deadlineNs))
+                timer.setEventHandler {
+                    once.finish(
+                        with: ProbeReport(
+                            provider: provider,
+                            failure: "探针超时（>\(Self.formattedTimeoutSeconds(finiteSeconds))s）",
+                            finishedAt: Date(),
+                            duration: Date().timeIntervalSince(started)
+                        ),
+                        cancelWork: true
+                    )
+                }
+
+                onBeforeAttachTimer?()
+                guard once.attachTimer(timer) else {
+                    return
+                }
+
+                // 在独立非结构化任务中执行，确保超时后立即返回而非阻塞等待不可中断的系统调用。
+                let workTask = Task.detached(priority: .utility) {
+                    let report = await operation()
+                    once.finish(with: report, cancelWork: false)
+                }
+
+                onBeforeAttachWorkTask?()
+                once.attachWorkTask(workTask)
+            }
+        } onCancel: {
+            stateBox.cancel(provider: provider, started: started)
+        }
+    }
+
+    // MARK: - 厂商环境边界（最终过滤：父环境、钥匙串注入与覆盖均无法绕过）
+
+    /// 绝不允许传递给任何当前 OAuth/本地探针的 API Key 或 ADC 凭据变量。
+    private static let alwaysExcludedEnvKeys: Set<String> = [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CREDENTIALS",
+        "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    ]
+
+    /// 仅允许传递给 Gemini 探针用于项目路由上下文的 Google Cloud 项目别名。
+    private static let geminiOnlyProjectKeys: Set<String> = [
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_PROJECT_ID",
+    ]
+
+    /// 构造最终厂商隔离环境：合并父环境、受控钥匙串注入与覆盖后，在最后统一执行边界裁剪。
+    public func buildEnvironment(
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        for provider: Provider?,
+        overrides: [String: String] = [:]
+    ) -> [String: String] {
+        var environment = baseEnvironment
+
+        if provider?.id == ProviderCatalog.deepseek.id {
+            if let key = deepSeekAPIKeyLoader() {
+                environment["DEEPSEEK_API_KEY"] = key
+            }
+        }
+        if provider?.id == ProviderCatalog.gemini.id {
+            if let account = geminiAccountLoader() {
+                environment["GEMINI_ACCOUNT_EMAIL"] = account.email
+                environment["GEMINI_ACCESS_TOKEN"] = account.accessToken
+                if let projectID = account.projectID, !projectID.isEmpty {
+                    environment["GEMINI_PROJECT_ID"] = projectID
+                }
+            }
+        }
+
+        for (name, value) in overrides {
+            environment[name] = value
+        }
+
+        Self.enforceEnvironmentBoundary(&environment, for: provider)
+        return environment
+    }
+
+    private static func enforceEnvironmentBoundary(
+        _ environment: inout [String: String],
+        for provider: Provider?
+    ) {
+        let providerID = provider?.id
+        for key in Array(environment.keys) {
+            if alwaysExcludedEnvKeys.contains(key) {
+                environment.removeValue(forKey: key)
+                continue
+            }
+            if key == "DEEPSEEK_API_KEY" && providerID != ProviderCatalog.deepseek.id {
+                environment.removeValue(forKey: key)
+                continue
+            }
+            if key.hasPrefix("GEMINI_") && providerID != ProviderCatalog.gemini.id {
+                environment.removeValue(forKey: key)
+                continue
+            }
+            if geminiOnlyProjectKeys.contains(key) && providerID != ProviderCatalog.gemini.id {
+                environment.removeValue(forKey: key)
+                continue
+            }
+            if key.hasPrefix("AGY_") && providerID != ProviderCatalog.agy.id {
+                environment.removeValue(forKey: key)
+                continue
+            }
+            if key.hasPrefix("CODEX_") && providerID != ProviderCatalog.codex.id {
+                environment.removeValue(forKey: key)
+                continue
+            }
+        }
+    }
+
+    // MARK: - 契约解析（保留供契约与脱敏单测使用）
 
     func decode(
         provider: Provider,
@@ -236,7 +387,6 @@ public struct ProbeRunner: ProbeProviding {
             return ProbeReport(provider: provider, failure: failure, finishedAt: finishedAt, duration: duration)
         }
 
-        // schema 不符 = 整份输出非法：不保留任何数字，也不当成「上次成功值」。
         if let mismatch = envelope.schemaMismatch {
             return ProbeReport(
                 provider: provider,
@@ -247,8 +397,6 @@ public struct ProbeRunner: ProbeProviding {
             )
         }
 
-        // 探针的失败信息以 JSON 里的 `error` / `warnings` 为准。
-        // exit code 只在拿不到 JSON 时作为补充线索，避免把「exit 非 0 但给了数据」误判成无数据。
         let failure = envelope.error.flatMap { $0.isEmpty ? nil : $0 }
         return ProbeReport(
             provider: provider,
@@ -259,323 +407,115 @@ public struct ProbeRunner: ProbeProviding {
         )
     }
 
-    // MARK: 进程
-
-    /// 每流输出上限：死循环输出不许把内存吃穿。
-    static let outputLimit = 8 * 1024 * 1024
-    /// 进程退出后等读端收尾的上限；到点直接停掉读取，主流程不再等。
-    static let drainTimeout: TimeInterval = 2
-
     private static func formattedTimeoutSeconds(_ seconds: TimeInterval) -> String {
-        if seconds.rounded() == seconds {
-            return "\(Int(seconds))"
+        guard seconds.isFinite else { return "\(Int(Self.defaultTimeout))" }
+        if seconds.rounded() == seconds, let exact = NativeProbeSupport.checkedInt(fromTruncating: seconds) {
+            return "\(exact)"
         }
         return String(format: "%.1f", seconds)
     }
-
-    /// 边跑边排空两条管道，再等进程退出 + 超时。
-    /// 关键点：
-    /// 1. 绝不能先 `waitUntilExit()` 再读（>64KB 会死锁）；
-    /// 2. 等 reader 的上限必须真的可超时，不能挂在不可取消的 continuation 上；
-    /// 3. 子进程继承管道时，到点直接停读（等价于关读端），别等它退出。
-    func execute(
-        probe: URL,
-        workingDirectory: URL,
-        timeout: TimeInterval,
-        provider: Provider? = nil,
-        environmentOverrides: [String: String] = [:]
-    ) async -> ProbeProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", probe.path]
-        process.currentDirectoryURL = workingDirectory
-        process.standardInput = FileHandle.nullDevice
-
-        var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONUNBUFFERED"] = "1"
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        // 契约要求 stdout 无颜色码；这里兜底，免得解析被 ANSI 污染。
-        environment["NO_COLOR"] = "1"
-        environment["TERM"] = "dumb"
-        if provider?.id == ProviderCatalog.deepseek.id {
-            if let key = deepSeekAPIKeyLoader() {
-                // 仅注入 DeepSeek 探针；不会传给其他厂商或写入日志 / 文件。
-                environment["DEEPSEEK_API_KEY"] = key
-            }
-        } else {
-            environment.removeValue(forKey: "DEEPSEEK_API_KEY")
-        }
-        if provider?.id == ProviderCatalog.gemini.id {
-            if let account = geminiAccountLoader() {
-                // 仅注入 Gemini 探针；不会传给 Codex / DeepSeek / OpenCode。
-                environment["GEMINI_ACCOUNT_EMAIL"] = account.email
-                environment["GEMINI_ACCESS_TOKEN"] = account.accessToken
-                if let projectID = account.projectID, !projectID.isEmpty {
-                    environment["GEMINI_PROJECT_ID"] = projectID
-                }
-            }
-        } else {
-            environment.removeValue(forKey: "GEMINI_ACCOUNT_EMAIL")
-            environment.removeValue(forKey: "GEMINI_ACCESS_TOKEN")
-            environment.removeValue(forKey: "GEMINI_PROJECT_ID")
-        }
-        if provider?.id != ProviderCatalog.agy.id {
-            for key in Array(environment.keys) where key.hasPrefix("AGY_") {
-                environment.removeValue(forKey: key)
-            }
-        }
-        // 仅用于保存前验证候选密钥；优先级高于钥匙串，绝不落盘。
-        for (name, value) in environmentOverrides {
-            environment[name] = value
-        }
-        process.environment = environment
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let terminationGroup = DispatchGroup()
-        let terminationState = LockedTerminationState(group: terminationGroup)
-        process.terminationHandler = { finished in
-            terminationState.markTerminated(status: finished.terminationStatus)
-        }
-
-        do {
-            try process.run()
-        } catch {
-            process.terminationHandler = nil
-            terminationState.cancelWithoutLaunch()
-            return .failedToStart(error.localizedDescription)
-        }
-
-        let stdoutBuffer = LockedOutputBuffer(limit: Self.outputLimit)
-        let stderrBuffer = LockedOutputBuffer(limit: Self.outputLimit)
-        let readers = DispatchGroup()
-        let stdoutDrainer = PipeDrainer(pipe: stdoutPipe, buffer: stdoutBuffer, group: readers)
-        let stderrDrainer = PipeDrainer(pipe: stderrPipe, buffer: stderrBuffer, group: readers)
-        stdoutDrainer.start()
-        stderrDrainer.start()
-
-        let deadline = Date().addingTimeInterval(timeout)
-        var timedOut = false
-        var overflowed = false
-
-        while !terminationState.hasTerminated && process.isRunning && Date() < deadline {
-            if stdoutBuffer.overflows || stderrBuffer.overflows {
-                // 输出超限：立刻杀，不再等它自然结束。
-                overflowed = true
-                stdoutDrainer.stop()
-                stderrDrainer.stop()
-                await Self.terminate(process, terminationState: terminationState)
-                break
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-
-        if !overflowed && !terminationState.hasTerminated && process.isRunning {
-            timedOut = true
-            await Self.terminate(process, terminationState: terminationState)
-        }
-
-        // 等 reader 收尾：有上限，到点就停读，主流程立刻继续（不会挂 20s）。
-        var drainTimedOut = false
-        if !overflowed {
-            let drained = await Self.waitForGroup(readers, timeout: Self.drainTimeout)
-            if !drained {
-                drainTimedOut = true
-                stdoutDrainer.stop()
-                stderrDrainer.stop()
-            }
-        }
-
-        // 绝不在 Swift Concurrency 协作线程调用 Process.waitUntilExit()（会自旋 CFRunLoop 死锁）；
-        // 改用 terminationHandler + DispatchGroup 有界等待。
-        let terminated = await Self.waitForGroup(terminationGroup, timeout: Self.drainTimeout)
-        let exitStatus = terminationState.status ?? (terminated && !process.isRunning ? process.terminationStatus : -1)
-
-        return .output(
-            ProbeProcessOutput(
-                stdout: stdoutBuffer.snapshot,
-                stderr: stderrBuffer.snapshot,
-                status: exitStatus,
-                timedOut: timedOut,
-                overflowed: overflowed || stdoutBuffer.overflows || stderrBuffer.overflows,
-                drainTimedOut: drainTimedOut
-            )
-        )
-    }
-
-    /// terminate + 短暂异步等待 + SIGKILL；绝不阻塞超过 ~600ms。
-    private static func terminate(_ process: Process, terminationState: LockedTerminationState) async {
-        guard !terminationState.hasTerminated && process.isRunning else { return }
-        process.terminate()
-        let giveUp = Date().addingTimeInterval(0.5)
-        while !terminationState.hasTerminated && process.isRunning && Date() < giveUp {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-        if !terminationState.hasTerminated && process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
-        }
-    }
-
-    /// 在后台线程上做 `group.wait(timeout:)`，主流程拿到结果就返回。
-    /// 不能用 `withTaskGroup` + continuation：group 退出时会等那个不可取消的 continuation。
-    private static func waitForGroup(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                let result = group.wait(timeout: .now() + timeout)
-                continuation.resume(returning: result == .success)
-            }
-        }
-    }
 }
 
-// MARK: - 进程输出
-
-struct ProbeProcessOutput: Sendable {
-    var stdout: Data
-    var stderr: Data
-    var status: Int32
-    var timedOut: Bool
-    var overflowed: Bool
-    var drainTimedOut: Bool
-}
-
-enum ProbeProcessResult: Sendable {
-    case failedToStart(String)
-    case output(ProbeProcessOutput)
-}
-
-/// 线程安全记录子进程终止状态并只 leave DispatchGroup 一次，避免 waitUntilExit 死锁。
-private final class LockedTerminationState: @unchecked Sendable {
+internal final class LockedOnceProbeContinuation: @unchecked Sendable {
     private let lock = NSLock()
-    private let group: DispatchGroup
-    private var terminated = false
-    private var exitStatus: Int32?
+    private var continuation: CheckedContinuation<ProbeReport, Never>?
+    private var timer: DispatchSourceTimer?
+    private var workTask: Task<Void, Never>?
+    private var settled = false
+    private var shouldCancelWork = false
 
-    init(group: DispatchGroup) {
-        self.group = group
-        group.enter()
+    init(_ continuation: CheckedContinuation<ProbeReport, Never>) {
+        self.continuation = continuation
     }
 
-    func markTerminated(status: Int32) {
-        lock.lock()
-        let shouldLeave = !terminated
-        terminated = true
-        exitStatus = status
-        lock.unlock()
-        if shouldLeave {
-            group.leave()
+    /// 原子挂载并一次性激活看门狗定时器：
+    /// - 若尚未收敛：在持锁期间完成 `timer.activate()`，保证任何并发 `finish` 取出并 `cancel()` 前源已激活。
+    /// - 若已提前完成/取消（或重复挂载）：清空事件回调、`cancel()` 后显式 `activate()` 一次再释放，满足 libdispatch 生命周期硬约束。
+    @discardableResult
+    func attachTimer(_ timer: DispatchSourceTimer) -> Bool {
+        let attached: Bool = lock.withLock {
+            guard !settled, self.timer == nil else {
+                return false
+            }
+            self.timer = timer
+            timer.activate()
+            return true
         }
-    }
-
-    func cancelWithoutLaunch() {
-        lock.lock()
-        let shouldLeave = !terminated
-        terminated = true
-        lock.unlock()
-        if shouldLeave {
-            group.leave()
+        if !attached {
+            timer.setEventHandler(handler: nil)
+            timer.cancel()
+            timer.activate()
         }
+        return attached
     }
 
-    var hasTerminated: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return terminated
-    }
-
-    var status: Int32? {
-        lock.lock()
-        defer { lock.unlock() }
-        return exitStatus
-    }
-}
-
-/// 两条管道各有一个读取器；用锁拼块，并带字节上限。
-private final class LockedOutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private let limit: Int
-    private var storage = Data()
-    private var didOverflow = false
-
-    init(limit: Int) {
-        self.limit = limit
-    }
-
-    /// 返回 false 表示超限，调用方应停止读取。
-    func append(_ chunk: Data) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !didOverflow else { return false }
-        if storage.count + chunk.count > limit {
-            didOverflow = true
+    func attachWorkTask(_ workTask: Task<Void, Never>) {
+        let cancelNow: Bool = lock.withLock {
+            if settled {
+                return shouldCancelWork
+            }
+            self.workTask = workTask
             return false
         }
-        storage.append(chunk)
-        return true
+        if cancelNow {
+            workTask.cancel()
+        }
     }
 
-    var overflows: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return didOverflow
-    }
-
-    var snapshot: Data {
-        lock.lock()
-        defer { lock.unlock() }
-        return storage
+    func finish(with report: ProbeReport, cancelWork: Bool) {
+        let (cont, activeTimer, activeTask): (
+            CheckedContinuation<ProbeReport, Never>?,
+            DispatchSourceTimer?,
+            Task<Void, Never>?
+        ) = lock.withLock {
+            guard !settled else { return (nil, nil, nil) }
+            settled = true
+            shouldCancelWork = cancelWork
+            let c = continuation
+            continuation = nil
+            let t = timer
+            timer = nil
+            let w = workTask
+            workTask = nil
+            return (c, t, w)
+        }
+        activeTimer?.cancel()
+        if cancelWork {
+            activeTask?.cancel()
+        }
+        cont?.resume(returning: report)
     }
 }
 
-/// 用 readabilityHandler 读管道：回调只做非阻塞可用数据拷贝，停读时不会卡在阻塞 read 上。
-private final class PipeDrainer {
-    private let handle: FileHandle
-    private let buffer: LockedOutputBuffer
-    private let group: DispatchGroup
-    private let stateLock = NSLock()
-    private var finished = false
+internal final class LockedProbeRunBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var once: LockedOnceProbeContinuation?
+    private var cancelled = false
 
-    init(pipe: Pipe, buffer: LockedOutputBuffer, group: DispatchGroup) {
-        self.handle = pipe.fileHandleForReading
-        self.buffer = buffer
-        self.group = group
-        group.enter()
-    }
-
-    func start() {
-        handle.readabilityHandler = { [weak self] handle in
-            self?.consume(handle)
+    func register(_ once: LockedOnceProbeContinuation) -> Bool {
+        lock.withLock {
+            if cancelled { return false }
+            self.once = once
+            return true
         }
     }
 
-    /// 停读：等价于关掉读端，强制 reader 不再等待（进程/孙进程是否活着都不影响）。
-    func stop() {
-        handle.readabilityHandler = nil
-        finish()
-    }
-
-    private func consume(_ handle: FileHandle) {
-        let chunk = handle.availableData
-        if chunk.isEmpty {
-            handle.readabilityHandler = nil
-            finish()
-            return
+    func cancel(provider: Provider, started: Date) {
+        let target: LockedOnceProbeContinuation? = lock.withLock {
+            cancelled = true
+            let o = once
+            once = nil
+            return o
         }
-        if !buffer.append(chunk) {
-            handle.readabilityHandler = nil
-            finish()
-        }
-    }
-
-    private func finish() {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard !finished else { return }
-        finished = true
-        group.leave()
+        target?.finish(
+            with: ProbeReport(
+                provider: provider,
+                failure: "探针已取消",
+                finishedAt: Date(),
+                duration: Date().timeIntervalSince(started)
+            ),
+            cancelWork: true
+        )
     }
 }
 

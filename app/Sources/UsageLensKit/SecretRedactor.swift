@@ -9,6 +9,7 @@ public enum SecretRedactor {
         (#"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#, "***", []),
         (#"ya29\.[A-Za-z0-9._-]+"#, "***", []),
         (#"1//[A-Za-z0-9._-]{16,}"#, "***", []),
+        (#"AIza[0-9A-Za-z_-]{16,}"#, "***", []),
         (#"sk-[A-Za-z0-9_-]{8,}"#, "***", []),
         (#"Bearer\s+\S+"#, "***", [.caseInsensitive]),
         (#"\b(?:api[_-]?key|key|token|secret|password)\b\s*[=:]\s*\S+"#, "***", [.caseInsensitive]),

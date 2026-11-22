@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
 import json
 import math
@@ -45,6 +46,14 @@ HTTP_TIMEOUT_SECONDS = 3.0
 HTTP_MAX_BYTES = 1024 * 1024
 
 ACCOUNT_REQUIRED_WARNING = "请先在配置中提供 Gemini 账号以查看 5 小时与 7 天用量"
+INVALID_PROJECT_NUMBER_ERROR = (
+    "Gemini 项目配置无效：请使用 Google Cloud 项目 ID（字符串标识），不要填写纯数字项目编号"
+)
+MISSING_PROJECT_ERROR = (
+    "未能从 Gemini 服务端发现可用的 Google Cloud 项目，请配置 GEMINI_PROJECT_ID 或 GOOGLE_CLOUD_PROJECT"
+    "（并确认已启用 Gemini for Cloud API 与相应 IAM 权限）后重试"
+)
+PROJECT_ENV_PRECEDENCE = ("GEMINI_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID")
 
 WINDOW_SPEC = {
     "5h": {"id": "5h", "label": "5 小时", "window_seconds": 18000},
@@ -55,6 +64,7 @@ _SECRET_PATTERNS = (
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     re.compile(r"ya29\.[A-Za-z0-9._\-]+"),
     re.compile(r"1//[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{16,}"),
     re.compile(r"Bearer\s+\S+", re.IGNORECASE),
     re.compile(r"sk-[A-Za-z0-9_\-]{5,}"),
     re.compile(r"\b(?:api[_-]?key|key|token|secret|password)\b\s*[=:]\s*\S+", re.IGNORECASE),
@@ -209,10 +219,22 @@ def _http_error_message(exc: urlerror.HTTPError, source: str = "manual") -> str:
     code = exc.code
     if code in (301, 302, 303, 307, 308):
         return "查询 Gemini 用量失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
-    if code in (401, 403):
+    if code == 401:
         if source == "local":
-            return "本机 Gemini 登录态无效或已过期（HTTP %d），请在 Gemini CLI 重新登录或在配置中手动提供账号" % code
-        return "Gemini 账号凭据无效或已过期（HTTP %d），请在配置中重新提供账号" % code
+            return "本机 Gemini 登录态无效或已过期（HTTP 401），请在 Gemini CLI 重新登录或在配置中手动提供账号"
+        return "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号"
+    if code == 403:
+        if source == "local":
+            return (
+                "Gemini 服务端拒绝访问（HTTP 403），请检查 Google Cloud 项目配置"
+                "（GEMINI_PROJECT_ID / GOOGLE_CLOUD_PROJECT）、Gemini for Cloud API 启用状态与 IAM 权限，"
+                "或在 Gemini CLI 重新登录"
+            )
+        return (
+            "Gemini 服务端拒绝访问（HTTP 403），请检查 Google Cloud 项目配置"
+            "（GEMINI_PROJECT_ID / GOOGLE_CLOUD_PROJECT）、Gemini for Cloud API 启用状态与 IAM 权限，"
+            "或在配置中更新账号凭据"
+        )
     if code == 429:
         return "查询 Gemini 用量失败：请求被限流（HTTP 429），请稍后重试"
     if 500 <= code < 600:
@@ -254,7 +276,11 @@ def _post_json_with_status(
             if len(body) > HTTP_MAX_BYTES:
                 return None, "查询 Gemini 用量失败：响应体超过 1MB 上限，已拒绝读取", None
     except urlerror.HTTPError as exc:
-        return None, redact(_http_error_message(exc, source=source)), exc.code
+        code = exc.code
+        message = _http_error_message(exc, source=source)
+        with contextlib.suppress(Exception):
+            exc.close()
+        return None, redact(message), code
     except urlerror.URLError as exc:
         return None, redact("查询 Gemini 用量失败：网络不可用（%s）" % exc.reason), None
     except (TimeoutError, OSError) as exc:
@@ -390,11 +416,34 @@ def _load_local_credentials(
     }
 
 
+def _is_numeric_project_number(value: str) -> bool:
+    """判断是否为纯数字 Google Cloud 项目编号（如 123456789012 或 projects/123456789012）。"""
+    candidate = value[len("projects/"):] if value.startswith("projects/") else value
+    return bool(candidate) and candidate.isascii() and candidate.isdigit()
+
+
+def _resolve_project_context() -> Tuple[Optional[str], Optional[str]]:
+    """按优先级解析项目路由上下文：GEMINI_PROJECT_ID > GOOGLE_CLOUD_PROJECT > GOOGLE_CLOUD_PROJECT_ID。
+    仅提供路由上下文，不构成认证凭据；拒绝纯数字项目编号且绝不回显原始输入。
+    """
+    for key in PROJECT_ENV_PRECEDENCE:
+        raw = os.environ.get(key)
+        if not isinstance(raw, str):
+            continue
+        trimmed = raw.strip()
+        if not trimmed:
+            continue
+        if _is_numeric_project_number(trimmed):
+            return None, INVALID_PROJECT_NUMBER_ERROR
+        return trimmed, None
+    return None, None
+
+
 def _resolve_credentials() -> Optional[dict]:
     """严格按 3 级优先级解析凭据：手动 env > 本机 CLI（只读）> None（零网络门控）。"""
     env_token = (os.environ.get("GEMINI_ACCESS_TOKEN") or "").strip()
     env_email = (os.environ.get("GEMINI_ACCOUNT_EMAIL") or "").strip() or None
-    env_project = (os.environ.get("GEMINI_PROJECT_ID") or "").strip() or None
+    env_project, project_error = _resolve_project_context()
 
     if env_token:
         return {
@@ -406,6 +455,7 @@ def _resolve_credentials() -> Optional[dict]:
             "client_id": None,
             "client_secret": None,
             "project_id": env_project,
+            "project_error": project_error,
         }
 
     if (os.environ.get("GEMINI_DISABLE_LOCAL_AUTH") or "").strip() == "1":
@@ -417,6 +467,7 @@ def _resolve_credentials() -> Optional[dict]:
 
     local["email"] = env_email or local["email"]
     local["project_id"] = env_project
+    local["project_error"] = project_error
     return local
 
 
@@ -462,6 +513,8 @@ def _refresh_access_token(creds: dict) -> Tuple[Optional[str], Optional[str]]:
                 return None, "刷新本机 Gemini 登录态失败：响应体超过 1MB 上限，已拒绝读取"
     except urlerror.HTTPError as exc:
         code = exc.code
+        with contextlib.suppress(Exception):
+            exc.close()
         if code in (301, 302, 303, 307, 308):
             return None, "刷新本机 Gemini 登录态失败：接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code
         if code in (400, 401, 403):
@@ -728,7 +781,8 @@ def build_payload() -> dict:
     source = creds["source"]
     email = creds.get("email")
     access_token = creds.get("access_token")
-    project_id = creds.get("project_id") or ""
+    selected_project = creds.get("project_id")
+    project_error = creds.get("project_error")
     refreshed_once = False
 
     def _error_payload(message: str, plan_value: Optional[str] = None) -> dict:
@@ -736,6 +790,9 @@ def build_payload() -> dict:
         payload["account"] = {"label": email or None, "plan": plan_value}
         payload["error"] = redact(message)
         return payload
+
+    if project_error is not None:
+        return _error_payload(project_error)
 
     # 仅本机凭据允许主动/被动内存刷新（绝不修改磁盘文件）
     if source == "local":
@@ -752,37 +809,50 @@ def build_payload() -> dict:
 
     assert access_token is not None
 
-    plan: Optional[str] = None
-    if not project_id:
-        load_body = {"metadata": {"ideType": "GEMINI_CLI", "platform": "MACOS"}}
-        load_data, load_err, load_status = _post_json_with_status(
+    metadata: Dict[str, str] = {"ideType": "GEMINI_CLI", "platform": "MACOS"}
+    if selected_project:
+        metadata["duetProject"] = selected_project
+        load_body: Dict[str, Any] = {
+            "cloudaicompanionProject": selected_project,
+            "metadata": metadata,
+        }
+    else:
+        load_body = {"metadata": metadata}
+
+    load_data, load_err, load_status = _post_json_with_status(
+        LOAD_CODE_ASSIST_URL,
+        access_token,
+        load_body,
+        source=source,
+    )
+    if load_status == 401 and source == "local" and not refreshed_once:
+        new_token, refresh_err = _refresh_access_token(creds)
+        if refresh_err is not None:
+            return _error_payload(refresh_err)
+        assert new_token is not None
+        access_token = new_token
+        refreshed_once = True
+        load_data, load_err, _ = _post_json_with_status(
             LOAD_CODE_ASSIST_URL,
             access_token,
             load_body,
             source=source,
         )
-        if load_status == 401 and source == "local" and not refreshed_once:
-            new_token, refresh_err = _refresh_access_token(creds)
-            if refresh_err is not None:
-                return _error_payload(refresh_err)
-            assert new_token is not None
-            access_token = new_token
-            refreshed_once = True
-            load_data, load_err, _ = _post_json_with_status(
-                LOAD_CODE_ASSIST_URL,
-                access_token,
-                load_body,
-                source=source,
-            )
-        if load_err is not None:
-            return _error_payload(load_err)
-        assert load_data is not None
-        raw_project = load_data.get("cloudaicompanionProject")
-        if isinstance(raw_project, str) and raw_project.strip():
-            project_id = raw_project.strip()
-        plan = _extract_plan(load_data)
+    if load_err is not None:
+        return _error_payload(load_err)
+    assert load_data is not None
 
-    quota_req = {"project": project_id} if project_id else {}
+    plan: Optional[str] = _extract_plan(load_data)
+    if selected_project:
+        effective_project = selected_project
+    else:
+        raw_project = load_data.get("cloudaicompanionProject")
+        discovered = raw_project.strip() if isinstance(raw_project, str) and raw_project.strip() else None
+        if not discovered or _is_numeric_project_number(discovered):
+            return _error_payload(MISSING_PROJECT_ERROR, plan_value=plan)
+        effective_project = discovered
+
+    quota_req = {"project": effective_project}
     quota_data, quota_err, quota_status = _post_json_with_status(
         RETRIEVE_QUOTA_URL,
         access_token,

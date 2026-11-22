@@ -249,10 +249,12 @@ class AgyProbeTest(unittest.TestCase):
         self.assertEqual(payload["windows"], [])
         self.assertIsNone(payload["error"])
         self.assertIsNone(payload["usage"])
-        self.assertIn(
-            "未检测到本机 AGY 登录态，请先运行 agy 登录以查看 5 小时与 7 天用量",
+        self.assertTrue(
+            any("隔离主目录环境" in w and "钥匙串" in w for w in payload["warnings"]),
             payload["warnings"],
         )
+        self.assertNotIn(str(self.home), completed.stdout.decode("utf-8", "replace"))
+        self.assertNotIn(str(self.home), completed.stderr.decode("utf-8", "replace"))
 
     # 2. AGY_DISABLE_LOCAL_AUTH=1 gate
     def test_disable_local_auth_skips_auth_file_and_network(self):
@@ -270,7 +272,7 @@ class AgyProbeTest(unittest.TestCase):
         self.assertEqual(len(opener.calls), 0, "禁用本机登录态时不得发起任何网络请求")
         self.assertEqual(payload["windows"], [])
         self.assertIsNone(payload["error"])
-        self.assertTrue(any("未检测到本机 AGY 登录态" in w for w in payload["warnings"]))
+        self.assertTrue(any("AGY_DISABLE_LOCAL_AUTH" in w for w in payload["warnings"]))
 
     # 3. go-keyring-base64: decoding & live 200 conservative aggregation
     def test_keyring_base64_and_live_conservative_max_aggregation(self):
@@ -357,11 +359,13 @@ class AgyProbeTest(unittest.TestCase):
         self.assertIsNone(payload["error"])
         self.assertEqual(len(opener.calls), 3)
 
-        # Verify loadCodeAssist used IDE_UNSPECIFIED
+        # Verify loadCodeAssist used IDE_UNSPECIFIED and required User-Agent header
         load_req, load_timeout = opener.calls[0]
         self.assertEqual(load_timeout, 3.0)
         load_body = json.loads(load_req.data.decode("utf-8"))
         self.assertEqual(load_body["metadata"]["ideType"], "IDE_UNSPECIFIED")
+        for req, _ in opener.calls:
+            self.assertEqual(req.get_header("User-agent"), "antigravity")
 
         by_id = {w["id"]: w for w in payload["windows"]}
         self.assertEqual(set(by_id.keys()), {"5h", "7d"})
@@ -768,6 +772,396 @@ class AgyProbeTest(unittest.TestCase):
         self.assertNotIn("ya29.", stderr_text)
         support.assert_no_secrets(self, stdout_text)
         support.assert_no_secrets(self, stderr_text)
+
+    def _make_fake_security(self, body: str):
+        """创建可执行假 security 脚本并返回 (script_path, argv_log_path)。"""
+        log_path = self.tmp / "security_calls.jsonl"
+        script_path = self.tmp / "fake_security.py"
+        script = (
+            "#!%s\n"
+            "import json, sys\n"
+            "with open(%r, 'a', encoding='utf-8') as f:\n"
+            "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "%s\n"
+        ) % (sys.executable, str(log_path), body)
+        script_path.write_text(script, encoding="utf-8")
+        os.chmod(script_path, 0o755)
+        return script_path, log_path
+
+    # 9. Fake security executable: keychain available + exact allowlisted command (no enumeration)
+    def test_keychain_available_via_fake_security_and_no_enumeration(self):
+        probe = load_probe()
+        keyring_text = make_keyring_payload(wrap_base64=True)
+        fake_sec, log_path = self._make_fake_security(
+            "print(%r)\nsys.exit(0)" % keyring_text
+        )
+        opener = FakeOpener(
+            responses=[
+                FakeResponse(
+                    json.dumps(
+                        {"cloudaicompanionProject": "proj-kc", "paidTier": {"name": "Google AI Pro"}}
+                    ).encode("utf-8"),
+                    LOAD_URL,
+                ),
+                FakeResponse(
+                    json.dumps(
+                        {
+                            "groups": [
+                                {
+                                    "buckets": [
+                                        {"window": "5h", "remainingFraction": 0.7, "resetTime": future_iso(3600)},
+                                        {"window": "weekly", "remainingFraction": 0.9, "resetTime": future_iso(5 * 86400)},
+                                    ]
+                                }
+                            ]
+                        }
+                    ).encode("utf-8"),
+                    SUMMARY_URL,
+                ),
+                FakeResponse(json.dumps({"buckets": []}).encode("utf-8"), QUOTA_URL),
+            ]
+        )
+
+        before = support.fingerprint(self.home)
+        with (
+            mock.patch.object(probe, "SECURITY_BIN", str(fake_sec)),
+            mock.patch.object(probe, "_is_home_isolated", return_value=False),
+            mock.patch.object(sys, "platform", "darwin"),
+        ):
+            code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=opener)
+        after = support.fingerprint(self.home)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(before, after, "钥匙串读取绝不可写盘")
+        self.assertEqual(payload["account"], {"label": FAKE_EMAIL, "plan": "Google AI Pro"})
+        self.assertEqual([w["id"] for w in payload["windows"]], ["5h", "7d"])
+        calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(
+            calls,
+            [["find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"]],
+            "只允许精确查询白名单钥匙串项，禁止 dump-keychain 或枚举",
+        )
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+    # 10. Keychain outcomes: missing vs denied vs nonzero vs timeout vs malformed (zero secret/stderr leak)
+    def test_keychain_discovery_outcomes_differentiated_and_secret_free(self):
+        probe = load_probe()
+        cases = [
+            (
+                "missing",
+                "sys.stderr.write('security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain. %s\\n')\nsys.exit(44)" % FAKE_TOKEN,
+                "未检测到本机 AGY 登录态",
+            ),
+            (
+                "denied",
+                "sys.stderr.write('security: SecKeychainItemCopyContent: User interaction is not allowed. %s\\n')\nsys.exit(36)" % FAKE_TOKEN,
+                "访问被拒绝或钥匙串已锁定",
+            ),
+            (
+                "nonzero",
+                "sys.stderr.write('security: unexpected failure secret=%s\\n')\nsys.exit(2)" % FAKE_REFRESH,
+                "钥匙串查询失败",
+            ),
+            (
+                "timeout",
+                "import time; time.sleep(1.0); sys.exit(0)",
+                "钥匙串凭据超时",
+            ),
+            (
+                "malformed",
+                "print('not-valid-keyring-' + %r)\nsys.exit(0)" % FAKE_TOKEN,
+                "钥匙串凭据格式异常",
+            ),
+        ]
+
+        for expected_outcome, script_body, expected_phrase in cases:
+            with self.subTest(outcome=expected_outcome):
+                fake_sec, log_path = self._make_fake_security(script_body)
+                if log_path.exists():
+                    log_path.unlink()
+                opener = FakeOpener()
+                timeout_budget = 0.15 if expected_outcome == "timeout" else 2.0
+                with (
+                    mock.patch.object(probe, "SECURITY_BIN", str(fake_sec)),
+                    mock.patch.object(probe, "KEYCHAIN_TIMEOUT_SECONDS", timeout_budget),
+                    mock.patch.object(probe, "_is_home_isolated", return_value=False),
+                    mock.patch.object(sys, "platform", "darwin"),
+                ):
+                    creds, discovery = probe._resolve_credentials_with_discovery()
+                    self.assertIsNone(creds)
+                    self.assertEqual(discovery.outcome, expected_outcome)
+                    # Discovery object must never hold secret material or raw stderr
+                    discovery_repr = repr(discovery)
+                    self.assertNotIn(FAKE_TOKEN, discovery_repr)
+                    self.assertNotIn(FAKE_REFRESH, discovery_repr)
+                    self.assertNotIn("SecKeychain", discovery_repr)
+                    self.assertNotIn(str(self.home), discovery_repr)
+
+                    code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=opener)
+
+                self.assertEqual(code, 0)
+                self.assertEqual(len(opener.calls), 0, "未取得凭据时不得发起网络请求")
+                self.assertEqual(payload["windows"], [])
+                self.assertIsNone(payload["error"])
+                self.assertTrue(
+                    any(expected_phrase in w for w in payload["warnings"]),
+                    "outcome=%s warnings=%r" % (expected_outcome, payload["warnings"]),
+                )
+                self.assertFalse(any("Gemini" in w for w in payload["warnings"]))
+                self.assertNotIn("SecKeychain", stdout_text)
+                self.assertNotIn("unexpected failure", stdout_text)
+                support.assert_no_secrets(self, stdout_text)
+                support.assert_no_secrets(self, stderr_text)
+
+    # 11. Local file malformed & unreadable outcomes + isolated-home skips fake security
+    def test_local_file_malformed_unreadable_and_isolated_home_skips_security(self):
+        probe = load_probe()
+        fake_sec, log_path = self._make_fake_security("sys.exit(0)")
+
+        # Isolated HOME must NOT invoke security binary at all
+        with (
+            mock.patch.object(probe, "SECURITY_BIN", str(fake_sec)),
+            mock.patch.object(sys, "platform", "darwin"),
+        ):
+            code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=FakeOpener())
+        self.assertEqual(code, 0)
+        self.assertFalse(log_path.exists(), "隔离 HOME 下绝不得调用真实/假 security 命令")
+        self.assertTrue(any("隔离主目录环境" in w for w in payload["warnings"]))
+        self.assertNotIn(str(self.home), stdout_text)
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+        # Malformed local auth.json (contains synthetic secret that must never leak)
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text("{corrupt " + FAKE_TOKEN, encoding="utf-8")
+        code2, payload2, stdout2, stderr2 = self._run_in_process(probe, opener=FakeOpener())
+        self.assertEqual(code2, 0)
+        self.assertTrue(any("本地凭据文件格式异常" in w for w in payload2["warnings"]))
+        support.assert_no_secrets(self, stdout2)
+        support.assert_no_secrets(self, stderr2)
+
+        # Unreadable local auth path (directory instead of file)
+        self.auth_file.unlink()
+        self.auth_file.mkdir(parents=True, exist_ok=True)
+        code3, payload3, stdout3, stderr3 = self._run_in_process(probe, opener=FakeOpener())
+        self.assertEqual(code3, 0)
+        self.assertTrue(any("无法读取本机 AGY 本地凭据文件" in w for w in payload3["warnings"]))
+        support.assert_no_secrets(self, stdout3)
+        support.assert_no_secrets(self, stderr3)
+
+    # 12. Discovery fails (keychain denied) + local today_tokens exist -> honest fallback
+    def test_discovery_failure_preserves_local_today_tokens_without_fake_quota(self):
+        probe = load_probe()
+        now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_transcript(
+            self.brain_cli,
+            "conv-denied-fallback",
+            [
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": now_iso,
+                    "input_tokens": 500,
+                    "output_tokens": 200,
+                    "cache_read_tokens": 100,
+                }
+            ],
+        )
+        fake_sec, _ = self._make_fake_security("sys.exit(36)")
+        with (
+            mock.patch.object(probe, "SECURITY_BIN", str(fake_sec)),
+            mock.patch.object(probe, "_is_home_isolated", return_value=False),
+            mock.patch.object(sys, "platform", "darwin"),
+        ):
+            code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=FakeOpener())
+        self.assertEqual(code, 0)
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["windows"], [])
+        self.assertEqual(payload["usage"], {"today_tokens": 800, "source": "local"})
+        self.assertTrue(any("钥匙串" in w and "实时配额" in w for w in payload["warnings"]))
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+    # 13. Server 403 after discovery reports permission/policy denial (does NOT claim expiration or missing AGY)
+    def test_server_403_reports_permission_denial_without_claiming_expiration_or_missing(self):
+        probe = load_probe()
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text(make_keyring_payload(), encoding="utf-8")
+        opener = FakeOpener(responses=[http_error(403, LOAD_URL)])
+        code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=opener)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["windows"], [])
+        self.assertIsNotNone(payload["error"])
+        self.assertIn("HTTP 403", payload["error"])
+        self.assertIn("权限", payload["error"])
+        self.assertNotIn("已过期", payload["error"])
+        self.assertNotIn("未检测到本机 AGY 登录态", payload["error"])
+        self.assertNotIn("agy login", payload["error"].lower())
+        self.assertNotIn("Gemini", payload["error"])
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+    # 14. Server 401 vs rejected OAuth refresh (bounded single attempt, zero writes, documented guidance)
+    def test_server_401_and_rejected_oauth_refresh_stay_bounded_and_honest(self):
+        probe = load_probe()
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text(
+            make_keyring_payload(
+                access_token=FAKE_TOKEN,
+                refresh_token=FAKE_REFRESH,
+                expiry=past_iso(120),
+                client_id=FAKE_CLIENT_ID,
+            ),
+            encoding="utf-8",
+        )
+        before_bytes = self.auth_file.read_bytes()
+
+        # Rejected OAuth refresh (HTTP 400)
+        opener = FakeOpener(responses=[http_error(400, OAUTH_URL)])
+        code, payload, stdout_text, stderr_text = self._run_in_process(probe, opener=opener)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(opener.calls[0][0].full_url, OAUTH_URL)
+        self.assertEqual(self.auth_file.read_bytes(), before_bytes, "刷新失败也绝不可写盘")
+        self.assertIn("HTTP 400", payload["error"])
+        self.assertIn("agy", payload["error"])
+        self.assertNotIn("agy login", payload["error"].lower())
+        self.assertNotIn("Gemini", payload["error"])
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+        # Manual 401 does not trigger refresh and clearly indicates expired/invalid auth
+        opener401 = FakeOpener(responses=[http_error(401, LOAD_URL)])
+        code2, payload2, stdout2, stderr2 = self._run_in_process(
+            probe,
+            env={"AGY_ACCESS_TOKEN": FAKE_TOKEN},
+            opener=opener401,
+        )
+        self.assertEqual(code2, 1)
+        self.assertEqual(len(opener401.calls), 1)
+        self.assertIn("HTTP 401", payload2["error"])
+        self.assertIn("已过期", payload2["error"])
+        self.assertNotIn("agy login", payload2["error"].lower())
+        support.assert_no_secrets(self, stdout2)
+        support.assert_no_secrets(self, stderr2)
+
+    # 15. Source precedence: AGY_ACCESS_TOKEN > $AGY_AUTH_FILE > ~/.gemini/antigravity-cli/auth.json > Keychain
+    def test_source_precedence_order(self):
+        probe = load_probe()
+        env_token = "ya29.precedenceEnvToken1234567890abcd"
+        custom_file_token = "ya29.precedenceCustomFile1234567890"
+        default_file_token = "ya29.precedenceDefaultFile123456789"
+        keychain_token = "ya29.precedenceKeychain1234567890ab"
+
+        custom_auth = self.tmp / "custom_agy_auth.json"
+        custom_auth.write_text(make_keyring_payload(access_token=custom_file_token), encoding="utf-8")
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text(make_keyring_payload(access_token=default_file_token), encoding="utf-8")
+        fake_sec, _ = self._make_fake_security("print(%r)\nsys.exit(0)" % make_keyring_payload(access_token=keychain_token))
+
+        base_env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        with (
+            mock.patch.object(probe, "SECURITY_BIN", str(fake_sec)),
+            mock.patch.object(probe, "_is_home_isolated", return_value=False),
+            mock.patch.object(sys, "platform", "darwin"),
+        ):
+            # 1. AGY_ACCESS_TOKEN wins over everything
+            with mock.patch.dict(os.environ, {**base_env, "AGY_ACCESS_TOKEN": env_token, "AGY_AUTH_FILE": str(custom_auth)}, clear=True):
+                creds, disc = probe._resolve_credentials_with_discovery()
+                self.assertEqual(disc.selected_source, "env")
+                self.assertEqual(creds["access_token"], env_token)
+
+            # 2. AGY_AUTH_FILE wins over default auth.json and Keychain
+            with mock.patch.dict(os.environ, {**base_env, "AGY_AUTH_FILE": str(custom_auth)}, clear=True):
+                creds, disc = probe._resolve_credentials_with_discovery()
+                self.assertEqual(disc.selected_source, "local_file")
+                self.assertEqual(creds["access_token"], custom_file_token)
+
+            # 3. Default auth.json wins over Keychain
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                creds, disc = probe._resolve_credentials_with_discovery()
+                self.assertEqual(disc.selected_source, "local_file")
+                self.assertEqual(creds["access_token"], default_file_token)
+
+            # 4. Keychain used when env & local file are absent
+            self.auth_file.unlink()
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                creds, disc = probe._resolve_credentials_with_discovery()
+                self.assertEqual(disc.selected_source, "keychain")
+                self.assertEqual(creds["access_token"], keychain_token)
+
+    # 16. API keys, Gemini OAuth/client vars, and Google project aliases stay isolated from AGY
+    def test_api_keys_gemini_clients_and_google_project_aliases_do_not_affect_agy(self):
+        probe = load_probe()
+        fake_api_key_a = "AIzaSySyntheticGeminiApiKeyValue12345"
+        fake_api_key_b = "AIzaSySyntheticGoogleApiKeyValue67890"
+        foreign_env = {
+            "GEMINI_API_KEY": fake_api_key_a,
+            "GOOGLE_API_KEY": fake_api_key_b,
+            "GEMINI_ACCESS_TOKEN": "ya29.foreignGeminiToken1234567890abcdef",
+            "GEMINI_PROJECT_ID": "foreign-gemini-proj",
+            "GOOGLE_CLOUD_PROJECT": "foreign-gcp-proj",
+            "GOOGLE_CLOUD_PROJECT_ID": "foreign-gcp-proj-id",
+            "GEMINI_OAUTH_CLIENT_ID": "foreign-gemini-client.apps.googleusercontent.com",
+            "GEMINI_OAUTH_CLIENT_SECRET": "foreign-gemini-secret-1234567890",
+        }
+
+        # Case A: No AGY credentials + API keys/Gemini vars -> zero network calls, no account inferred
+        opener_none = FakeOpener()
+        code, payload, stdout_text, stderr_text = self._run_in_process(
+            probe, env=foreign_env, opener=opener_none
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(opener_none.calls), 0)
+        self.assertEqual(payload["account"], {"label": None, "plan": None})
+        self.assertEqual(payload["windows"], [])
+        for forbidden in (fake_api_key_a, fake_api_key_b, "foreign-gemini-proj", "foreign-gcp-proj"):
+            self.assertNotIn(forbidden, stdout_text)
+            self.assertNotIn(forbidden, stderr_text)
+        support.assert_no_secrets(self, stdout_text)
+        support.assert_no_secrets(self, stderr_text)
+
+        # Case B: Expired AGY local auth without AGY client_id must NOT borrow GEMINI_OAUTH_CLIENT_ID
+        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_file.write_text(
+            make_keyring_payload(expiry=past_iso(300), client_id=None),
+            encoding="utf-8",
+        )
+        opener_expired = FakeOpener()
+        code2, payload2, _, _ = self._run_in_process(probe, env=foreign_env, opener=opener_expired)
+        self.assertEqual(code2, 1)
+        self.assertEqual(len(opener_expired.calls), 0, "不得借用 GEMINI_OAUTH_CLIENT_ID 刷新 AGY")
+        self.assertIsNotNone(payload2["error"])
+
+        # Case C: Valid AGY auth + Google/Gemini project aliases -> AGY ignores them and discovers its own project
+        self.auth_file.write_text(make_keyring_payload(), encoding="utf-8")
+        opener_live = FakeOpener(
+            responses=[
+                FakeResponse(json.dumps({"cloudaicompanionProject": "proj-agy-own"}).encode("utf-8"), LOAD_URL),
+                FakeResponse(
+                    json.dumps({
+                        "groups": [{"buckets": [
+                            {"window": "5h", "remainingFraction": 0.8, "resetTime": future_iso(3600)},
+                            {"window": "weekly", "remainingFraction": 0.9, "resetTime": future_iso(5 * 86400)},
+                        ]}]
+                    }).encode("utf-8"),
+                    SUMMARY_URL,
+                ),
+                FakeResponse(json.dumps({"buckets": []}).encode("utf-8"), QUOTA_URL),
+            ]
+        )
+        code3, payload3, stdout3, stderr3 = self._run_in_process(probe, env=foreign_env, opener=opener_live)
+        self.assertEqual(code3, 0)
+        self.assertEqual(len(opener_live.calls), 3)
+        self.assertEqual(opener_live.calls[0][0].full_url, LOAD_URL)
+        self.assertEqual(json.loads(opener_live.calls[1][0].data.decode("utf-8")), {"project": "proj-agy-own"})
+        self.assertEqual(json.loads(opener_live.calls[2][0].data.decode("utf-8")), {"project": "proj-agy-own"})
+        for req, _ in opener_live.calls:
+            self.assertEqual(req.get_header("Authorization"), "Bearer " + FAKE_TOKEN)
+            self.assertNotIn(fake_api_key_a, req.full_url)
+            self.assertNotIn(fake_api_key_b, req.full_url)
+        support.assert_no_secrets(self, stdout3)
+        support.assert_no_secrets(self, stderr3)
 
 
 if __name__ == "__main__":

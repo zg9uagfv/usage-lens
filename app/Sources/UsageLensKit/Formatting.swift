@@ -33,8 +33,12 @@ public enum UsageFormat {
     public static func resetCountdown(until date: Date?, now: Date = Date()) -> String? {
         guard let date else { return nil }
         let seconds = date.timeIntervalSince(now)
+        guard seconds.isFinite else { return nil }
         if seconds <= 0 { return "窗口已过期" }
-        let minutes = max(1, Int((seconds / 60).rounded(.up)))
+        guard let rawMinutes = NativeProbeSupport.checkedInt(fromTruncating: (seconds / 60).rounded(.up)) else {
+            return nil
+        }
+        let minutes = max(1, rawMinutes)
         if minutes < 60 { return "\(minutes) 分后重置" }
         if minutes < 24 * 60 {
             let hours = minutes / 60
@@ -49,7 +53,10 @@ public enum UsageFormat {
     /// 「刚刚」/「3 小时前」/「5 天前」；nil = 不知道数据时间。
     public static func dataAgeText(from date: Date?, now: Date = Date()) -> String? {
         guard let date else { return nil }
-        let seconds = Int(max(0, now.timeIntervalSince(date)))
+        let rawSeconds = max(0, now.timeIntervalSince(date))
+        guard let seconds = NativeProbeSupport.checkedInt(fromTruncating: rawSeconds) else {
+            return "很久以前"
+        }
         if seconds < 3600 { return "刚刚" }
         if seconds < 86_400 { return "\(seconds / 3600) 小时前" }
         return "\(seconds / 86_400) 天前"
@@ -70,7 +77,10 @@ public enum UsageFormat {
     /// 「刚刚更新」/「3 分钟前更新」/「2 小时前更新」。
     public static func updatedText(at date: Date?, now: Date = Date()) -> String {
         guard let date else { return "尚未更新" }
-        let seconds = Int(max(0, now.timeIntervalSince(date)))
+        let rawSeconds = max(0, now.timeIntervalSince(date))
+        guard let seconds = NativeProbeSupport.checkedInt(fromTruncating: rawSeconds) else {
+            return "很久以前更新"
+        }
         if seconds < 60 { return "刚刚更新" }
         if seconds < 3600 { return "\(seconds / 60) 分钟前更新" }
         if seconds < 86_400 { return "\(seconds / 3600) 小时前更新" }

@@ -49,15 +49,24 @@ extension KeyedDecodingContainer where Key == ProbeKey {
     }
 
     func optionalDouble(_ key: ProbeKey) -> Double? {
-        if let value = try? decode(Double.self, forKey: key) { return value }
+        if let value = try? decode(Double.self, forKey: key), value.isFinite { return value }
         if let value = try? decode(Int.self, forKey: key) { return Double(value) }
-        if let raw = try? decode(String.self, forKey: key) { return Double(raw) }
+        if let raw = try? decode(String.self, forKey: key),
+           let value = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+           value.isFinite {
+            return value
+        }
         return nil
     }
 
     func optionalInt(_ key: ProbeKey) -> Int? {
-        guard let value = optionalDouble(key) else { return nil }
-        return Int(value.rounded())
+        if let exact = try? decode(Int.self, forKey: key) { return exact }
+        if let raw = try? decode(String.self, forKey: key),
+           let exact = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return exact
+        }
+        guard let value = optionalDouble(key), value.isFinite else { return nil }
+        return NativeProbeSupport.checkedInt(fromTruncating: value.rounded())
     }
 
     func optionalBool(_ key: ProbeKey) -> Bool? {
@@ -71,7 +80,7 @@ extension KeyedDecodingContainer where Key == ProbeKey {
 
     func optionalDate(_ key: ProbeKey) -> Date? {
         if let raw = try? decode(String.self, forKey: key) { return ProbeDate.parse(raw) }
-        if let seconds = try? decode(Double.self, forKey: key) {
+        if let seconds = try? decode(Double.self, forKey: key), seconds.isFinite {
             return Date(timeIntervalSince1970: seconds)
         }
         return nil
@@ -110,7 +119,7 @@ public enum ProbeDate {
         if let date = withFractional.date(from: trimmed) { return date }
         if let date = plain.date(from: trimmed) { return date }
         if let date = dayOnly.date(from: trimmed) { return date }
-        if let seconds = Double(trimmed) { return Date(timeIntervalSince1970: seconds) }
+        if let seconds = Double(trimmed), seconds.isFinite { return Date(timeIntervalSince1970: seconds) }
         return nil
     }
 }

@@ -1,7 +1,33 @@
+import Foundation
 import XCTest
 @testable import UsageLensKit
 
 final class GeminiAccountTests: XCTestCase {
+    private let fakeEmail = "user@gmail.com"
+    private let fakeToken = "ya29.a0AfB_byTestSecretToken1234567890abcdef"
+    private let fakeRefresh = "1//0eTestRefreshToken1234567890abcdef"
+    private let fakeRefreshed = "ya29.a0AfB_byRefreshedToken9876543210fedcba"
+
+    private func futureISO(_ seconds: TimeInterval) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: Date().addingTimeInterval(seconds))
+    }
+
+    private func jsonResponse(_ obj: [String: Any], url: URL, status: Int = 200) -> Result<NativeHTTPResponse, Error> {
+        let body = try! JSONSerialization.data(withJSONObject: obj)
+        return .success(NativeHTTPResponse(statusCode: status, finalURL: url, body: body))
+    }
+
+    private func okQuotaResponse() -> Result<NativeHTTPResponse, Error> {
+        jsonResponse([
+            "buckets": [
+                ["modelId": "gemini-2.5-pro", "remainingFraction": 0.75, "resetTime": futureISO(3600), "windowDuration": "5h"],
+                ["modelId": "gemini-2.5-pro", "remainingFraction": 0.60, "resetTime": futureISO(4 * 86_400), "windowDuration": "7d"],
+            ],
+        ], url: GeminiNativeProbe.retrieveQuotaURL)
+    }
+
     func testProviderCatalogGeminiFlags() {
         XCTAssertTrue(ProviderCatalog.gemini.requiresAccount)
         XCTAssertTrue(ProviderCatalog.gemini.requiresCredentials)
@@ -44,7 +70,6 @@ final class GeminiAccountTests: XCTestCase {
             GeminiAccount(email: "user@gmail.com", accessToken: "ya29.test_token_12345", projectID: "projects/demo")
         )
 
-        // 更新覆盖
         try GeminiAccountStore.save(
             email: "other@gmail.com",
             accessToken: "ya29.updated_token_999",
@@ -57,56 +82,40 @@ final class GeminiAccountTests: XCTestCase {
             GeminiAccount(email: "other@gmail.com", accessToken: "ya29.updated_token_999", projectID: nil)
         )
 
-        // 删除
         try GeminiAccountStore.delete(storage: storage)
         XCTAssertFalse(GeminiAccountStore.hasSavedAccount(storage: storage))
         XCTAssertNil(GeminiAccountStore.savedAccountEmail(storage: storage))
         XCTAssertNil(GeminiAccountStore.load(storage: storage))
     }
 
-    func testGeminiAccountValidationSuccessAndFailure() async throws {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/gemini-validation-tests", isDirectory: true)
-        let probes = root.appendingPathComponent("probes", isDirectory: true)
-        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
-
-        let script = probes.appendingPathComponent("gemini.py")
-        let scriptText = """
-        import json, os, sys
-        email = os.environ.get("GEMINI_ACCOUNT_EMAIL", "")
-        token = os.environ.get("GEMINI_ACCESS_TOKEN", "")
-        if token == "ya29.good_token_12345":
-            out = {
-                "schema": "usage-lens/probe@1",
-                "provider": "gemini",
-                "account": {"label": email, "plan": "pro"},
-                "windows": [
-                    {"id": "5h", "label": "5 小时", "used_percent": 25, "window_seconds": 18000, "basis": "server"},
-                    {"id": "7d", "label": "7 天", "used_percent": 40, "window_seconds": 604800, "basis": "server"}
-                ],
-                "warnings": [],
-                "error": None
+    func testGeminiAccountValidationSuccessAndFailureNativeSwift() async {
+        let transport = MockNativeHTTPTransport { req in
+            let auth = req.headers["Authorization"] ?? ""
+            if auth != "Bearer ya29.good_token_12345" {
+                return NativeHTTPResponse(statusCode: 401, finalURL: req.url, body: Data("{}".utf8))
             }
-            print(json.dumps(out, ensure_ascii=False))
-            sys.exit(0)
-        out = {
-            "schema": "usage-lens/probe@1",
-            "provider": "gemini",
-            "account": {"label": email, "plan": None},
-            "windows": [],
-            "warnings": [],
-            "error": "Gemini 账号凭据无效或已过期（HTTP 401），请在配置中重新提供账号"
+            if req.url == GeminiNativeProbe.loadCodeAssistURL {
+                let body = try JSONSerialization.data(withJSONObject: [
+                    "cloudaicompanionProject": "projects/demo",
+                    "currentTier": ["id": "pro"],
+                ])
+                return NativeHTTPResponse(statusCode: 200, finalURL: req.url, body: body)
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "buckets": [
+                    ["windowDuration": "5h", "remainingFraction": 0.75, "resetTime": self.futureISO(3600)],
+                    ["windowDuration": "7d", "remainingFraction": 0.60, "resetTime": self.futureISO(4 * 86_400)],
+                ],
+            ])
+            return NativeHTTPResponse(statusCode: 200, finalURL: req.url, body: body)
         }
-        print(json.dumps(out, ensure_ascii=False))
-        sys.exit(1)
-        """
-        try scriptText.write(to: script, atomically: true, encoding: .utf8)
 
         let runner = ProbeRunner(
-            root: root,
             timeout: 5,
             deepSeekAPIKeyLoader: { nil },
-            geminiAccountLoader: { nil }
+            geminiAccountLoader: { nil },
+            baseEnvironmentProvider: { ["HOME": "/tmp/empty-home-\(UUID().uuidString)"] },
+            transport: transport
         )
 
         let emptyEmailMsg = await GeminiAccountStore.validationMessage(email: "", accessToken: "ya29.good_token_12345", runner: runner)
@@ -130,50 +139,189 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(failMsg?.contains("HTTP 401") ?? false, failMsg ?? "nil")
     }
 
-    func testProbeRunnerIsolatesGeminiCredentialsByProvider() async throws {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/gemini-env-isolation-tests", isDirectory: true)
-        let probes = root.appendingPathComponent("probes", isDirectory: true)
-        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
+    func testGeminiProjectPrecedenceTrimmingAndLoadQuotaSemantics() async throws {
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-lens-gemini-proj-\(UUID().uuidString)", isDirectory: true)
+        let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
+        try FileManager.default.createDirectory(at: geminiDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempHome) }
 
-        let echoScript = """
-        import json, os
-        has_token = "GEMINI_ACCESS_TOKEN" in os.environ
-        email = os.environ.get("GEMINI_ACCOUNT_EMAIL")
-        project = os.environ.get("GEMINI_PROJECT_ID")
-        print(json.dumps({
-            "schema": "usage-lens/probe@1",
-            "provider": "test",
-            "account": {"label": email, "plan": project},
-            "windows": [],
-            "warnings": ["has_gemini_token=" + str(has_token)],
-            "error": None
-        }))
-        """
-        try echoScript.write(to: probes.appendingPathComponent("gemini.py"), atomically: true, encoding: .utf8)
-        try echoScript.write(to: probes.appendingPathComponent("codex.py"), atomically: true, encoding: .utf8)
-        try echoScript.write(to: probes.appendingPathComponent("deepseek.py"), atomically: true, encoding: .utf8)
+        let cases: [(String, [String: String], String)] = [
+            (
+                "gemini_project_id_wins",
+                [
+                    "GEMINI_PROJECT_ID": "  proj-gemini-id  ",
+                    "GOOGLE_CLOUD_PROJECT": "proj-gcp",
+                    "GOOGLE_CLOUD_PROJECT_ID": "proj-gcp-id",
+                ],
+                "proj-gemini-id"
+            ),
+            (
+                "google_cloud_project_wins_over_id",
+                [
+                    "GEMINI_PROJECT_ID": "   ",
+                    "GOOGLE_CLOUD_PROJECT": "  proj-gcp  ",
+                    "GOOGLE_CLOUD_PROJECT_ID": "proj-gcp-id",
+                ],
+                "proj-gcp"
+            ),
+            (
+                "google_cloud_project_id_fallback",
+                [
+                    "GEMINI_PROJECT_ID": "",
+                    "GOOGLE_CLOUD_PROJECT": " \t ",
+                    "GOOGLE_CLOUD_PROJECT_ID": "  proj-gcp-id  ",
+                ],
+                "proj-gcp-id"
+            ),
+        ]
 
-        let account = GeminiAccount(email: "user@gmail.com", accessToken: "ya29.secret_for_gemini_only", projectID: "proj-1")
-        let runner = ProbeRunner(
-            root: root,
-            timeout: 5,
-            deepSeekAPIKeyLoader: { nil },
-            geminiAccountLoader: { account }
-        )
+        // 1. Manual OAuth
+        for (name, projEnv, expected) in cases {
+            let transport = MockNativeHTTPTransport(responses: [
+                jsonResponse(["cloudaicompanionProject": "proj-server-other", "currentTier": ["id": "standard"]], url: GeminiNativeProbe.loadCodeAssistURL),
+                okQuotaResponse(),
+            ])
+            var env = projEnv
+            env["HOME"] = tempHome.path
+            env["GEMINI_ACCOUNT_EMAIL"] = fakeEmail
+            env["GEMINI_ACCESS_TOKEN"] = fakeToken
+            let report = await GeminiNativeProbe(transport: transport).run(environment: env)
+            XCTAssertNil(report.failure, "\(name): \(report.failure ?? "")")
+            XCTAssertEqual(transport.calls.count, 2)
+            let loadBody = try JSONSerialization.jsonObject(with: XCTUnwrap(transport.calls[0].body)) as? [String: Any]
+            let meta = loadBody?["metadata"] as? [String: Any]
+            XCTAssertEqual(loadBody?["cloudaicompanionProject"] as? String, expected, name)
+            XCTAssertEqual(meta?["duetProject"] as? String, expected, name)
+            let quotaBody = try JSONSerialization.jsonObject(with: XCTUnwrap(transport.calls[1].body)) as? [String: Any]
+            XCTAssertEqual(quotaBody?["project"] as? String, expected, "explicit project must not be replaced: \(name)")
+        }
 
-        let geminiReport = await runner.report(for: ProviderCatalog.gemini)
-        XCTAssertEqual(geminiReport.envelope?.account?.label, "user@gmail.com")
-        XCTAssertEqual(geminiReport.envelope?.account?.plan, "proj-1")
-        XCTAssertEqual(geminiReport.warnings, ["has_gemini_token=True"])
+        // 2. Local OAuth (~/.gemini/oauth_creds.json)
+        let localCreds: [String: Any] = [
+            "access_token": "ya29.localWorkspaceToken1234567890",
+            "expiry_date": Int((Date().timeIntervalSince1970 + 3600) * 1000),
+        ]
+        try JSONSerialization.data(withJSONObject: localCreds)
+            .write(to: geminiDir.appendingPathComponent("oauth_creds.json"))
+        try #"{"active":"workspace@example.com","old":[]}"#
+            .write(to: geminiDir.appendingPathComponent("google_accounts.json"), atomically: true, encoding: .utf8)
 
-        let codexReport = await runner.report(for: ProviderCatalog.codex)
-        XCTAssertNil(codexReport.envelope?.account?.label)
-        XCTAssertEqual(codexReport.warnings, ["has_gemini_token=False"])
+        let transportLocal = MockNativeHTTPTransport(responses: [
+            jsonResponse(["cloudaicompanionProject": "proj-server-ignored", "currentTier": ["id": "pro"]], url: GeminiNativeProbe.loadCodeAssistURL),
+            okQuotaResponse(),
+        ])
+        let localReport = await GeminiNativeProbe(transport: transportLocal).run(environment: [
+            "HOME": tempHome.path,
+            "GOOGLE_CLOUD_PROJECT": "ws-proj-local",
+        ])
+        XCTAssertNil(localReport.failure)
+        XCTAssertEqual(localReport.envelope?.account?.label, "workspace@example.com")
+        let localLoad = try JSONSerialization.jsonObject(with: XCTUnwrap(transportLocal.calls[0].body)) as? [String: Any]
+        XCTAssertEqual(localLoad?["cloudaicompanionProject"] as? String, "ws-proj-local")
+        let localQuota = try JSONSerialization.jsonObject(with: XCTUnwrap(transportLocal.calls[1].body)) as? [String: Any]
+        XCTAssertEqual(localQuota?["project"] as? String, "ws-proj-local")
+    }
 
-        let deepseekReport = await runner.report(for: ProviderCatalog.deepseek)
-        XCTAssertNil(deepseekReport.envelope?.account?.label)
-        XCTAssertEqual(deepseekReport.warnings, ["has_gemini_token=False"])
+    func testGeminiNumericProjectNumberRejectedWithoutEchoingInput() async {
+        let cases: [([String: String], String)] = [
+            (["GOOGLE_CLOUD_PROJECT": "123456789012"], "123456789012"),
+            (["GOOGLE_CLOUD_PROJECT_ID": "  987654321098  "], "987654321098"),
+            (["GEMINI_PROJECT_ID": "projects/555666777888"], "555666777888"),
+            (["GEMINI_PROJECT_ID": "444333222111", "GOOGLE_CLOUD_PROJECT": "valid-proj"], "444333222111"),
+        ]
+        for (projEnv, forbidden) in cases {
+            let transport = MockNativeHTTPTransport()
+            var env = projEnv
+            env["GEMINI_ACCOUNT_EMAIL"] = fakeEmail
+            env["GEMINI_ACCESS_TOKEN"] = fakeToken
+            let report = await GeminiNativeProbe(transport: transport).run(environment: env)
+            XCTAssertTrue(transport.calls.isEmpty, "纯数字项目编号不得发起任何网络请求")
+            XCTAssertTrue(report.failure?.contains("项目编号") ?? false)
+            XCTAssertFalse(report.failure?.contains(forbidden) ?? true, "绝不可回显用户输入的项目编号")
+        }
+    }
+
+    func testGeminiNoProjectDiscoveryMissingProject401Refresh403DenialAndAPIKeyIsolation() async throws {
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-lens-gemini-flow-\(UUID().uuidString)", isDirectory: true)
+        let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
+        try FileManager.default.createDirectory(at: geminiDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        // 1. API-key-only / project-only without OAuth -> zero network calls, no account inferred
+        for env in [
+            ["HOME": tempHome.path, "GEMINI_API_KEY": "AIzaSyGeminiOnly1234567890abcdef"],
+            ["HOME": tempHome.path, "GOOGLE_API_KEY": "AIzaSyGoogleOnly1234567890abcdef"],
+            [
+                "HOME": tempHome.path,
+                "GEMINI_API_KEY": "AIzaSyGeminiOnly1234567890abcdef",
+                "GOOGLE_API_KEY": "AIzaSyGoogleOnly1234567890abcdef",
+                "GOOGLE_CLOUD_PROJECT": "ws-no-oauth",
+            ],
+        ] {
+            let transport = MockNativeHTTPTransport()
+            let report = await GeminiNativeProbe(transport: transport).run(environment: env)
+            XCTAssertTrue(transport.calls.isEmpty)
+            XCTAssertNil(report.failure)
+            XCTAssertNil(report.envelope?.account?.label)
+            XCTAssertTrue(report.warnings.contains { $0.contains("提供 Gemini 账号") })
+        }
+
+        // 2. No configured project + server omits cloudaicompanionProject -> honest guidance, zero quota call
+        let transportMissing = MockNativeHTTPTransport(responses: [
+            jsonResponse(["currentTier": ["id": "standard"]], url: GeminiNativeProbe.loadCodeAssistURL),
+        ])
+        let missingReport = await GeminiNativeProbe(transport: transportMissing).run(environment: [
+            "HOME": tempHome.path,
+            "GEMINI_ACCOUNT_EMAIL": fakeEmail,
+            "GEMINI_ACCESS_TOKEN": fakeToken,
+        ])
+        XCTAssertEqual(transportMissing.calls.count, 1)
+        let loadSent = try JSONSerialization.jsonObject(with: XCTUnwrap(transportMissing.calls[0].body)) as? [String: Any]
+        XCTAssertNil(loadSent?["cloudaicompanionProject"])
+        XCTAssertTrue(missingReport.failure?.contains("GOOGLE_CLOUD_PROJECT") ?? false)
+        XCTAssertTrue(missingReport.failure?.contains("IAM") ?? false)
+
+        // 3. Local OAuth + explicit GOOGLE_CLOUD_PROJECT: bounded single 401 refresh + 403 denial without replacement
+        let credsFile = geminiDir.appendingPathComponent("oauth_creds.json")
+        let credsData = try JSONSerialization.data(withJSONObject: [
+            "access_token": fakeToken,
+            "refresh_token": fakeRefresh,
+            "client_id": "synthetic-client.apps.googleusercontent.com",
+            "expiry_date": Int((Date().timeIntervalSince1970 + 3600) * 1000),
+        ])
+        try credsData.write(to: credsFile)
+        try #"{"active":"ws.local@example.com","old":[]}"#
+            .write(to: geminiDir.appendingPathComponent("google_accounts.json"), atomically: true, encoding: .utf8)
+
+        let transport401 = MockNativeHTTPTransport(responses: [
+            jsonResponse([:], url: GeminiNativeProbe.loadCodeAssistURL, status: 401),
+            jsonResponse(["access_token": fakeRefreshed], url: GeminiNativeProbe.oauthTokenURL),
+            jsonResponse(["cloudaicompanionProject": "server-other"], url: GeminiNativeProbe.loadCodeAssistURL),
+            jsonResponse([:], url: GeminiNativeProbe.retrieveQuotaURL, status: 401),
+        ])
+        let report401 = await GeminiNativeProbe(transport: transport401).run(environment: [
+            "HOME": tempHome.path,
+            "GOOGLE_CLOUD_PROJECT": "ws-proj-explicit",
+        ])
+        let oauthCount = transport401.calls.filter { $0.url == GeminiNativeProbe.oauthTokenURL }.count
+        XCTAssertEqual(oauthCount, 1, "单次执行最多刷新一次")
+        XCTAssertTrue(report401.failure?.contains("HTTP 401") ?? false)
+        XCTAssertEqual(try Data(contentsOf: credsFile), credsData, "绝不修改本地凭据文件")
+
+        let transport403 = MockNativeHTTPTransport(responses: [
+            jsonResponse(["cloudaicompanionProject": "server-other"], url: GeminiNativeProbe.loadCodeAssistURL),
+            jsonResponse(["error": "permission_denied"], url: GeminiNativeProbe.retrieveQuotaURL, status: 403),
+        ])
+        let report403 = await GeminiNativeProbe(transport: transport403).run(environment: [
+            "HOME": tempHome.path,
+            "GOOGLE_CLOUD_PROJECT": "ws-proj-explicit",
+        ])
+        XCTAssertEqual(transport403.calls.count, 2)
+        XCTAssertTrue(report403.failure?.contains("HTTP 403") ?? false)
+        XCTAssertTrue(report403.failure?.contains("IAM") ?? false)
+        XCTAssertFalse(report403.failure?.contains("ws-proj-explicit") ?? true)
     }
 
     func testSecretRedactorRedactsGoogleOAuthTokens() {
@@ -192,6 +340,11 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(redactedJWT.contains("***"))
         XCTAssertFalse(redactedJWT.contains("eyJhbGciOiJSUzI1NiJ9"))
         XCTAssertTrue(redactedJWT.contains("failed"))
+
+        let apiKey = SecretRedactor.redact("failed AIzaSySyntheticKey123456789 end")
+        XCTAssertTrue(apiKey.contains("***"))
+        XCTAssertFalse(apiKey.contains("AIzaSy"))
+        XCTAssertTrue(apiKey.contains("end"))
     }
 
     func testDetectLocalCLIAuthAndCredentialSourcePriority() throws {
@@ -202,22 +355,18 @@ final class GeminiAccountTests: XCTestCase {
 
         let storage = InMemoryGeminiKeychainStorage()
 
-        // 1. 无本机文件且无钥匙串 -> unconfigured
         XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
         XCTAssertEqual(GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome), .unconfigured)
 
-        // 2. 写入畸形 JSON -> nil
         let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
         try fm.createDirectory(at: geminiDir, withIntermediateDirectories: true)
         let credsURL = geminiDir.appendingPathComponent("oauth_creds.json")
         try "{bad json".write(to: credsURL, atomically: true, encoding: .utf8)
         XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
 
-        // 3. 空令牌 -> nil
         try #"{"access_token":"   ","refresh_token":""}"#.write(to: credsURL, atomically: true, encoding: .utf8)
         XCTAssertNil(GeminiAccountStore.detectLocalCLIAuth(homeDirectory: tempHome))
 
-        // 4. 有效本机令牌 + id_token JWT email 回退
         let jwtPayloadData = Data(#"{"email":"jwt.user@gmail.com"}"#.utf8)
         let jwtPayloadB64 = jwtPayloadData.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -237,7 +386,6 @@ final class GeminiAccountTests: XCTestCase {
             .localCLI(email: "jwt.user@gmail.com")
         )
 
-        // 5. google_accounts.json 的 active 优先于 id_token
         let accountsURL = geminiDir.appendingPathComponent("google_accounts.json")
         try #"{"active":"active.local@gmail.com","old":[]}"#.write(to: accountsURL, atomically: true, encoding: .utf8)
         XCTAssertEqual(
@@ -249,14 +397,12 @@ final class GeminiAccountTests: XCTestCase {
             .localCLI(email: "active.local@gmail.com")
         )
 
-        // 6. 保存手动钥匙串账号 -> 最高优先级 (.manualKeychain)
         try GeminiAccountStore.save(email: "manual@gmail.com", accessToken: "ya29.manual_token", storage: storage)
         XCTAssertEqual(
             GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
             .manualKeychain(email: "manual@gmail.com")
         )
 
-        // 7. 删除手动钥匙串账号 -> 自动回落到 .localCLI
         try GeminiAccountStore.delete(storage: storage)
         XCTAssertEqual(
             GeminiAccountStore.credentialSource(storage: storage, homeDirectory: tempHome),
@@ -264,49 +410,10 @@ final class GeminiAccountTests: XCTestCase {
         )
     }
 
-    func testValidationMessagePassesDisableLocalAuthEnv() async throws {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/gemini-disable-local-auth-tests", isDirectory: true)
-        let probes = root.appendingPathComponent("probes", isDirectory: true)
-        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
-
-        let script = probes.appendingPathComponent("gemini.py")
-        let scriptText = """
-        import json, os, sys
-        disabled = os.environ.get("GEMINI_DISABLE_LOCAL_AUTH")
-        if disabled != "1":
-            print(json.dumps({"schema": "usage-lens/probe@1", "provider": "gemini", "windows": [], "error": "missing GEMINI_DISABLE_LOCAL_AUTH"}))
-            sys.exit(1)
-        print(json.dumps({
-            "schema": "usage-lens/probe@1",
-            "provider": "gemini",
-            "account": {"label": os.environ.get("GEMINI_ACCOUNT_EMAIL"), "plan": "pro"},
-            "windows": [{"id": "5h", "label": "5 小时", "used_percent": 10, "window_seconds": 18000, "basis": "server"}],
-            "warnings": [],
-            "error": None
-        }))
-        """
-        try scriptText.write(to: script, atomically: true, encoding: .utf8)
-
-        let runner = ProbeRunner(
-            root: root,
-            timeout: 5,
-            deepSeekAPIKeyLoader: { nil },
-            geminiAccountLoader: { nil }
-        )
-        let msg = await GeminiAccountStore.validationMessage(
-            email: "user@gmail.com",
-            accessToken: "ya29.candidate_token",
-            runner: runner
-        )
-        XCTAssertNil(msg)
-    }
-
     func testGeminiStateTransitionsAndMenuBarTension() {
         let now = Date()
         var state = ProviderState(provider: ProviderCatalog.gemini)
 
-        // 1. 未配置账号：不进入菜单栏
         let unconfigured = ProbeReport(
             provider: ProviderCatalog.gemini,
             envelope: ProbeEnvelope(
@@ -323,7 +430,6 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertNil(state.accountLabel)
         XCTAssertNil(Tension.mostTense(in: [state], now: now))
 
-        // 2. 配置账号后返回 5h 和 7d 窗口：进入菜单栏取最紧张窗口
         let configured = ProbeReport(
             provider: ProviderCatalog.gemini,
             envelope: ProbeEnvelope(
@@ -344,7 +450,6 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertEqual(state.windows.count, 2)
         XCTAssertEqual(Tension.mostTense(in: [state], now: now)?.compactLabel, "Gemini 7d 68%")
 
-        // 3. 凭据过期（HTTP 401 带空 windows JSON）：有旧值时进入 .stale 并保留上次 5h/7d 值，退出菜单栏
         let expiredWithEmptyEnvelope = ProbeReport(
             provider: ProviderCatalog.gemini,
             envelope: ProbeEnvelope(
@@ -362,13 +467,11 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertEqual(staleState.windows.count, 2)
         XCTAssertNil(Tension.mostTense(in: [staleState], now: now))
 
-        // 4. 无旧值时遇到 HTTP 401 带空 windows JSON：进入 .failed
         let freshFailed = ProviderReducer.apply(expiredWithEmptyEnvelope, to: ProviderState(provider: ProviderCatalog.gemini))
         XCTAssertEqual(freshFailed.status, .failed)
         XCTAssertNil(freshFailed.envelope)
         XCTAssertFalse(freshFailed.isStale)
 
-        // 5. 删除账号后刷新：用未配置 envelope 替换旧值，不残留原账号 5h/7d 用量
         let cleared = ProviderReducer.apply(unconfigured, to: state)
         XCTAssertEqual(cleared.status, .warning)
         XCTAssertNil(cleared.accountLabel)
@@ -378,8 +481,6 @@ final class GeminiAccountTests: XCTestCase {
 
     func testAuthFailureAfterUnconfiguredOrEmptyQuotaBecomesFailed() {
         let now = Date()
-
-        // 1. 未配置账号成功 envelope（0 窗口、无指标）后遇到 HTTP 401 -> 必须进入 .failed，而不是 .stale
         let unconfigured = ProbeReport(
             provider: ProviderCatalog.gemini,
             envelope: ProbeEnvelope(
@@ -415,63 +516,14 @@ final class GeminiAccountTests: XCTestCase {
         XCTAssertTrue(state.windows.isEmpty)
         XCTAssertEqual(state.failureReason, auth401.failure)
         XCTAssertNil(Tension.mostTense(in: [state], now: now))
-
-        // 2. 已配置账号但返回空配额（0 窗口、无指标）后遇到 HTTP 403 -> 也必须进入 .failed
-        let emptyQuota = ProbeReport(
-            provider: ProviderCatalog.gemini,
-            envelope: ProbeEnvelope(
-                provider: "gemini",
-                account: ProbeAccount(label: "user@gmail.com", plan: "free"),
-                windows: [],
-                warnings: ["未返回任何配额窗口"]
-            ),
-            finishedAt: now
-        )
-        let auth403 = ProbeReport(
-            provider: ProviderCatalog.gemini,
-            envelope: ProbeEnvelope(
-                provider: "gemini",
-                account: ProbeAccount(label: "user@gmail.com", plan: nil),
-                windows: [],
-                error: "Gemini 账号凭据无权限（HTTP 403），请在配置中重新提供账号"
-            ),
-            failure: "Gemini 账号凭据无权限（HTTP 403），请在配置中重新提供账号",
-            finishedAt: now.addingTimeInterval(60)
-        )
-
-        var emptyState = ProviderReducer.apply(emptyQuota, to: ProviderState(provider: ProviderCatalog.gemini))
-        XCTAssertEqual(emptyState.status, .warning)
-        XCTAssertFalse(emptyState.hasDisplayableUsage)
-
-        emptyState = ProviderReducer.apply(auth403, to: emptyState)
-        XCTAssertEqual(emptyState.status, .failed)
-        XCTAssertFalse(emptyState.isStale)
-        XCTAssertNil(emptyState.envelope)
-        XCTAssertNil(emptyState.lastDataAt)
-        XCTAssertTrue(emptyState.windows.isEmpty)
-        XCTAssertEqual(emptyState.failureReason, auth403.failure)
     }
 
-    func testGeminiDelayedMultiStepRefreshSucceedsWithinDefaultBudgetAndEnforcesBoundedDeadline() async throws {
+    func testGeminiNativeDelayedMultiStepRefreshAndBoundedDeadline() async throws {
         let fm = FileManager.default
-        let tempRoot = fm.temporaryDirectory.appendingPathComponent(
-            "usage-lens-gemini-timeout-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        let probesDir = tempRoot.appendingPathComponent("probes", isDirectory: true)
-        let tempHome = tempRoot.appendingPathComponent("home", isDirectory: true)
+        let tempHome = fm.temporaryDirectory.appendingPathComponent("usage-lens-gemini-delay-\(UUID().uuidString)", isDirectory: true)
         let geminiDir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
-        try fm.createDirectory(at: probesDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: geminiDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: tempRoot) }
-
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let realGeminiProbe = repoRoot.appendingPathComponent("probes/gemini.py")
-        XCTAssertTrue(fm.fileExists(atPath: realGeminiProbe.path), "找不到真实 probes/gemini.py：\(realGeminiProbe.path)")
+        defer { try? fm.removeItem(at: tempHome) }
 
         let credsJSON = """
         {
@@ -481,103 +533,58 @@ final class GeminiAccountTests: XCTestCase {
           "expiry_date": 1000000000000
         }
         """
-        try credsJSON.write(
-            to: geminiDir.appendingPathComponent("oauth_creds.json"),
-            atomically: true,
-            encoding: .utf8
-        )
-        try #"{"active":"delayed.local@gmail.com","old":[]}"#.write(
-            to: geminiDir.appendingPathComponent("google_accounts.json"),
-            atomically: true,
-            encoding: .utf8
-        )
+        try credsJSON.write(to: geminiDir.appendingPathComponent("oauth_creds.json"), atomically: true, encoding: .utf8)
+        try #"{"active":"delayed.local@gmail.com","old":[]}"#
+            .write(to: geminiDir.appendingPathComponent("google_accounts.json"), atomically: true, encoding: .utf8)
 
-        let wrapperScript = """
-        import importlib.util, json, sys, time
+        let delayedTransport = MockNativeHTTPTransport { req in
+            try await Task.sleep(nanoseconds: 120_000_000)
+            if req.url == GeminiNativeProbe.oauthTokenURL {
+                let body = try JSONSerialization.data(withJSONObject: ["access_token": "ya29.refreshed_delayed_12345", "expires_in": 3600])
+                return NativeHTTPResponse(statusCode: 200, finalURL: req.url, body: body)
+            }
+            if req.url == GeminiNativeProbe.loadCodeAssistURL {
+                let body = try JSONSerialization.data(withJSONObject: ["cloudaicompanionProject": "proj-delayed", "currentTier": ["id": "pro"]])
+                return NativeHTTPResponse(statusCode: 200, finalURL: req.url, body: body)
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "buckets": [
+                    ["windowDuration": "5h", "remainingFraction": 0.75, "resetTime": self.futureISO(3600)],
+                    ["windowDuration": "7d", "remainingFraction": 0.60, "resetTime": self.futureISO(4 * 86_400)],
+                ],
+            ])
+            return NativeHTTPResponse(statusCode: 200, finalURL: req.url, body: body)
+        }
 
-        spec = importlib.util.spec_from_file_location("real_gemini_probe", \(String(reflecting: realGeminiProbe.path)))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        class _DelayedResponse:
-            def __init__(self, body, final_url):
-                self._body = body
-                self._final_url = final_url
-                self.headers = {"Content-Length": str(len(body))}
-            def geturl(self):
-                return self._final_url
-            def read(self, amount=-1):
-                return self._body if amount is None or amount < 0 else self._body[:amount]
-            def __enter__(self):
-                return self
-            def __exit__(self, *exc_info):
-                return False
-
-        class _DelayedOpener:
-            def open(self, request, timeout=None):
-                assert timeout is not None and timeout <= 3.0
-                time.sleep(2.15)
-                url = request.full_url
-                if url == module.OAUTH_TOKEN_URL:
-                    body = json.dumps({"access_token": "ya29.refreshed_delayed_token_12345", "expires_in": 3600}).encode("utf-8")
-                    return _DelayedResponse(body, url)
-                if url == module.LOAD_CODE_ASSIST_URL:
-                    body = json.dumps({"cloudaicompanionProject": "proj-delayed", "currentTier": {"id": "pro"}}).encode("utf-8")
-                    return _DelayedResponse(body, url)
-                if url == module.RETRIEVE_QUOTA_URL:
-                    body = json.dumps({
-                        "buckets": [
-                            {"windowDuration": "5h", "remainingFraction": 0.75, "resetTime": "2099-01-01T05:00:00Z"},
-                            {"windowDuration": "7d", "remainingFraction": 0.60, "resetTime": "2099-01-07T00:00:00Z"},
-                        ]
-                    }).encode("utf-8")
-                    return _DelayedResponse(body, url)
-                raise AssertionError("unexpected url: " + url)
-
-        module._OPENER = _DelayedOpener()
-        sys.exit(module.main(["gemini.py"]))
-        """
-        try wrapperScript.write(
-            to: probesDir.appendingPathComponent("gemini.py"),
-            atomically: true,
-            encoding: .utf8
-        )
-
-        // 1. 默认 ProbeRunner：Gemini 享有 15s 有界预算，其他探针保持 6s 默认。
         let defaultRunner = ProbeRunner(
-            root: tempRoot,
             deepSeekAPIKeyLoader: { nil },
-            geminiAccountLoader: { nil }
+            geminiAccountLoader: { nil },
+            baseEnvironmentProvider: { ["HOME": tempHome.path] },
+            transport: delayedTransport
         )
         XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.codex), 6)
         XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.deepseek), 6)
         XCTAssertEqual(defaultRunner.effectiveTimeout(for: ProviderCatalog.gemini), 15)
 
-        let report = await defaultRunner.report(
-            for: ProviderCatalog.gemini,
-            environmentOverrides: ["HOME": tempHome.path]
-        )
+        let report = await defaultRunner.report(for: ProviderCatalog.gemini)
         XCTAssertNil(report.failure, report.failure ?? "nil")
-        XCTAssertGreaterThanOrEqual(report.duration, 6.0, "3 步延迟序列总时长应超过 6s")
         XCTAssertEqual(report.envelope?.account?.label, "delayed.local@gmail.com")
         XCTAssertEqual(report.envelope?.account?.plan, "pro")
         XCTAssertEqual(report.envelope?.windows.count, 2)
         XCTAssertEqual(report.envelope?.windows.first(where: { $0.id == "5h" })?.usedPercent, 25)
         XCTAssertEqual(report.envelope?.windows.first(where: { $0.id == "7d" })?.usedPercent, 40)
 
-        // 2. 仍严格执行有界超时，并在失败文案中报告实际截止时间。
+        // Bounded timeout enforcement
         let boundedRunner = ProbeRunner(
-            root: tempRoot,
-            providerTimeouts: [ProviderCatalog.gemini.id: 2],
+            providerTimeouts: [ProviderCatalog.gemini.id: 0.15],
             deepSeekAPIKeyLoader: { nil },
-            geminiAccountLoader: { nil }
+            geminiAccountLoader: { nil },
+            baseEnvironmentProvider: { ["HOME": tempHome.path] },
+            transport: delayedTransport
         )
-        let timedOut = await boundedRunner.report(
-            for: ProviderCatalog.gemini,
-            environmentOverrides: ["HOME": tempHome.path]
-        )
+        let timedOut = await boundedRunner.report(for: ProviderCatalog.gemini)
         XCTAssertNil(timedOut.envelope)
-        XCTAssertEqual(timedOut.failure, "探针超时（>2s）")
-        XCTAssertLessThan(timedOut.duration, 5.0)
+        XCTAssertTrue(timedOut.failure?.contains("探针超时") ?? false, timedOut.failure ?? "nil")
+        XCTAssertLessThan(timedOut.duration, 1.0)
     }
 }

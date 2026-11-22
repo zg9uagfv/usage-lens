@@ -1,0 +1,39 @@
+{
+  "fixture_kind": "secret-free-credential-schema",
+  "provider": "agy",
+  "confirmed_versions": ["1.5.13"],
+  "keychain": {
+    "platform": "darwin",
+    "item_class": "genp",
+    "service": "gemini",
+    "account": "antigravity",
+    "encoding": "go-keyring-base64:<base64(utf8-json)>",
+    "payload_schema": {
+      "auth_method": "str",
+      "id_token_email": "str",
+      "writer_id": "str",
+      "token": {
+        "access_token": "str",
+        "token_type": "str",
+        "refresh_token": "str",
+        "expiry": "str (RFC3339)",
+        "expires_in": "int"
+      }
+    }
+  },
+  "local_auth_file_allowlist": [
+    "$AGY_AUTH_FILE",
+    "~/.gemini/antigravity-cli/auth.json"
+  ],
+  "live_quota_api": {
+    "host": "daily-cloudcode-pa.googleapis.com",
+    "required_headers": {
+      "User-Agent": "antigravity"
+    },
+    "endpoints": [
+      "/v1internal:loadCodeAssist",
+      "/v1internal:retrieveUserQuotaSummary",
+      "/v1internal:retrieveUserQuota"
+    ]
+  }
+}

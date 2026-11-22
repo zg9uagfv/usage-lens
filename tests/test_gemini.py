@@ -164,6 +164,10 @@ class GeminiProbeTest(unittest.TestCase):
                 "GEMINI_DISABLE_LOCAL_AUTH",
                 "GEMINI_OAUTH_CLIENT_ID",
                 "GEMINI_OAUTH_CLIENT_SECRET",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_CLOUD_PROJECT_ID",
             )
         }
         env["HOME"] = str(self.home)
@@ -177,6 +181,15 @@ class GeminiProbeTest(unittest.TestCase):
             env.update(extra_env)
         with mock.patch.dict(os.environ, env, clear=True):
             return self.module.build_payload()
+
+    def _ok_load_response(self, project: str = "projects/demo-123", tier_id: str = "pro") -> FakeResponse:
+        return FakeResponse(
+            json.dumps({
+                "cloudaicompanionProject": project,
+                "currentTier": {"id": tier_id, "name": "Gemini Pro"},
+            }).encode("utf-8"),
+            LOAD_URL,
+        )
 
     def _write_local_oauth_creds(self, payload: dict, active_email: str | None = None):
         gemini_dir = self.home / ".gemini"
@@ -295,9 +308,11 @@ class GeminiProbeTest(unittest.TestCase):
         self.assertNotIn(FAKE_TOKEN, rendered)
         support.assert_no_secrets(self, rendered)
 
-    def test_explicit_project_id_skips_load_code_assist(self):
+    def test_explicit_project_id_sends_load_code_assist_fields_and_keeps_selected_project(self):
         reset_5h = future_iso(2 * 3600)
         reset_7d = future_iso(5 * 86400)
+        # Even if loadCodeAssist returns a different project, explicit project must NOT be silently replaced.
+        load_resp = self._ok_load_response(project="projects/other-from-server", tier_id="standard")
         quota_resp = FakeResponse(
             json.dumps({
                 "buckets": [
@@ -307,13 +322,27 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[load_resp, quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
-            payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="projects/explicit-1")
+            payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="  projects/explicit-1  ")
 
-        self.assertEqual(len(opener.calls), 1)
-        self.assertEqual(opener.calls[0][0].full_url, QUOTA_URL)
-        self.assertEqual(json.loads(opener.calls[0][0].data.decode("utf-8")), {"project": "projects/explicit-1"})
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["account"], {"label": FAKE_EMAIL, "plan": "standard"})
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(opener.calls[0][0].full_url, LOAD_URL)
+        self.assertEqual(
+            json.loads(opener.calls[0][0].data.decode("utf-8")),
+            {
+                "cloudaicompanionProject": "projects/explicit-1",
+                "metadata": {
+                    "ideType": "GEMINI_CLI",
+                    "platform": "MACOS",
+                    "duetProject": "projects/explicit-1",
+                },
+            },
+        )
+        self.assertEqual(opener.calls[1][0].full_url, QUOTA_URL)
+        self.assertEqual(json.loads(opener.calls[1][0].data.decode("utf-8")), {"project": "projects/explicit-1"})
         self.assertEqual([w["id"] for w in payload["windows"]], ["5h", "7d"])
 
     def test_multi_bucket_aggregation_picks_highest_usage(self):
@@ -332,7 +361,7 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[self._ok_load_response("p1"), quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="p1")
 
@@ -352,7 +381,7 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[self._ok_load_response("p1"), quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="p1")
 
@@ -372,7 +401,7 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[self._ok_load_response("p1"), quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="p1")
 
@@ -391,7 +420,7 @@ class GeminiProbeTest(unittest.TestCase):
     def test_http_errors_produce_chinese_error_and_nonzero_exit(self):
         cases = [
             (401, "凭据无效或已过期"),
-            (403, "凭据无效或已过期"),
+            (403, "拒绝访问"),
             (429, "限流"),
             (500, "暂时不可用"),
             (302, "拒绝跟随"),
@@ -420,13 +449,13 @@ class GeminiProbeTest(unittest.TestCase):
     def test_timeout_malformed_json_and_oversized_response(self):
         cases = [
             (FakeOpener(exc=TimeoutError("timed out")), "超时"),
-            (FakeOpener(responses=[FakeResponse(b"<html>bad</html>", QUOTA_URL)]), "合法 JSON"),
+            (FakeOpener(responses=[self._ok_load_response("p1"), FakeResponse(b"<html>bad</html>", QUOTA_URL)]), "合法 JSON"),
             (
-                FakeOpener(responses=[FakeResponse(b"{}", QUOTA_URL, headers={"Content-Length": str(2 * 1024 * 1024)})]),
+                FakeOpener(responses=[self._ok_load_response("p1"), FakeResponse(b"{}", QUOTA_URL, headers={"Content-Length": str(2 * 1024 * 1024)})]),
                 "过大",
             ),
             (
-                FakeOpener(responses=[FakeResponse(b"{}", "https://evil.example/steal")]),
+                FakeOpener(responses=[self._ok_load_response("p1"), FakeResponse(b"{}", "https://evil.example/steal")]),
                 "官方域名",
             ),
         ]
@@ -462,7 +491,7 @@ class GeminiProbeTest(unittest.TestCase):
         self.addCleanup(target.close)
         self.addCleanup(source.close)
 
-        with mock.patch.object(self.module, "RETRIEVE_QUOTA_URL", source.url + "/quota"):
+        with mock.patch.object(self.module, "LOAD_CODE_ASSIST_URL", source.url + "/load"):
             payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, project_id="p1")
 
         self.assertEqual(payload["windows"], [])
@@ -518,14 +547,15 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[self._ok_load_response("p-manual"), quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(email="manual@gmail.com", token=FAKE_TOKEN, project_id="p-manual")
 
         self.assertIsNone(payload["error"])
         self.assertEqual(payload["account"]["label"], "manual@gmail.com")
-        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(len(opener.calls), 2)
         self.assertEqual(opener.calls[0][0].get_header("Authorization"), "Bearer " + FAKE_TOKEN)
+        self.assertEqual(opener.calls[1][0].get_header("Authorization"), "Bearer " + FAKE_TOKEN)
 
     def test_local_fresh_oauth_creds_reused_readonly_with_google_accounts_email(self):
         local_token = "ya29.localFreshToken1234567890abcdef"
@@ -584,7 +614,7 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[quota_resp])
+        opener = FakeOpener(responses=[self._ok_load_response("p-jwt"), quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(project_id="p-jwt")
 
@@ -611,6 +641,7 @@ class GeminiProbeTest(unittest.TestCase):
             json.dumps({"access_token": refreshed_token, "expires_in": 3600}).encode("utf-8"),
             OAUTH_URL,
         )
+        load_resp = self._ok_load_response("p-refresh")
         quota_resp = FakeResponse(
             json.dumps({
                 "buckets": [
@@ -620,15 +651,17 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[refresh_resp, quota_resp])
+        opener = FakeOpener(responses=[refresh_resp, load_resp, quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(project_id="p-refresh")
 
         self.assertIsNone(payload["error"])
-        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(opener.calls), 3)
         self.assertEqual(opener.calls[0][0].full_url, OAUTH_URL)
-        self.assertEqual(opener.calls[1][0].full_url, QUOTA_URL)
+        self.assertEqual(opener.calls[1][0].full_url, LOAD_URL)
         self.assertEqual(opener.calls[1][0].get_header("Authorization"), "Bearer " + refreshed_token)
+        self.assertEqual(opener.calls[2][0].full_url, QUOTA_URL)
+        self.assertEqual(opener.calls[2][0].get_header("Authorization"), "Bearer " + refreshed_token)
         self.assertEqual([w["id"] for w in payload["windows"]], ["5h", "7d"])
         self.assertEqual(support.fingerprint(self.home), before)
         self.assertEqual((self.home / ".gemini" / "oauth_creds.json").read_text(encoding="utf-8"), before_content)
@@ -651,6 +684,7 @@ class GeminiProbeTest(unittest.TestCase):
             json.dumps({"access_token": refreshed_token, "expires_in": 3600}).encode("utf-8"),
             OAUTH_URL,
         )
+        load_resp = self._ok_load_response("p-reactive")
         quota_resp = FakeResponse(
             json.dumps({
                 "buckets": [
@@ -660,15 +694,16 @@ class GeminiProbeTest(unittest.TestCase):
             }).encode("utf-8"),
             QUOTA_URL,
         )
-        opener = FakeOpener(responses=[http_error(401, QUOTA_URL), refresh_resp, quota_resp])
+        opener = FakeOpener(responses=[load_resp, http_error(401, QUOTA_URL), refresh_resp, quota_resp])
         with mock.patch.object(self.module, "_OPENER", opener):
             payload = self._build(project_id="p-reactive")
 
         self.assertIsNone(payload["error"])
-        self.assertEqual(len(opener.calls), 3)
-        self.assertEqual(opener.calls[0][0].get_header("Authorization"), "Bearer " + stale_token)
-        self.assertEqual(opener.calls[1][0].full_url, OAUTH_URL)
-        self.assertEqual(opener.calls[2][0].get_header("Authorization"), "Bearer " + refreshed_token)
+        self.assertEqual(len(opener.calls), 4)
+        self.assertEqual(opener.calls[0][0].full_url, LOAD_URL)
+        self.assertEqual(opener.calls[1][0].get_header("Authorization"), "Bearer " + stale_token)
+        self.assertEqual(opener.calls[2][0].full_url, OAUTH_URL)
+        self.assertEqual(opener.calls[3][0].get_header("Authorization"), "Bearer " + refreshed_token)
         self.assertEqual(support.fingerprint(self.home), before)
 
     def test_refresh_redirect_rejected_without_leaking_refresh_token(self):
@@ -767,6 +802,278 @@ class GeminiProbeTest(unittest.TestCase):
         for url, expected in cases.items():
             with self.subTest(url=url):
                 self.assertEqual(self.module.is_official_oauth_url(url), expected)
+
+    # ---------- Google Cloud 项目上下文优先级、校验与 API Key 隔离 ----------
+
+    def test_project_precedence_and_trimming_across_manual_and_local_oauth(self):
+        reset_5h = future_iso(3600)
+        reset_7d = future_iso(5 * 86400)
+        quota_body = json.dumps({
+            "buckets": [
+                {"modelId": "gemini-2.5-pro", "remainingFraction": 0.70, "resetTime": reset_5h, "windowDuration": "5h"},
+                {"modelId": "gemini-2.5-pro", "remainingFraction": 0.50, "resetTime": reset_7d, "windowDuration": "7d"},
+            ]
+        }).encode("utf-8")
+
+        cases = [
+            (
+                "gemini_project_id_beats_all",
+                {
+                    "GEMINI_PROJECT_ID": "  proj-from-gemini-id  ",
+                    "GOOGLE_CLOUD_PROJECT": "proj-from-gcp",
+                    "GOOGLE_CLOUD_PROJECT_ID": "proj-from-gcp-id",
+                },
+                "proj-from-gemini-id",
+            ),
+            (
+                "google_cloud_project_beats_google_cloud_project_id",
+                {
+                    "GEMINI_PROJECT_ID": "   ",
+                    "GOOGLE_CLOUD_PROJECT": "  proj-from-gcp  ",
+                    "GOOGLE_CLOUD_PROJECT_ID": "proj-from-gcp-id",
+                },
+                "proj-from-gcp",
+            ),
+            (
+                "google_cloud_project_id_used_when_others_blank",
+                {
+                    "GEMINI_PROJECT_ID": "",
+                    "GOOGLE_CLOUD_PROJECT": " \t ",
+                    "GOOGLE_CLOUD_PROJECT_ID": "  proj-from-gcp-id  ",
+                },
+                "proj-from-gcp-id",
+            ),
+        ]
+
+        # 1. Manual OAuth
+        for name, extra_env, expected_project in cases:
+            with self.subTest(mode="manual", case=name):
+                opener = FakeOpener(responses=[
+                    self._ok_load_response("proj-server-ignored"),
+                    FakeResponse(quota_body, QUOTA_URL),
+                ])
+                with mock.patch.object(self.module, "_OPENER", opener):
+                    payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN, extra_env=extra_env)
+                self.assertIsNone(payload["error"])
+                self.assertEqual(len(opener.calls), 2)
+                load_sent = json.loads(opener.calls[0][0].data.decode("utf-8"))
+                self.assertEqual(load_sent["cloudaicompanionProject"], expected_project)
+                self.assertEqual(load_sent["metadata"]["duetProject"], expected_project)
+                quota_sent = json.loads(opener.calls[1][0].data.decode("utf-8"))
+                self.assertEqual(quota_sent, {"project": expected_project})
+
+        # 2. Local OAuth (~/.gemini/oauth_creds.json)
+        self._write_local_oauth_creds(
+            {
+                "access_token": "ya29.localWorkspaceToken1234567890abc",
+                "expiry_date": int((time.time() + 3600) * 1000),
+            },
+            active_email="workspace.user@example.com",
+        )
+        before = support.fingerprint(self.home)
+        for name, extra_env, expected_project in cases:
+            with self.subTest(mode="local", case=name):
+                opener = FakeOpener(responses=[
+                    self._ok_load_response("proj-server-ignored"),
+                    FakeResponse(quota_body, QUOTA_URL),
+                ])
+                with mock.patch.object(self.module, "_OPENER", opener):
+                    payload = self._build(extra_env=extra_env)
+                self.assertIsNone(payload["error"])
+                self.assertEqual(payload["account"]["label"], "workspace.user@example.com")
+                load_sent = json.loads(opener.calls[0][0].data.decode("utf-8"))
+                self.assertEqual(load_sent["cloudaicompanionProject"], expected_project)
+                self.assertEqual(load_sent["metadata"]["duetProject"], expected_project)
+                self.assertEqual(json.loads(opener.calls[1][0].data.decode("utf-8")), {"project": expected_project})
+        self.assertEqual(support.fingerprint(self.home), before, "项目选择不得写盘")
+
+    def test_numeric_project_number_rejected_without_echoing_input(self):
+        cases = [
+            ("bare_google_cloud_project", {"GOOGLE_CLOUD_PROJECT": "123456789012"}, "123456789012"),
+            ("padded_project_id", {"GOOGLE_CLOUD_PROJECT_ID": "  987654321098  "}, "987654321098"),
+            ("projects_prefix_number", {"GEMINI_PROJECT_ID": "projects/555666777888"}, "555666777888"),
+            (
+                "higher_precedence_numeric_not_silently_replaced",
+                {"GEMINI_PROJECT_ID": "444333222111", "GOOGLE_CLOUD_PROJECT": "valid-project-id"},
+                "444333222111",
+            ),
+        ]
+        for name, extra_env, forbidden_number in cases:
+            with self.subTest(case=name):
+                opener = FakeOpener(exc=AssertionError("非法纯数字项目编号不得发起任何网络请求"))
+                stdout_buf = io.StringIO()
+                stderr_buf = io.StringIO()
+                env = {
+                    "HOME": str(self.home),
+                    "GEMINI_ACCOUNT_EMAIL": FAKE_EMAIL,
+                    "GEMINI_ACCESS_TOKEN": FAKE_TOKEN,
+                    **extra_env,
+                }
+                with mock.patch.object(self.module, "_OPENER", opener), \
+                     mock.patch.dict(os.environ, env, clear=True), \
+                     mock.patch.object(sys, "stdout", stdout_buf), \
+                     mock.patch.object(sys, "stderr", stderr_buf):
+                    rc = self.module.main(["gemini.py"])
+                self.assertEqual(rc, 1)
+                self.assertEqual(opener.calls, [])
+                payload = support.strict_loads(stdout_buf.getvalue().strip())
+                self.assertEqual(payload["windows"], [])
+                self.assertIn("项目编号", payload["error"] or "")
+                self.assertNotIn(forbidden_number, stdout_buf.getvalue())
+                self.assertNotIn(forbidden_number, stderr_buf.getvalue())
+                support.assert_no_secrets(self, stdout_buf.getvalue())
+                support.assert_no_secrets(self, stderr_buf.getvalue())
+
+    def test_no_project_metadata_only_and_missing_discovered_project_guidance(self):
+        # 1. Valid server discovery sends metadata-only loadCodeAssist (no cloudaicompanionProject / duetProject)
+        load_resp = self._ok_load_response("projects/discovered-99")
+        quota_resp = FakeResponse(
+            json.dumps({
+                "buckets": [
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.80, "resetTime": future_iso(3600), "windowDuration": "5h"},
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.60, "resetTime": future_iso(4 * 86400), "windowDuration": "7d"},
+                ]
+            }).encode("utf-8"),
+            QUOTA_URL,
+        )
+        opener = FakeOpener(responses=[load_resp, quota_resp])
+        with mock.patch.object(self.module, "_OPENER", opener):
+            payload = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN)
+        self.assertIsNone(payload["error"])
+        load_sent = json.loads(opener.calls[0][0].data.decode("utf-8"))
+        self.assertNotIn("cloudaicompanionProject", load_sent)
+        self.assertNotIn("duetProject", load_sent["metadata"])
+        self.assertEqual(json.loads(opener.calls[1][0].data.decode("utf-8")), {"project": "projects/discovered-99"})
+
+        # 2. Server returns no valid cloudaicompanionProject -> honest guidance, zero quota calls, no fabricated windows
+        before = support.fingerprint(self.home)
+        missing_load_resp = FakeResponse(
+            json.dumps({"currentTier": {"id": "standard"}}).encode("utf-8"),
+            LOAD_URL,
+        )
+        opener_missing = FakeOpener(responses=[missing_load_resp])
+        with mock.patch.object(self.module, "_OPENER", opener_missing):
+            payload_missing = self._build(email=FAKE_EMAIL, token=FAKE_TOKEN)
+        self.assertEqual(len(opener_missing.calls), 1, "缺失项目时不得继续请求 retrieveUserQuota 或执行 onboarding")
+        self.assertEqual(payload_missing["windows"], [])
+        self.assertIn("GOOGLE_CLOUD_PROJECT", payload_missing["error"] or "")
+        self.assertIn("IAM", payload_missing["error"] or "")
+        self.assertEqual(support.fingerprint(self.home), before)
+
+    def test_explicit_google_cloud_project_bounded_401_refresh_and_403_denial(self):
+        stale_token = "ya29.workspaceStaleToken1234567890abc"
+        refreshed_token = "ya29.workspaceRefreshed1234567890abc"
+        self._write_local_oauth_creds(
+            {
+                "access_token": stale_token,
+                "refresh_token": FAKE_REFRESH,
+                "expiry_date": int((time.time() + 3600) * 1000),
+                "client_id": "test-client-id.apps.googleusercontent.com",
+            },
+            active_email="workspace@example.com",
+        )
+        before = support.fingerprint(self.home)
+
+        # 1. 401 on loadCodeAssist triggers at most 1 refresh; subsequent 401 on quota does NOT refresh again
+        opener_401 = FakeOpener(responses=[
+            http_error(401, LOAD_URL),
+            FakeResponse(json.dumps({"access_token": refreshed_token}).encode("utf-8"), OAUTH_URL),
+            self._ok_load_response("proj-server-other"),
+            http_error(401, QUOTA_URL),
+        ])
+        with mock.patch.object(self.module, "_OPENER", opener_401):
+            payload_401 = self._build(extra_env={"GOOGLE_CLOUD_PROJECT": "ws-proj-1"})
+        oauth_calls = [req for req, _ in opener_401.calls if req.full_url == OAUTH_URL]
+        self.assertEqual(len(oauth_calls), 1, "单次探针最多刷新一次 OAuth token")
+        self.assertEqual(json.loads(opener_401.calls[3][0].data.decode("utf-8")), {"project": "ws-proj-1"})
+        self.assertIn("HTTP 401", payload_401["error"] or "")
+        self.assertEqual(support.fingerprint(self.home), before)
+
+        # 2. 403 on loadCodeAssist: honest project/IAM guidance, zero retries, no project replacement
+        opener_403_load = FakeOpener(responses=[http_error(403, LOAD_URL)])
+        with mock.patch.object(self.module, "_OPENER", opener_403_load):
+            payload_403_load = self._build(extra_env={"GOOGLE_CLOUD_PROJECT": "ws-proj-1"})
+        self.assertEqual(len(opener_403_load.calls), 1)
+        self.assertEqual(payload_403_load["windows"], [])
+        self.assertIn("HTTP 403", payload_403_load["error"] or "")
+        self.assertIn("IAM", payload_403_load["error"] or "")
+        self.assertNotIn("ws-proj-1", payload_403_load["error"] or "")
+
+        # 3. 403 on retrieveUserQuota: honest project/IAM guidance, zero retries, no project replacement
+        opener_403_quota = FakeOpener(responses=[
+            self._ok_load_response("proj-server-other"),
+            http_error(403, QUOTA_URL),
+        ])
+        with mock.patch.object(self.module, "_OPENER", opener_403_quota):
+            payload_403_quota = self._build(extra_env={"GOOGLE_CLOUD_PROJECT": "ws-proj-1"})
+        self.assertEqual(len(opener_403_quota.calls), 2)
+        self.assertEqual(json.loads(opener_403_quota.calls[1][0].data.decode("utf-8")), {"project": "ws-proj-1"})
+        self.assertEqual(payload_403_quota["windows"], [])
+        self.assertIn("HTTP 403", payload_403_quota["error"] or "")
+        self.assertIn("IAM", payload_403_quota["error"] or "")
+
+    def test_api_keys_and_project_aliases_never_authenticate_or_enter_oauth_requests(self):
+        fake_gemini_api_key = "AIzaSySyntheticGeminiApiKeyOnly12345"
+        fake_google_api_key = "AIzaSySyntheticGoogleApiKeyOnly67890"
+
+        # 1. API-key-only & project-only cases without OAuth -> zero network calls, no inferred account
+        only_cases = [
+            {"GEMINI_API_KEY": fake_gemini_api_key},
+            {"GOOGLE_API_KEY": fake_google_api_key},
+            {
+                "GEMINI_API_KEY": fake_gemini_api_key,
+                "GOOGLE_API_KEY": fake_google_api_key,
+                "GOOGLE_CLOUD_PROJECT": "ws-proj-no-oauth",
+                "GOOGLE_CLOUD_PROJECT_ID": "ws-proj-no-oauth-2",
+            },
+            {"GOOGLE_CLOUD_PROJECT": "123456789012"},
+        ]
+        for extra in only_cases:
+            with self.subTest(keys=sorted(extra.keys())):
+                opener = FakeOpener(exc=AssertionError("无 OAuth 凭据时不许发起任何网络请求"))
+                with mock.patch.object(self.module, "_OPENER", opener):
+                    payload = self._build(extra_env=extra)
+                self.assertEqual(opener.calls, [])
+                self.assertEqual(payload["account"], {"label": None, "plan": None})
+                self.assertEqual(payload["windows"], [])
+                self.assertIsNone(payload["error"])
+                self.assertTrue(any("提供 Gemini 账号" in w for w in payload["warnings"]))
+                rendered = json.dumps(payload, ensure_ascii=False)
+                self.assertNotIn(fake_gemini_api_key, rendered)
+                self.assertNotIn(fake_google_api_key, rendered)
+
+        # 2. Valid OAuth + API keys present -> API keys never appear in Authorization, URL, body, or output
+        quota_resp = FakeResponse(
+            json.dumps({
+                "buckets": [
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.75, "resetTime": future_iso(3600), "windowDuration": "5h"},
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.50, "resetTime": future_iso(4 * 86400), "windowDuration": "7d"},
+                ]
+            }).encode("utf-8"),
+            QUOTA_URL,
+        )
+        opener = FakeOpener(responses=[self._ok_load_response("ws-proj-ok"), quota_resp])
+        with mock.patch.object(self.module, "_OPENER", opener):
+            payload = self._build(
+                email=FAKE_EMAIL,
+                token=FAKE_TOKEN,
+                extra_env={
+                    "GEMINI_API_KEY": fake_gemini_api_key,
+                    "GOOGLE_API_KEY": fake_google_api_key,
+                    "GOOGLE_CLOUD_PROJECT": "ws-proj-ok",
+                },
+            )
+        self.assertIsNone(payload["error"])
+        for req, _ in opener.calls:
+            self.assertEqual(req.get_header("Authorization"), "Bearer " + FAKE_TOKEN)
+            raw_body = req.data.decode("utf-8") if req.data else ""
+            for key_val in (fake_gemini_api_key, fake_google_api_key):
+                self.assertNotIn(key_val, req.full_url)
+                self.assertNotIn(key_val, raw_body)
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(fake_gemini_api_key, rendered)
+        self.assertNotIn(fake_google_api_key, rendered)
+        support.assert_no_secrets(self, rendered)
 
 
 if __name__ == "__main__":

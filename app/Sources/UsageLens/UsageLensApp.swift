@@ -109,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         closeRestoredSwiftUISettingsWindow()
+        if popover.isShown || (developmentPanel?.isVisible ?? false) {
+            store.refreshIfNeededForExternalAuth(for: ProviderCatalog.agy)
+        }
     }
 
     @objc private func blink() {
@@ -140,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.contentViewController?.view.appearance = appearance
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            store.refreshIfNeededForExternalAuth(for: ProviderCatalog.agy)
         }
     }
 

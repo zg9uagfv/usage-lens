@@ -92,6 +92,19 @@ public final class UsageStore: ObservableObject {
         }
     }
 
+    /// 针对 AGY 等依赖外部 CLI / 钥匙串登录态的厂商：当其当前缺少实时窗口且存在登录态诊断或失败时，
+    /// 在面板重新打开或应用重新激活时触发一次安全重检，不向其他厂商传递任何凭据。
+    public func refreshIfNeededForExternalAuth(for provider: Provider = ProviderCatalog.agy) {
+        guard ProviderCatalog.active.contains(provider) else { return }
+        let current = state(for: provider)
+        guard current.hasLoaded, !current.isMissingProbe, !current.isIncompatibleSchema else { return }
+        let needsReauthRefresh = current.windows.isEmpty
+            && (current.failureReason != nil || !current.warnings.isEmpty || current.accountLabel == nil)
+        if needsReauthRefresh {
+            credentialsDidChange(for: provider)
+        }
+    }
+
     public func stop() {
         loop?.cancel()
         loop = nil

@@ -26,7 +26,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -38,6 +38,7 @@ OFFICIAL_HOST = "daily-cloudcode-pa.googleapis.com"
 LOAD_CODE_ASSIST_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 RETRIEVE_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
 RETRIEVE_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+AGY_USER_AGENT = "antigravity"
 
 OAUTH_TOKEN_HOST = "oauth2.googleapis.com"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -46,9 +47,13 @@ PROACTIVE_REFRESH_SKEW_SECONDS = 60.0
 HTTP_TIMEOUT_SECONDS = 3.0
 HTTP_MAX_BYTES = 1024 * 1024
 
+SECURITY_BIN = "/usr/bin/security"
 KEYCHAIN_TIMEOUT_SECONDS = 2.0
 KEYCHAIN_SERVICE = "gemini"
 KEYCHAIN_ACCOUNT = "antigravity"
+KEYCHAIN_CANDIDATES: Tuple[Tuple[str, str], ...] = (
+    (KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT),
+)
 GO_KEYRING_B64_PREFIX = "go-keyring-base64:"
 
 TAIL_CHUNK_BYTES = 256 * 1024
@@ -58,7 +63,39 @@ TODAY_TOKEN_SCAN_FILES = 50
 LOCAL_AUTH_FILE: Optional[Path] = None
 BRAIN_DIRS: Optional[List[Path]] = None
 
-AUTH_REQUIRED_WARNING = "未检测到本机 AGY 登录态，请先运行 agy 登录以查看 5 小时与 7 天用量"
+AUTH_REQUIRED_WARNING = (
+    "未检测到本机 AGY 登录态（本地凭据文件与钥匙串均未找到），请先运行 agy 登录后刷新以查看实时配额"
+)
+AUTH_DISABLED_WARNING = (
+    "已通过 AGY_DISABLE_LOCAL_AUTH 禁用本机 AGY 登录态检测，当前无法查询 AGY 实时配额"
+)
+AUTH_ISOLATED_HOME_WARNING = (
+    "未检测到本机 AGY 登录态：当前处于隔离主目录环境，已跳过本机登录钥匙串读取；"
+    "请在真实用户环境运行 agy 登录或提供 AGY 凭据后刷新以查看实时配额"
+)
+AUTH_KEYCHAIN_DENIED_WARNING = (
+    "无法访问本机 AGY 钥匙串凭据（访问被拒绝或钥匙串已锁定），"
+    "请解锁登录钥匙串或运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_KEYCHAIN_TIMEOUT_WARNING = (
+    "读取本机 AGY 钥匙串凭据超时，请解锁登录钥匙串或运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_KEYCHAIN_NONZERO_WARNING = (
+    "无法读取本机 AGY 钥匙串凭据（钥匙串查询失败），"
+    "请检查登录钥匙串状态或运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_KEYCHAIN_UNREADABLE_WARNING = (
+    "无法读取本机 AGY 钥匙串凭据，请检查登录钥匙串或运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_KEYCHAIN_MALFORMED_WARNING = (
+    "本机 AGY 钥匙串凭据格式异常，请运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_FILE_UNREADABLE_WARNING = (
+    "无法读取本机 AGY 本地凭据文件，请检查文件权限或运行 agy 重新登录后刷新以查看实时配额"
+)
+AUTH_FILE_MALFORMED_WARNING = (
+    "本机 AGY 本地凭据文件格式异常，请运行 agy 重新登录后刷新以查看实时配额"
+)
 
 WINDOW_SPEC = {
     "5h": {"id": "5h", "label": "5 小时", "window_seconds": 18000},
@@ -69,6 +106,7 @@ _SECRET_PATTERNS = (
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     re.compile(r"ya29\.[A-Za-z0-9._\-]+"),
     re.compile(r"1//[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{16,}"),
     re.compile(r"Bearer\s+\S+", re.IGNORECASE),
     re.compile(r"sk-[A-Za-z0-9_\-]{5,}"),
     re.compile(r"\b(?:api[_-]?key|key|token|secret|password)\b\s*[=:]\s*\S+", re.IGNORECASE),
@@ -221,14 +259,18 @@ def is_official_oauth_url(url: str) -> bool:
 
 def _http_error_reason(code: int, source: str = "local", oauth: bool = False) -> str:
     if oauth and code in (400, 401, 403):
-        return "本机 AGY 登录态已过期或刷新失败（HTTP %d），请先运行 agy 刷新登录态" % code
+        return "本机 AGY 登录态已过期或刷新失败（HTTP %d），请先运行 agy 重新登录后刷新" % code
     prefix = "刷新本机 AGY 登录态失败：" if oauth else ""
     if code in (301, 302, 303, 307, 308):
         return prefix + ("接口返回重定向（HTTP %d），已按安全策略拒绝跟随" % code)
-    if code in (401, 403):
+    if code == 401:
         if source == "local":
-            return "本机 AGY 登录态无效或已过期（HTTP %d），请先运行 agy 刷新登录态" % code
-        return "AGY 凭据无效或已过期（HTTP %d）" % code
+            return "本机 AGY 登录态已过期或认证被拒（HTTP 401），请先运行 agy 重新登录后刷新"
+        return "AGY 凭据无效或已过期（HTTP 401），请更新 AGY 凭据后刷新"
+    if code == 403:
+        if source == "local":
+            return "AGY 服务端拒绝访问（HTTP 403），可能是项目权限、策略或配额资格受限，请检查 AGY 账号权限或运行 agy 重新登录后刷新"
+        return "AGY 服务端拒绝访问（HTTP 403），可能是项目权限、策略或凭据权限受限，请检查配置或更新 AGY 凭据后刷新"
     if code == 429:
         return prefix + "请求被限流（HTTP 429），请稍后重试"
     if 500 <= code < 600:
@@ -292,6 +334,7 @@ def _post_json_with_status(
             "Authorization": "Bearer " + access_token,
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": AGY_USER_AGENT,
         },
         url_validator=is_official_url,
         http_error_formatter=lambda code: _http_error_reason(code, source=source),
@@ -299,6 +342,23 @@ def _post_json_with_status(
 
 
 # ---------------------------------------------------------------- 凭据发现与内存刷新
+
+
+class SourceAttempt(NamedTuple):
+    """单个受支持凭据来源的脱敏探测结果（绝不保存令牌、邮箱、路径、长度或原始 stderr）。"""
+
+    source: str
+    outcome: str
+    detail: Optional[str] = None
+
+
+class AGYCredentialDiscovery(NamedTuple):
+    """AGY 凭据发现过程的结构化脱敏结论。"""
+
+    attempts: Tuple[SourceAttempt, ...]
+    outcome: str
+    selected_source: Optional[str] = None
+    detail: Optional[str] = None
 
 
 def _decode_jwt_payload(token: Any) -> Optional[dict]:
@@ -394,54 +454,198 @@ def _local_auth_file_path() -> Path:
     return Path(env_path) if env_path else Path.home() / ".gemini" / "antigravity-cli" / "auth.json"
 
 
+def _classify_keychain_failure(returncode: int, stderr_text: str) -> str:
+    """将 security find-generic-password 的非零退出归类为脱敏状态码，绝不保留原始 stderr。"""
+    lower = (stderr_text or "").lower()
+    if (
+        returncode == 44
+        or "could not be found in the keychain" in lower
+        or "item could not be found" in lower
+        or "errsecitemnotfound" in lower
+    ):
+        return "missing"
+    if (
+        returncode in (36, 51, 128)
+        or "user interaction is not allowed" in lower
+        or "interaction not allowed" in lower
+        or "errsecinteractionnotallowed" in lower
+        or "errsecauthfailed" in lower
+        or "errsecusercanceled" in lower
+        or "denied" in lower
+        or "canceled" in lower
+        or "cancelled" in lower
+        or "locked" in lower
+        or "authorization" in lower
+    ):
+        return "denied"
+    return "nonzero"
+
+
+def _load_keychain_credentials_with_outcome() -> Tuple[Optional[dict], SourceAttempt]:
+    """只读读取 macOS 登录钥匙串白名单中的 AGY go-keyring 凭据并返回脱敏结果。"""
+    if sys.platform != "darwin":
+        return None, SourceAttempt(source="keychain", outcome="not-applicable")
+    if _is_home_isolated():
+        return None, SourceAttempt(source="keychain", outcome="isolated_home")
+
+    fallback_outcome = "missing"
+    error_priority = {"denied": 5, "timeout": 4, "malformed": 3, "nonzero": 2, "unreadable": 1, "missing": 0}
+
+    for service, account in KEYCHAIN_CANDIDATES:
+        cmd = [
+            SECURITY_BIN, "find-generic-password",
+            "-s", service, "-a", account, "-w",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT_SECONDS, check=False
+            )
+        except subprocess.TimeoutExpired:
+            outcome = "timeout"
+        except (OSError, subprocess.SubprocessError):
+            outcome = "unreadable"
+        else:
+            if completed.returncode == 0:
+                raw = _non_empty_str(completed.stdout)
+                creds = _decode_keyring_payload(raw) if raw else None
+                if creds is not None:
+                    return creds, SourceAttempt(source="keychain", outcome="available")
+                outcome = "malformed"
+            else:
+                outcome = _classify_keychain_failure(completed.returncode, completed.stderr or "")
+
+        if error_priority.get(outcome, 0) > error_priority.get(fallback_outcome, 0):
+            fallback_outcome = outcome
+
+    return None, SourceAttempt(source="keychain", outcome=fallback_outcome)
+
+
 def _load_keychain_credentials() -> Optional[dict]:
-    """只读读取 macOS 登录钥匙串中的 AGY go-keyring 凭据。"""
-    if sys.platform != "darwin" or _is_home_isolated():
-        return None
-    cmd = [
-        "/usr/bin/security", "find-generic-password",
-        "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w",
-    ]
-    try:
-        completed = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT_SECONDS, check=False
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    raw = _non_empty_str(completed.stdout) if completed.returncode == 0 else None
-    return _decode_keyring_payload(raw) if raw else None
+    """兼容旧调用方：仅返回钥匙串凭据或 None。"""
+    creds, _ = _load_keychain_credentials_with_outcome()
+    return creds
 
 
-def _resolve_credentials() -> Optional[dict]:
-    """只读解析 AGY 凭据：AGY_ACCESS_TOKEN > DISABLE 门控 > 本地 auth.json > macOS 钥匙串。"""
+def _discovery_warning(discovery: AGYCredentialDiscovery) -> str:
+    """将脱敏发现结果映射为可执行的 AGY 专属中文提示。"""
+    outcome = discovery.outcome
+    if outcome == "disabled":
+        return AUTH_DISABLED_WARNING
+    if outcome == "isolated_home":
+        return AUTH_ISOLATED_HOME_WARNING
+    if outcome == "denied":
+        return AUTH_KEYCHAIN_DENIED_WARNING
+    if outcome == "timeout":
+        return AUTH_KEYCHAIN_TIMEOUT_WARNING
+    if outcome == "nonzero":
+        return AUTH_KEYCHAIN_NONZERO_WARNING
+    if outcome == "malformed":
+        return AUTH_FILE_MALFORMED_WARNING if discovery.detail == "local_file" else AUTH_KEYCHAIN_MALFORMED_WARNING
+    if outcome == "unreadable":
+        return AUTH_FILE_UNREADABLE_WARNING if discovery.detail == "local_file" else AUTH_KEYCHAIN_UNREADABLE_WARNING
+    return AUTH_REQUIRED_WARNING
+
+
+def _resolve_credentials_with_discovery() -> Tuple[Optional[dict], AGYCredentialDiscovery]:
+    """只读解析 AGY 凭据并保留每一步受支持来源的脱敏结果：
+    AGY_ACCESS_TOKEN > AGY_DISABLE_LOCAL_AUTH=1 > 本地 auth.json > macOS 钥匙串白名单。
+    """
+    attempts: List[SourceAttempt] = []
     env_token = _non_empty_str(os.environ.get("AGY_ACCESS_TOKEN"))
     env_email = _non_empty_str(os.environ.get("AGY_ACCOUNT_EMAIL"))
     env_project = _non_empty_str(os.environ.get("AGY_PROJECT_ID"))
 
     if env_token:
-        return {
-            "source": "manual", "email": env_email, "access_token": env_token,
-            "refresh_token": None, "expiry_epoch": None, "client_id": None,
-            "client_secret": None, "project_id": env_project,
-        }
+        attempts.append(SourceAttempt(source="env", outcome="available"))
+        return (
+            {
+                "source": "manual", "email": env_email, "access_token": env_token,
+                "refresh_token": None, "expiry_epoch": None, "client_id": None,
+                "client_secret": None, "project_id": env_project,
+            },
+            AGYCredentialDiscovery(
+                attempts=tuple(attempts),
+                outcome="available",
+                selected_source="env",
+            ),
+        )
+    attempts.append(SourceAttempt(source="env", outcome="missing"))
 
     if (os.environ.get("AGY_DISABLE_LOCAL_AUTH") or "").strip() == "1":
-        return None
+        attempts.append(SourceAttempt(source="local_file", outcome="disabled"))
+        attempts.append(SourceAttempt(source="keychain", outcome="disabled"))
+        return None, AGYCredentialDiscovery(attempts=tuple(attempts), outcome="disabled")
 
     local: Optional[dict] = None
+    file_attempt: SourceAttempt
     auth_path = _local_auth_file_path()
-    if auth_path.is_file():
-        with contextlib.suppress(OSError, UnicodeDecodeError):
-            local = _decode_keyring_payload(auth_path.read_text(encoding="utf-8"))
+    try:
+        exists = auth_path.exists()
+    except OSError:
+        exists = False
+        file_attempt = SourceAttempt(source="local_file", outcome="unreadable")
+    else:
+        if not exists:
+            file_attempt = SourceAttempt(source="local_file", outcome="missing")
+        elif not auth_path.is_file():
+            file_attempt = SourceAttempt(source="local_file", outcome="unreadable")
+        else:
+            try:
+                raw_text = auth_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                file_attempt = SourceAttempt(source="local_file", outcome="unreadable")
+            else:
+                local = _decode_keyring_payload(raw_text)
+                file_attempt = SourceAttempt(
+                    source="local_file",
+                    outcome="available" if local is not None else "malformed",
+                )
+    attempts.append(file_attempt)
 
-    if local is None:
-        local = _load_keychain_credentials()
-    if local is None:
-        return None
+    if local is not None:
+        local["email"] = env_email or local["email"]
+        local["project_id"] = env_project
+        return local, AGYCredentialDiscovery(
+            attempts=tuple(attempts),
+            outcome="available",
+            selected_source="local_file",
+        )
 
-    local["email"] = env_email or local["email"]
-    local["project_id"] = env_project
-    return local
+    keychain_creds, keychain_attempt = _load_keychain_credentials_with_outcome()
+    attempts.append(keychain_attempt)
+    if keychain_creds is not None:
+        keychain_creds["email"] = env_email or keychain_creds["email"]
+        keychain_creds["project_id"] = env_project
+        return keychain_creds, AGYCredentialDiscovery(
+            attempts=tuple(attempts),
+            outcome="available",
+            selected_source="keychain",
+        )
+
+    if keychain_attempt.outcome in ("denied", "timeout", "malformed", "nonzero", "unreadable"):
+        overall_outcome = keychain_attempt.outcome
+        overall_detail = "keychain"
+    elif file_attempt.outcome in ("malformed", "unreadable"):
+        overall_outcome = file_attempt.outcome
+        overall_detail = "local_file"
+    elif keychain_attempt.outcome == "isolated_home":
+        overall_outcome = "isolated_home"
+        overall_detail = "keychain"
+    else:
+        overall_outcome = "missing"
+        overall_detail = None
+
+    return None, AGYCredentialDiscovery(
+        attempts=tuple(attempts),
+        outcome=overall_outcome,
+        detail=overall_detail,
+    )
+
+
+def _resolve_credentials() -> Optional[dict]:
+    """只读解析 AGY 凭据：AGY_ACCESS_TOKEN > DISABLE 门控 > 本地 auth.json > macOS 钥匙串。"""
+    creds, _ = _resolve_credentials_with_discovery()
+    return creds
 
 
 def _refresh_access_token(creds: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -449,7 +653,7 @@ def _refresh_access_token(creds: dict) -> Tuple[Optional[str], Optional[str]]:
     refresh_token = creds.get("refresh_token")
     client_id = creds.get("client_id")
     if not refresh_token or not client_id:
-        return None, "本机 AGY 登录态已过期，请先运行 agy 刷新登录态"
+        return None, "本机 AGY 登录态已过期，请先运行 agy 重新登录后刷新"
 
     form_fields = {
         "grant_type": "refresh_token",
@@ -799,11 +1003,11 @@ def build_payload() -> dict:
     today_tokens, token_warnings = find_today_tokens(now.astimezone().date())
     usage_obj = {"today_tokens": today_tokens, "source": "local"} if today_tokens is not None else None
 
-    creds = _resolve_credentials()
+    creds, discovery = _resolve_credentials_with_discovery()
     if creds is None:
         payload = _empty_payload(now_iso)
         payload["usage"] = usage_obj
-        payload["warnings"] = _dedupe_redacted([AUTH_REQUIRED_WARNING] + token_warnings)
+        payload["warnings"] = _dedupe_redacted([_discovery_warning(discovery)] + token_warnings)
         return payload
 
     source = creds["source"]

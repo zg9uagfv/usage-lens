@@ -356,6 +356,75 @@ enum Fixtures {
             finishedAt: now
         )
     }
+
+    static func agyMissingAuthReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: nil, plan: nil),
+                windows: [],
+                warnings: ["未检测到本机 AGY 登录态（本地凭据文件与钥匙串均未找到），请先运行 agy 登录后刷新以查看实时配额"]
+            ),
+            finishedAt: Date()
+        )
+    }
+
+    static func agyKeychainDeniedReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: nil, plan: nil),
+                windows: [],
+                warnings: ["无法访问本机 AGY 钥匙串凭据（访问被拒绝或钥匙串已锁定），请解锁登录钥匙串或运行 agy 重新登录后刷新以查看实时配额"]
+            ),
+            finishedAt: Date()
+        )
+    }
+
+    static func agyIsolatedHomeReport() -> ProbeReport {
+        ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: nil, plan: nil),
+                windows: [],
+                warnings: ["未检测到本机 AGY 登录态：当前处于隔离主目录环境，已跳过本机登录钥匙串读取；请在真实用户环境运行 agy 登录或提供 AGY 凭据后刷新以查看实时配额"]
+            ),
+            finishedAt: Date()
+        )
+    }
+
+    static func agyExpiredAuthReport() -> ProbeReport {
+        let message = "查询 AGY 用量失败：本机 AGY 登录态已过期或认证被拒（HTTP 401），请先运行 agy 重新登录后刷新"
+        return ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: "agy.user@example.com", plan: nil),
+                windows: [],
+                error: message
+            ),
+            failure: message,
+            finishedAt: Date()
+        )
+    }
+
+    static func agyForbidden403Report() -> ProbeReport {
+        let message = "查询 AGY 用量失败：AGY 服务端拒绝访问（HTTP 403），可能是项目权限、策略或配额资格受限，请检查 AGY 账号权限或运行 agy 重新登录后刷新"
+        return ProbeReport(
+            provider: ProviderCatalog.agy,
+            envelope: ProbeEnvelope(
+                provider: "agy",
+                account: ProbeAccount(label: "agy.user@example.com", plan: nil),
+                windows: [],
+                error: message
+            ),
+            failure: message,
+            finishedAt: Date()
+        )
+    }
 }
 
 // MARK: - 离屏渲染
@@ -1079,5 +1148,88 @@ final class PanelRenderTests: XCTestCase {
                 assertNonBlankImage(settingsImg, context: "settings-agy-active-\(theme.rawValue)-\(label)")
             }
         }
+    }
+
+    /// 验收 AGY 认证诊断空态（missing / denied / isolated / expired）渲染与文案隔离：
+    /// 1. 明确命名 AGY 并给出可执行操作，绝不提示用户去 Gemini 配置填令牌；
+    /// 2. 不含合成密钥痕迹；
+    /// 3. 外部认证态变化触发 AGY 刷新时不干扰 Gemini 已加载数据。
+    func testAgyDiagnosticEmptyStatesRenderActionablyWithoutGeminiGuidance() async throws {
+        let metrics = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 900),
+            physicalSizeMM: CGSize(width: 286, height: 179)
+        )
+        let panelSize = CGSize(width: metrics.panelWidth, height: metrics.scaledDimension(340, minimum: 280))
+
+        let cases: [(name: String, report: ProbeReport, expectedStatus: ProviderStatus)] = [
+            ("22-panel-agy-missing", Fixtures.agyMissingAuthReport(), .warning),
+            ("23-panel-agy-denied", Fixtures.agyKeychainDeniedReport(), .warning),
+            ("24-panel-agy-isolated", Fixtures.agyIsolatedHomeReport(), .warning),
+            ("25-panel-agy-expired", Fixtures.agyExpiredAuthReport(), .failed),
+            ("26-panel-agy-forbidden-403", Fixtures.agyForbidden403Report(), .failed),
+        ]
+
+        for item in cases {
+            let store = makeStore(
+                SequencedProbeProvider([
+                    ProviderCatalog.agy: [item.report],
+                    ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport()],
+                ]),
+                selected: ProviderCatalog.agy
+            )
+            await store.refreshAll()
+            let state = store.state(for: ProviderCatalog.agy)
+            XCTAssertEqual(state.status, item.expectedStatus, item.name)
+            XCTAssertTrue(state.windows.isEmpty, item.name)
+
+            let combinedText = ([state.failureReason].compactMap { $0 } + state.warnings).joined(separator: " ")
+            XCTAssertTrue(combinedText.contains("AGY"), "\(item.name) must name AGY")
+            XCTAssertFalse(combinedText.contains("Gemini"), "\(item.name) must not direct users to Gemini settings")
+            XCTAssertFalse(combinedText.contains("请先在配置中提供"), "\(item.name) must not direct users to manual Gemini config")
+            XCTAssertFalse(combinedText.contains("ya29."), "\(item.name) must not leak access tokens")
+            XCTAssertFalse(combinedText.contains("1//"), "\(item.name) must not leak refresh tokens")
+
+            let (_, img) = try renderHosted(
+                PanelView(store: store).environment(\.displayScaleMetrics, metrics),
+                size: panelSize,
+                appearance: NSAppearance(named: .aqua),
+                named: item.name
+            )
+            assertNonBlankImage(img, context: item.name)
+
+            // Gemini 既有配额显示保持完整不受影响
+            let geminiState = store.state(for: ProviderCatalog.gemini)
+            XCTAssertEqual(geminiState.status, .ok)
+            XCTAssertEqual(geminiState.windows.map(\.id), ["5h", "7d"])
+        }
+    }
+
+    func testRefreshIfNeededForExternalAuthRefreshesAgyWithoutDisturbingGemini() async {
+        let gated = GatedProbeProvider([
+            ProviderCatalog.agy: [Fixtures.agyKeychainDeniedReport(), Fixtures.agyLiveReport()],
+            ProviderCatalog.gemini: [Fixtures.geminiConfiguredReport(), Fixtures.geminiConfiguredReport()],
+            ProviderCatalog.codex: [Fixtures.codexReport(), Fixtures.codexReport()],
+        ])
+        let store = makeStore(gated, selected: ProviderCatalog.agy)
+
+        await store.refreshAll()
+        XCTAssertEqual(store.state(for: ProviderCatalog.agy).status, .warning)
+        XCTAssertTrue(store.state(for: ProviderCatalog.agy).windows.isEmpty)
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).status, .ok)
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).windows.map(\.id), ["5h", "7d"])
+
+        // 触发外部认证重检：AGY 立即刷新拿到 5h/7d，Gemini 状态保持健康
+        store.refreshIfNeededForExternalAuth(for: ProviderCatalog.agy)
+        for _ in 0..<40 {
+            if !store.isRefreshing && store.state(for: ProviderCatalog.agy).windows.count == 2 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        XCTAssertEqual(store.state(for: ProviderCatalog.agy).status, .ok)
+        XCTAssertEqual(store.state(for: ProviderCatalog.agy).windows.map(\.id), ["5h", "7d"])
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).status, .ok)
+        XCTAssertEqual(store.state(for: ProviderCatalog.gemini).windows.map(\.id), ["5h", "7d"])
     }
 }

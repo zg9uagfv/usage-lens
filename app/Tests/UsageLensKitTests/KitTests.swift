@@ -525,105 +525,136 @@ final class BlockingStateTests: XCTestCase {
     }
 }
 
-final class ProbeProcessDrainTests: XCTestCase {
-    /// 审查实测：200KB stderr 会在旧实现里死锁。这里跑 1MB stdout + 200KB stderr。
-    func testLargeOutputIsFullyDrainedWithoutTimeout() async throws {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/process-tests", isDirectory: true)
-        let probes = root.appendingPathComponent("probes", isDirectory: true)
-        try FileManager.default.createDirectory(at: probes, withIntermediateDirectories: true)
-
-        let script = probes.appendingPathComponent("big.py")
-        let json = #"{"schema": "usage-lens/probe@1", "provider": "codex", "windows": [{"id": "5h", "used_percent": 21, "window_seconds": 18000, "resets_at": "2099-01-01T00:00:00Z", "basis": "server"}]}"#
-        let scriptText = """
-        import sys
-        sys.stdout.write('\(json)' + ' ' * (1024 * 1024))
-        sys.stdout.flush()
-        sys.stderr.write('E' * (200 * 1024))
-        sys.stderr.flush()
-        """
-        try scriptText.write(to: script, atomically: true, encoding: .utf8)
-
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/big.py")
-        let runner = ProbeRunner(root: root, timeout: 5)
-
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
-
-        XCTAssertNil(report.failure)
-        XCTAssertEqual(report.envelope?.windows.first?.usedPercent, 21)
-        XCTAssertLessThan(elapsed, 4.0, "大输出不该走到超时")
-
-        switch await runner.execute(probe: script, workingDirectory: root, timeout: 5) {
-        case .output(let output):
-            XCTAssertFalse(output.timedOut)
-            XCTAssertGreaterThanOrEqual(output.stdout.count, 1024 * 1024, "stdout 必须读完整")
-            XCTAssertGreaterThanOrEqual(output.stderr.count, 200 * 1024, "stderr 必须读完整")
-        case .failedToStart(let message):
-            XCTFail("探针启动失败：\(message)")
-        }
+final class NativeProbeRuntimeTests: XCTestCase {
+    func testPinnedHTTPSURLValidation() {
+        XCTAssertTrue(NativeProbeSupport.isPinnedHTTPSURLString("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", expectedHost: "daily-cloudcode-pa.googleapis.com"))
+        XCTAssertTrue(NativeProbeSupport.isPinnedHTTPSURLString("https://cloudcode-pa.googleapis.com:443/v1internal:retrieveUserQuota", expectedHost: "cloudcode-pa.googleapis.com"))
+        XCTAssertFalse(NativeProbeSupport.isPinnedHTTPSURLString("http://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", expectedHost: "cloudcode-pa.googleapis.com"))
+        XCTAssertFalse(NativeProbeSupport.isPinnedHTTPSURLString("https://cloudcode-pa.googleapis.com:8443/x", expectedHost: "cloudcode-pa.googleapis.com"))
+        XCTAssertFalse(NativeProbeSupport.isPinnedHTTPSURLString("https://evil@cloudcode-pa.googleapis.com/x", expectedHost: "cloudcode-pa.googleapis.com"))
+        XCTAssertFalse(NativeProbeSupport.isPinnedHTTPSURLString("https://cloudcode-pa.googleapis.com.evil.com/x", expectedHost: "cloudcode-pa.googleapis.com"))
     }
-}
 
-final class ProbeProcessWatchdogTests: XCTestCase {
-    private func makeRoot() throws -> URL {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".cache/watchdog-tests", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("probes", isDirectory: true),
-            withIntermediateDirectories: true
+    func testCodexNativeProbeLiveFallbackAndTodayTokens() async throws {
+        let fm = FileManager.default
+        let tempHome = fm.temporaryDirectory.appendingPathComponent("usage-lens-codex-native-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = tempHome.appendingPathComponent(".codex/sessions", isDirectory: true)
+        try fm.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempHome) }
+
+        let now = Date()
+        let iso = ISO8601DateFormatter().string(from: now)
+        let futureEpoch = Int(now.addingTimeInterval(7200).timeIntervalSince1970)
+        let rollout = """
+        {"timestamp":"\(iso)","type":"token_usage_record","payload":{"usage":{"total_tokens":1200}}}
+        {"timestamp":"\(iso)","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":32,"window_minutes":300,"resets_at":\(futureEpoch)},"secondary":{"used_percent":14,"window_minutes":10080,"resets_at":\(futureEpoch + 86400)},"plan_type":"plus"}}}
+        """
+        try rollout.write(to: sessionsDir.appendingPathComponent("rollout-2026-11-22.jsonl"), atomically: true, encoding: .utf8)
+
+        // 1. Live 200 success
+        let liveBody = try JSONSerialization.data(withJSONObject: [
+            "plan_type": "pro",
+            "rate_limit": [
+                "primary_window": ["used_percent": 45, "limit_window_seconds": 18_000, "reset_at": futureEpoch],
+                "secondary_window": ["used_percent": 20, "limit_window_seconds": 604_800, "reset_at": futureEpoch + 86_400],
+            ],
+        ])
+        let liveTransport = MockNativeHTTPTransport(responses: [
+            .success(NativeHTTPResponse(statusCode: 200, finalURL: CodexNativeProbe.usageURL, body: liveBody)),
+        ])
+        let liveReport = await CodexNativeProbe(transport: liveTransport).run(
+            environment: [
+                "HOME": tempHome.path,
+                "CODEX_ACCESS_TOKEN": "sk-synthetic-codex-token",
+                "CODEX_ACCOUNT_EMAIL": "codex@example.com",
+            ],
+            now: now
         )
-        return root
+        XCTAssertNil(liveReport.failure)
+        XCTAssertEqual(liveReport.envelope?.account?.label, "codex@example.com")
+        XCTAssertEqual(liveReport.envelope?.account?.plan, "pro")
+        XCTAssertEqual(liveReport.envelope?.windows.first(where: { $0.id == "5h" })?.usedPercent, 45)
+        XCTAssertEqual(liveReport.envelope?.usage?.todayTokens, 1200)
+
+        // 2. Live 302 redirect rejected -> graceful fallback to local rollout log
+        let redirectTransport = MockNativeHTTPTransport(responses: [
+            .failure(NativeHTTPError.redirected(statusCode: 302)),
+        ])
+        let fallbackReport = await CodexNativeProbe(transport: redirectTransport).run(
+            environment: [
+                "HOME": tempHome.path,
+                "CODEX_ACCESS_TOKEN": "sk-synthetic-codex-token",
+            ],
+            now: now
+        )
+        XCTAssertNil(fallbackReport.failure)
+        XCTAssertEqual(fallbackReport.envelope?.windows.first(where: { $0.id == "5h" })?.usedPercent, 32)
+        XCTAssertTrue(fallbackReport.warnings.contains { $0.contains("拒绝跟随") })
     }
 
-    /// 探针 fork 的子进程持有管道：report() 必须 ~3s 内返回并判失败，不能等 20s。
-    func testChildHoldingPipeDoesNotHang() async throws {
-        let root = try makeRoot()
-        let script = root.appendingPathComponent("probes/leaky.py")
-        let json = #"{"schema":"usage-lens/probe@1","provider":"codex","windows":[{"id":"5h","used_percent":21,"basis":"server"}]}"#
-        let text = """
-        import subprocess, sys
-        subprocess.Popen(["sleep", "20"])  # 继承 stdout/stderr，退出后仍持有管道
-        sys.stdout.write('\(json)')
-        sys.stdout.flush()
-        sys.stderr.write("helper spawned\\n")
-        sys.stderr.flush()
-        """
-        try text.write(to: script, atomically: true, encoding: .utf8)
+    func testDeepSeekNativeProbeNoKeyBalanceAndProjcacheSpend() async throws {
+        let fm = FileManager.default
+        let tempHome = fm.temporaryDirectory.appendingPathComponent("usage-lens-deepseek-native-\(UUID().uuidString)", isDirectory: true)
+        let projDir = tempHome.appendingPathComponent(".dsh/storages/session_projcache/sessions", isDirectory: true)
+        try fm.createDirectory(at: projDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempHome) }
 
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/leaky.py")
-        let runner = ProbeRunner(root: root, timeout: 5)
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
+        let now = Date()
+        let createdMs = Int(now.timeIntervalSince1970 * 1000)
+        let projData = try JSONSerialization.data(withJSONObject: [
+            "record": [
+                "identity": ["createdAt": createdMs],
+                "rows": [
+                    "tokenUsage": [
+                        "val": [
+                            "totals": [
+                                "uncachedInputTokens": 100_000,
+                                "cacheReadTokens": 500_000,
+                                "outputTokens": 50_000,
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])
+        try projData.write(to: projDir.appendingPathComponent("sess-1.json"))
 
-        XCTAssertLessThan(elapsed, 4.0, "不能等子进程退出")
-        XCTAssertNotNil(report.failure)
-        XCTAssertTrue(report.failure?.contains("未正常关闭") ?? false, report.failure ?? "nil")
-        XCTAssertNil(report.envelope)
+        // 1. No API key -> zero network calls, balance nil, warning + local spend
+        let noKeyTransport = MockNativeHTTPTransport()
+        let noKeyReport = await DeepSeekNativeProbe(transport: noKeyTransport).run(
+            environment: ["HOME": tempHome.path],
+            now: now
+        )
+        XCTAssertTrue(noKeyTransport.calls.isEmpty)
+        XCTAssertNil(noKeyReport.envelope?.balance)
+        XCTAssertEqual(noKeyReport.envelope?.windows, [])
+        XCTAssertTrue(noKeyReport.warnings.contains { $0.contains("余额需要 API key") })
+        XCTAssertNotNil(noKeyReport.envelope?.spend?.today)
+
+        // 2. With API key -> official balance 200
+        let balBody = try JSONSerialization.data(withJSONObject: [
+            "balance_infos": [["currency": "CNY", "total_balance": "12.34"]],
+        ])
+        let okTransport = MockNativeHTTPTransport(responses: [
+            .success(NativeHTTPResponse(statusCode: 200, finalURL: DeepSeekNativeProbe.balanceURL, body: balBody)),
+        ])
+        let okReport = await DeepSeekNativeProbe(transport: okTransport).run(
+            environment: ["HOME": tempHome.path, "DEEPSEEK_API_KEY": "sk-synthetic-deepseek-12345"],
+            now: now
+        )
+        XCTAssertEqual(okReport.envelope?.balance?.amount, 12.34)
+        XCTAssertEqual(okReport.envelope?.balance?.currency, "CNY")
+        XCTAssertEqual(okReport.envelope?.balance?.source, "official")
     }
 
-    /// 死循环输出：必须被 8MB/流上限拦住并 kill，不能把内存吃穿。
-    func testInfiniteOutputIsCapped() async throws {
-        let root = try makeRoot()
-        let script = root.appendingPathComponent("probes/flood.py")
-        let text = """
-        import sys
-        while True:
-            sys.stdout.write("x" * 65536)
-            sys.stdout.flush()
-        """
-        try text.write(to: script, atomically: true, encoding: .utf8)
-
-        let provider = Provider(id: "codex", displayName: "Codex", probeRelativePath: "probes/flood.py")
-        let runner = ProbeRunner(root: root, timeout: 10)
-        let started = Date()
-        let report = await runner.report(for: provider)
-        let elapsed = Date().timeIntervalSince(started)
-
-        XCTAssertLessThan(elapsed, 6.0, "超限必须立刻终止，不靠超时")
-        XCTAssertTrue(report.failure?.contains("输出超限") ?? false, report.failure ?? "nil")
+    func testOpenCodeNativeProbeReturnsMissingWithoutPython() async {
+        let runner = ProbeRunner(
+            deepSeekAPIKeyLoader: { nil },
+            geminiAccountLoader: { nil },
+            baseEnvironmentProvider: { [:] }
+        )
+        let report = await runner.report(for: ProviderCatalog.opencode)
+        XCTAssertTrue(report.isMissingProbe)
         XCTAssertNil(report.envelope)
     }
 }

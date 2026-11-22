@@ -30,7 +30,13 @@ public struct PanelView: View {
         return VStack(spacing: 0) {
             ProviderTabBar(store: store)
             Divider().opacity(0.35)
-            ProviderDetailView(state: store.state(for: store.selected), showSettings: showSettings)
+            ProviderDetailView(
+                state: store.state(for: store.selected),
+                showSettings: showSettings,
+                refreshProvider: { provider in
+                    store.credentialsDidChange(for: provider)
+                }
+            )
                 .padding(.horizontal, metrics.scaledSpacing(14))
                 .padding(.top, metrics.scaledSpacing(12))
                 .padding(.bottom, metrics.scaledSpacing(14))
@@ -114,9 +120,35 @@ struct ProviderTabBar: View {
 struct ProviderDetailView: View {
     let state: ProviderState
     var showSettings: () -> Void = {}
+    var refreshProvider: (Provider) -> Void = { _ in }
     @Environment(\.displayScaleMetrics) private var metrics
 
     private var isDimmed: Bool { state.isDimmed }
+
+    private var isAgyProvider: Bool {
+        state.provider.id == ProviderCatalog.agy.id
+    }
+
+    private var agyAuthDiagnosticWarning: String? {
+        guard isAgyProvider else { return nil }
+        return state.visibleWarnings.first { warning in
+            warning.contains("AGY") && (
+                warning.contains("登录态")
+                || warning.contains("钥匙串")
+                || warning.contains("凭据")
+            )
+        }
+    }
+
+    private var isAgyAuthEmptyState: Bool {
+        isAgyProvider
+            && state.hasLoaded
+            && !state.isMissingProbe
+            && !state.isIncompatibleSchema
+            && state.windows.isEmpty
+            && !hasMetrics
+            && (state.failureReason != nil || agyAuthDiagnosticWarning != nil || state.accountLabel == nil)
+    }
 
     private var needsAccountConfiguration: Bool {
         state.provider.requiresAccount
@@ -130,8 +162,13 @@ struct ProviderDetailView: View {
     }
 
     private var displayedWarnings: [String] {
-        guard needsAccountConfiguration else { return state.visibleWarnings }
-        return state.visibleWarnings.filter { !$0.contains("请先在配置中提供") }
+        if needsAccountConfiguration {
+            return state.visibleWarnings.filter { !$0.contains("请先在配置中提供") }
+        }
+        if isAgyAuthEmptyState, let diagnostic = agyAuthDiagnosticWarning {
+            return state.visibleWarnings.filter { $0 != diagnostic }
+        }
+        return state.visibleWarnings
     }
 
     var body: some View {
@@ -177,7 +214,7 @@ struct ProviderDetailView: View {
     // 账号 + plan
     private var header: some View {
         HStack(spacing: metrics.scaledSpacing(6)) {
-            Text(state.accountLabel ?? "未提供账号")
+            Text(state.accountLabel ?? (isAgyProvider ? "未检测到 AGY 账号" : "未提供账号"))
                 .font(metrics.font(11.5, weight: .medium))
                 .foregroundStyle(state.accountLabel == nil ? Color.secondary : Color.primary)
                 .lineLimit(1)
@@ -223,28 +260,31 @@ struct ProviderDetailView: View {
         }
     }
 
-    // 没有窗口概念的服务（例如 DeepSeek）：不画进度条，只说明。
+    // 没有窗口概念的服务（例如 DeepSeek）或 AGY 缺少实时配额时，不画进度条，只说明。
     private var noWindowCaption: some View {
         HStack(spacing: metrics.scaledSpacing(5)) {
-            Image(systemName: "minus.circle").font(metrics.font(10))
-            Text("该服务无窗口配额").font(metrics.font(11))
+            Image(systemName: isAgyProvider ? "person.crop.circle.badge.exclamationmark" : "minus.circle")
+                .font(metrics.font(10))
+            Text(isAgyProvider ? "暂无 AGY 实时窗口配额（需本机 AGY 登录态）" : "该服务无窗口配额")
+                .font(metrics.font(11))
             Spacer(minLength: 0)
         }
         .foregroundStyle(.secondary)
     }
 
     private var emptyTile: some View {
-        VStack(spacing: metrics.scaledSpacing(6)) {
-            Image(systemName: needsAccountConfiguration ? "person.crop.circle.badge.exclamationmark" : "chart.bar.xaxis")
+        let isActionableAuth = needsAccountConfiguration || isAgyAuthEmptyState
+        return VStack(spacing: metrics.scaledSpacing(6)) {
+            Image(systemName: isActionableAuth ? "person.crop.circle.badge.exclamationmark" : "chart.bar.xaxis")
                 .font(metrics.font(18, weight: .regular))
-                .foregroundStyle(needsAccountConfiguration ? Color.secondary : Color.secondary.opacity(0.6))
+                .foregroundStyle(isActionableAuth ? Color.secondary : Color.secondary.opacity(0.6))
             Text(emptyTitle)
                 .font(metrics.font(12.5, weight: .semibold))
-                .foregroundStyle(needsAccountConfiguration ? .primary : .secondary)
+                .foregroundStyle(isActionableAuth ? .primary : .secondary)
             if let reason = emptyReason {
                 Text(reason)
                     .font(metrics.font(10.5))
-                    .foregroundStyle(needsAccountConfiguration ? .secondary : .tertiary)
+                    .foregroundStyle(isActionableAuth ? .secondary : .tertiary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -263,6 +303,21 @@ struct ProviderDetailView: View {
                 .buttonStyle(.plain)
                 .padding(.top, metrics.scaledSpacing(4))
                 .accessibilityLabel("前往配置 \(state.provider.displayName) 账号")
+            } else if isAgyAuthEmptyState {
+                Button {
+                    refreshProvider(state.provider)
+                } label: {
+                    Text("重新检测 AGY")
+                        .font(metrics.font(11, weight: .semibold))
+                        .padding(.horizontal, metrics.scaledSpacing(12))
+                        .padding(.vertical, metrics.scaledSpacing(5))
+                        .background(Capsule().fill(Color.accentColor.opacity(0.16)))
+                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, metrics.scaledSpacing(4))
+                .accessibilityLabel("重新检测 AGY 登录态并刷新")
             }
         }
         .frame(maxWidth: .infinity)
@@ -277,6 +332,23 @@ struct ProviderDetailView: View {
         }
         if needsAccountConfiguration {
             return "需要提供 \(state.provider.displayName) 账号"
+        }
+        if isAgyAuthEmptyState {
+            if let failure = state.failureReason {
+                if failure.contains("HTTP 403") {
+                    return "AGY 访问被服务端拒绝"
+                }
+                return "AGY 登录态已过期或不可用"
+            }
+            if let warning = agyAuthDiagnosticWarning {
+                if warning.contains("隔离") {
+                    return "AGY 登录态检测已跳过"
+                }
+                if warning.contains("钥匙串") && !warning.contains("未找到") {
+                    return "无法读取 AGY 钥匙串凭据"
+                }
+            }
+            return "未检测到 AGY 登录态"
         }
         return "无数据"
     }
@@ -296,6 +368,10 @@ struct ProviderDetailView: View {
         guard state.hasLoaded else { return "正在读取探针" }
         if needsAccountConfiguration {
             return "请在配置中提供 \(state.provider.displayName) 账号，以查看 5 小时与 7 天使用量"
+        }
+        if isAgyAuthEmptyState {
+            return agyAuthDiagnosticWarning
+                ?? "请先通过 AGY 登录或解锁登录钥匙串，然后点击重新检测以查看 5 小时与 7 天使用量"
         }
         return "探针没有返回窗口数据"
     }
