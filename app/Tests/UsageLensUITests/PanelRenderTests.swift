@@ -1232,4 +1232,204 @@ final class PanelRenderTests: XCTestCase {
         XCTAssertEqual(store.state(for: ProviderCatalog.gemini).status, .ok)
         XCTAssertEqual(store.state(for: ProviderCatalog.gemini).windows.map(\.id), ["5h", "7d"])
     }
+
+    /// 验收 UI 层面的首次使用与登录指导文案：
+    /// 1. 直接断言 ProviderDetailView / FooterBar / SettingsPanelView / AboutPanelView 的实际可见 UI 文案，
+    ///    覆盖 AGY (missing/denied/isolated/expired/403 + local-only)、Gemini (未配置/CLI/手动覆盖)、
+    ///    Codex/OpenCode/DeepSeek、升级添加 AGY 指引及关于页；
+    /// 2. 强制确保所有 AGY 空态可见文案均含 `agy acp --login`、无 `Gemini`、无 `agy login`、无钥匙串内部 service 名；
+    /// 3. 在 3 主题 × 4 显示档位下渲染新增指引与关于页，确认滚动与布局正常。
+    func testUserUsageGuidanceCopyAndHostedRenderAcrossThemesAndScales() async throws {
+        // 1. AGY 空态（missing / denied / isolated / expired / 403）实际 UI 文案
+        let agyReports: [(String, ProbeReport)] = [
+            ("missing", Fixtures.agyMissingAuthReport()),
+            ("denied", Fixtures.agyKeychainDeniedReport()),
+            ("isolated", Fixtures.agyIsolatedHomeReport()),
+            ("expired", Fixtures.agyExpiredAuthReport()),
+            ("forbidden403", Fixtures.agyForbidden403Report()),
+        ]
+        for (name, report) in agyReports {
+            let store = makeStore(
+                SequencedProbeProvider([ProviderCatalog.agy: [report]]),
+                selected: ProviderCatalog.agy
+            )
+            await store.refreshAll()
+            let detail = ProviderDetailView(state: store.state(for: ProviderCatalog.agy))
+            let uiText = [detail.emptyTitle, detail.emptyReason ?? "", detail.emptyGuidanceHint ?? ""].joined(separator: " ")
+
+            XCTAssertTrue(uiText.contains("AGY"), "AGY(\(name)) UI 应明确命名 AGY")
+            XCTAssertTrue(uiText.contains("agy acp --login"), "AGY(\(name)) UI 应给出有效登录命令 agy acp --login")
+            XCTAssertTrue(uiText.contains("无需手动复制 OAuth token"), "AGY(\(name)) UI 应说明无需手动复制 token")
+            XCTAssertTrue(uiText.contains("重新检测 AGY"), "AGY(\(name)) UI 应提示重新检测步骤")
+            XCTAssertFalse(uiText.localizedCaseInsensitiveContains("gemini"), "AGY(\(name)) 空态 UI 不得出现 Gemini 指导或内部 service 名")
+            XCTAssertFalse(uiText.contains("agy login"), "AGY(\(name)) UI 不得出现无效命令 agy login")
+            XCTAssertFalse(uiText.contains("前往配置"), "AGY(\(name)) UI 不得引导去手动账号配置")
+        }
+
+        // AGY 有本地今日 tokens 但无实时配额：保留本地数据与无 Gemini 提示
+        let agyLocalStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.agy: [Fixtures.agyOfflineLocalTokensReport()]]),
+            selected: ProviderCatalog.agy
+        )
+        await agyLocalStore.refreshAll()
+        let agyLocalDetail = ProviderDetailView(state: agyLocalStore.state(for: ProviderCatalog.agy))
+        XCTAssertTrue(agyLocalDetail.noWindowText.contains("agy acp --login"))
+        XCTAssertFalse(agyLocalDetail.noWindowText.localizedCaseInsensitiveContains("gemini"))
+        XCTAssertEqual(agyLocalStore.state(for: ProviderCatalog.agy).envelope?.usage?.todayTokens, 320_000)
+
+        // 2. Gemini 未配置空态实际 UI 文案：优先 gemini 浏览器登录 + 自动复用 + AGY 切换/升级指引 + 可选高级覆盖
+        let geminiStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.gemini: [Fixtures.geminiNeedsAccountReport()]]),
+            selected: ProviderCatalog.gemini
+        )
+        await geminiStore.refreshAll()
+        let geminiDetail = ProviderDetailView(state: geminiStore.state(for: ProviderCatalog.gemini))
+        let geminiUIText = [geminiDetail.emptyTitle, geminiDetail.emptyReason ?? "", geminiDetail.emptyGuidanceHint ?? ""].joined(separator: " ")
+        XCTAssertTrue(geminiUIText.contains("gemini"), "Gemini 空态应提示终端运行 gemini")
+        XCTAssertTrue(geminiUIText.contains("浏览器 Google 登录"), "Gemini 空态应提示浏览器 Google 登录")
+        XCTAssertTrue(geminiUIText.contains("~/.gemini/oauth_creds.json"), "Gemini 空态应说明自动复用路径")
+        XCTAssertTrue(geminiUIText.contains("刷新"), "Gemini 空态应提示登录后刷新")
+        XCTAssertTrue(geminiUIText.contains("AGY"), "Gemini 空态应提醒 Antigravity 用户切到 AGY")
+        XCTAssertTrue(geminiUIText.contains("添加模型厂商 → 添加 AGY"), "Gemini 空态应给出缺少 AGY 时的恢复路径")
+        XCTAssertTrue(geminiUIText.contains("可选高级手动覆盖"), "Gemini 空态应将手动配置标注为可选高级覆盖")
+
+        // 3. Codex / OpenCode / DeepSeek 空态与页脚帮助文案
+        let codexEmptyStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.codex: [Fixtures.emptyCodexReport()]]),
+            selected: ProviderCatalog.codex
+        )
+        await codexEmptyStore.refreshAll()
+        XCTAssertTrue((ProviderDetailView(state: codexEmptyStore.state(for: ProviderCatalog.codex)).emptyReason ?? "").contains("codex"))
+
+        let opencodeMissing = await OpenCodeNativeProbe().run(environment: [:])
+        let opencodeStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.opencode: [opencodeMissing]]),
+            selected: ProviderCatalog.opencode
+        )
+        await opencodeStore.refreshAll()
+        let opencodeDetail = ProviderDetailView(state: opencodeStore.state(for: ProviderCatalog.opencode))
+        XCTAssertTrue(opencodeStore.state(for: ProviderCatalog.opencode).isMissingProbe)
+        XCTAssertTrue(opencodeDetail.emptyTitle.contains("暂未接入原生用量探针"))
+        let opencodeReason = opencodeDetail.emptyReason ?? ""
+        XCTAssertTrue(opencodeReason.contains("预留标签"))
+        XCTAssertTrue(opencodeReason.contains("无需填写 token"))
+        XCTAssertTrue(opencodeReason.contains("配置"))
+        XCTAssertFalse(opencodeReason.contains("probes/opencode.py"), "OpenCode 真实占位态不应提示过时的 Python 探针路径")
+
+        let deepseekEmpty = ProbeReport(
+            provider: ProviderCatalog.deepseek,
+            envelope: ProbeEnvelope(provider: "deepseek", windows: []),
+            finishedAt: Date()
+        )
+        let deepseekStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.deepseek: [deepseekEmpty]]),
+            selected: ProviderCatalog.deepseek
+        )
+        await deepseekStore.refreshAll()
+        let deepseekReason = ProviderDetailView(state: deepseekStore.state(for: ProviderCatalog.deepseek)).emptyReason ?? ""
+        XCTAssertTrue(deepseekReason.contains("API Key"))
+        XCTAssertTrue(deepseekReason.contains("估算"))
+
+        XCTAssertTrue(FooterBar.refreshHelpText.contains("刷新"))
+        XCTAssertTrue(FooterBar.settingsHelpText.contains("添加模型厂商"))
+        XCTAssertTrue(FooterBar.settingsHelpText.contains("使用说明"))
+
+        // 4. 配置页使用说明 + Gemini 三态与高级覆盖文案 + 关于页五厂商范围
+        let settingsGuideText = ([SettingsPanelView.usageGuideHeadline] + SettingsPanelView.usageGuideItems.map { "\($0.title) \($0.detail)" }).joined(separator: "\n")
+        XCTAssertTrue(settingsGuideText.contains("agy acp --login"))
+        XCTAssertTrue(settingsGuideText.contains("添加模型厂商 → 添加 AGY"))
+        XCTAssertTrue(settingsGuideText.contains("~/.gemini/oauth_creds.json"))
+        XCTAssertTrue(settingsGuideText.contains("codex"))
+        XCTAssertTrue(settingsGuideText.contains("OpenCode"))
+        XCTAssertTrue(settingsGuideText.contains("预留标签"))
+        XCTAssertTrue(settingsGuideText.contains("原生用量探针尚未接入"))
+        XCTAssertTrue(settingsGuideText.contains("DeepSeek"))
+        XCTAssertTrue(settingsGuideText.contains("估算"))
+        XCTAssertFalse(settingsGuideText.contains("agy login"))
+
+        XCTAssertTrue(SettingsPanelView.geminiLocalAutoReuseSummary.contains("gemini"))
+        XCTAssertTrue(SettingsPanelView.geminiLocalAutoReuseSummary.contains("~/.gemini/oauth_creds.json"))
+        XCTAssertTrue(SettingsPanelView.geminiManualOverrideHeading.contains("可选高级手动覆盖"))
+        XCTAssertTrue(SettingsPanelView.geminiManualOverrideHeading.contains("勿填入 API Key"))
+        XCTAssertTrue(SettingsPanelView.geminiManualOverrideCaption.contains("Google Cloud Project ID"))
+
+        for providerName in ["Codex", "AGY", "Gemini", "OpenCode", "DeepSeek"] {
+            XCTAssertTrue(AboutPanelView.productSummary.contains(providerName), "关于页产品范围应包含 \(providerName)")
+        }
+
+        // 5. 跨 3 主题 × 4 显示档位验证实际托管渲染（About + 新增指导后的 Settings 滚动 + AGY/Gemini 空态）
+        let previousTheme = UserDefaults.standard.string(forKey: "usageLens.theme")
+        defer {
+            if let previousTheme {
+                UserDefaults.standard.set(previousTheme, forKey: "usageLens.theme")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "usageLens.theme")
+            }
+        }
+        let launchAtLogin = LaunchAtLoginManager()
+        let profiles: [(String, DisplayScaleMetrics)] = [
+            ("compact", DisplayScaleMetrics.make(displaySize: CGSize(width: 1024, height: 768))),
+            ("standard", DisplayScaleMetrics.make(displaySize: CGSize(width: 1440, height: 900), physicalSizeMM: CGSize(width: 286, height: 179))),
+            ("comfortable", DisplayScaleMetrics.make(displaySize: CGSize(width: 1728, height: 1117), physicalSizeMM: CGSize(width: 345, height: 223))),
+            ("large", DisplayScaleMetrics.make(displaySize: CGSize(width: 1920, height: 1080), visibleSize: CGSize(width: 1920, height: 1020), physicalSizeMM: CGSize(width: 597, height: 336))),
+        ]
+        let agyMissingStore = makeStore(
+            SequencedProbeProvider([ProviderCatalog.agy: [Fixtures.agyMissingAuthReport()]]),
+            selected: ProviderCatalog.agy
+        )
+        await agyMissingStore.refreshAll()
+
+        for theme in UsageLensTheme.allCases {
+            UserDefaults.standard.set(theme.rawValue, forKey: "usageLens.theme")
+            let nsAppearance = appearance(for: theme)
+            for (label, metrics) in profiles {
+                let (_, aboutImg) = try renderHosted(
+                    AboutPanelView().environment(\.displayScaleMetrics, metrics),
+                    size: metrics.aboutWindowSize,
+                    appearance: nsAppearance,
+                    named: "27-about-five-providers-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(aboutImg, context: "about-\(theme.rawValue)-\(label)")
+
+                let settingsView = SettingsPanelView(
+                    launchAtLogin: launchAtLogin,
+                    hasSavedAPIKey: false,
+                    geminiCredentialSource: .unconfigured,
+                    initialExpandedProviderID: ProviderCatalog.gemini.id
+                ).environment(\.displayScaleMetrics, metrics)
+                let (_, settingsImg) = try renderHosted(
+                    settingsView,
+                    size: metrics.settingsWindowSize,
+                    appearance: nsAppearance,
+                    scrollToBottom: true,
+                    named: "28-settings-guidance-\(theme.rawValue)-\(label)",
+                    inspectView: { root in
+                        let scroll = self.firstDescendant(ofType: NSScrollView.self, in: root)
+                        XCTAssertNotNil(scroll)
+                        if let docHeight = scroll?.documentView?.frame.height {
+                            XCTAssertGreaterThan(docHeight, metrics.settingsWindowSize.height * 0.5)
+                        }
+                    }
+                )
+                assertNonBlankImage(settingsImg, context: "settings-guidance-\(theme.rawValue)-\(label)")
+
+                let panelSize = CGSize(width: metrics.panelWidth, height: metrics.scaledDimension(380, minimum: 300))
+                let (_, agyImg) = try renderHosted(
+                    PanelView(store: agyMissingStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "29-panel-agy-guidance-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(agyImg, context: "panel-agy-guidance-\(theme.rawValue)-\(label)")
+
+                let (_, geminiImg) = try renderHosted(
+                    PanelView(store: geminiStore).environment(\.displayScaleMetrics, metrics),
+                    size: panelSize,
+                    appearance: nsAppearance,
+                    named: "30-panel-gemini-guidance-\(theme.rawValue)-\(label)"
+                )
+                assertNonBlankImage(geminiImg, context: "panel-gemini-guidance-\(theme.rawValue)-\(label)")
+            }
+        }
+    }
 }

@@ -261,12 +261,19 @@ struct ProviderDetailView: View {
     }
 
     // 没有窗口概念的服务（例如 DeepSeek）或 AGY 缺少实时配额时，不画进度条，只说明。
+    internal var noWindowText: String {
+        isAgyProvider
+            ? "暂无 AGY 实时窗口配额（终端运行 agy acp --login 登录后点击刷新，无需复制 token）"
+            : "该服务无窗口配额"
+    }
+
     private var noWindowCaption: some View {
         HStack(spacing: metrics.scaledSpacing(5)) {
             Image(systemName: isAgyProvider ? "person.crop.circle.badge.exclamationmark" : "minus.circle")
                 .font(metrics.font(10))
-            Text(isAgyProvider ? "暂无 AGY 实时窗口配额（需本机 AGY 登录态）" : "该服务无窗口配额")
+            Text(noWindowText)
                 .font(metrics.font(11))
+                .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
         .foregroundStyle(.secondary)
@@ -281,10 +288,19 @@ struct ProviderDetailView: View {
             Text(emptyTitle)
                 .font(metrics.font(12.5, weight: .semibold))
                 .foregroundStyle(isActionableAuth ? .primary : .secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
             if let reason = emptyReason {
                 Text(reason)
                     .font(metrics.font(10.5))
                     .foregroundStyle(isActionableAuth ? .secondary : .tertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let guidance = emptyGuidanceHint {
+                Text(guidance)
+                    .font(metrics.font(10))
+                    .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -321,17 +337,20 @@ struct ProviderDetailView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, metrics.scaledSpacing(20))
+        .padding(.vertical, metrics.scaledSpacing(18))
         .padding(.horizontal, metrics.scaledSpacing(12))
         .cardBackground(opacity: 0.04)
     }
 
-    private var emptyTitle: String {
+    internal var emptyTitle: String {
         if state.status == .incompatible {
             return "探针输出格式不兼容"
         }
+        if state.isMissingProbe && state.provider.id == ProviderCatalog.opencode.id {
+            return "OpenCode 暂未接入原生用量探针"
+        }
         if needsAccountConfiguration {
-            return "需要提供 \(state.provider.displayName) 账号"
+            return "未检测到 \(state.provider.displayName) 登录态"
         }
         if isAgyAuthEmptyState {
             if let failure = state.failureReason {
@@ -353,13 +372,16 @@ struct ProviderDetailView: View {
         return "无数据"
     }
 
-    private var emptyReason: String? {
+    internal var emptyReason: String? {
         if state.status == .incompatible {
             return state.failureReason?
                 .replacingOccurrences(of: "探针输出格式不兼容（", with: "")
                 .replacingOccurrences(of: "）", with: "")
         }
         if state.isMissingProbe {
+            if state.provider.id == ProviderCatalog.opencode.id {
+                return "当前为预留标签，OpenCode 暂未接入原生用量探针（无需填写 token）；如暂不需要，可在右下角「配置 → 模型厂商」中移除该标签。"
+            }
             return "未安装探针 \(state.provider.probeRelativePath)"
         }
         if let failure = state.failureReason {
@@ -367,13 +389,40 @@ struct ProviderDetailView: View {
         }
         guard state.hasLoaded else { return "正在读取探针" }
         if needsAccountConfiguration {
-            return "请在配置中提供 \(state.provider.displayName) 账号，以查看 5 小时与 7 天使用量"
+            return "首次使用：在终端运行 gemini 并选择浏览器 Google 登录，将自动复用 ~/.gemini/oauth_creds.json，通常无需手动 token；完成后点击左下角「刷新」。"
         }
         if isAgyAuthEmptyState {
             return agyAuthDiagnosticWarning
-                ?? "请先通过 AGY 登录或解锁登录钥匙串，然后点击重新检测以查看 5 小时与 7 天使用量"
+                ?? "未检测到本机 AGY 登录态，暂时无法获取 5 小时与 7 天实时配额。"
         }
-        return "探针没有返回窗口数据"
+        switch state.provider.id {
+        case ProviderCatalog.codex.id:
+            return "首次使用：请先在终端运行 codex 登录并使用以生成本地记录，再点击左下角「刷新」。"
+        case ProviderCatalog.opencode.id:
+            return "当前为预留标签，OpenCode 暂未接入原生用量探针（无需填写 token）；如暂不需要，可在右下角「配置 → 模型厂商」中移除该标签。"
+        case ProviderCatalog.deepseek.id:
+            return "官方余额需在配置页验证并保存 API Key；本地花费为估算值，缺少本地记录时显示无数据。"
+        default:
+            return "探针没有返回窗口数据"
+        }
+    }
+
+    internal var emptyGuidanceHint: String? {
+        if needsAccountConfiguration {
+            return "如果你使用的是 Antigravity，请切换到顶部「AGY」标签页（若缺少 AGY，点击右下角「配置 → 添加模型厂商 → 添加 AGY」）；也可点击下方按钮进行可选高级手动覆盖。"
+        }
+        if isAgyAuthEmptyState {
+            if let warning = agyAuthDiagnosticWarning {
+                if warning.contains("隔离") {
+                    return "当前处于隔离环境，已跳过本机钥匙串；在正常桌面环境中于终端运行 agy acp --login（或 agy）完成浏览器 Google 登录后，返回点击「重新检测 AGY」（无需手动复制 OAuth token）。"
+                }
+                if warning.contains("钥匙串") && !warning.contains("未找到") {
+                    return "请先解锁 macOS 登录钥匙串并允许访问，或在终端运行 agy acp --login（或 agy）完成浏览器 Google 登录；将自动复用本机 AGY 登录态，无需手动复制 OAuth token，完成后点击「重新检测 AGY」。"
+                }
+            }
+            return "使用步骤：在终端运行 agy acp --login（或 agy）完成浏览器 Google 登录，将自动复用本机 AGY 登录态，无需手动复制 OAuth token；完成后点击「重新检测 AGY」。"
+        }
+        return nil
     }
 
     private var metricsRow: some View {
@@ -631,6 +680,9 @@ struct FooterBar: View {
         .accessibilityLabel("关于 usage-lens")
     }
 
+    internal static let settingsHelpText = "配置（主题、添加模型厂商、查看使用说明）"
+    internal static let refreshHelpText = "重新检测登录态并刷新用量"
+
     private var settingsButton: some View {
         let buttonSize = metrics.scaledDimension(24, minimum: 20)
         return Button {
@@ -643,7 +695,7 @@ struct FooterBar: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("配置")
+        .help(Self.settingsHelpText)
         .accessibilityLabel("配置")
     }
 
@@ -671,7 +723,7 @@ struct FooterBar: View {
         }
         .buttonStyle(.plain)
         .disabled(store.isRefreshing)
-        .help("立即重新运行探针")
+        .help(Self.refreshHelpText)
     }
 
     private var quitButton: some View {

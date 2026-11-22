@@ -11,6 +11,8 @@ public struct AboutPanelView: View {
         UsageLensTheme(rawValue: themeRawValue) ?? .system
     }
 
+    internal static let productSummary = "菜单栏用量看板 · Codex / AGY / Gemini / OpenCode / DeepSeek"
+
     public init() {}
 
     public var body: some View {
@@ -28,9 +30,12 @@ public struct AboutPanelView: View {
                 Text("\(appVersion)（构建 \(buildNumber)）")
                     .font(metrics.font(11.5))
                     .foregroundStyle(.secondary)
-                Text("菜单栏用量看板 · Codex / DeepSeek")
+                Text(Self.productSummary)
                     .font(metrics.font(10.5))
                     .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, metrics.scaledSpacing(12))
             }
         }
         .frame(width: metrics.aboutWindowSize.width, height: metrics.aboutWindowSize.height)

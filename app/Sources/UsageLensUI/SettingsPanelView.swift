@@ -177,9 +177,12 @@ public struct SettingsPanelView: View {
             }
             .disabled(addableProviders.isEmpty)
 
-            Text("管理要显示的模型厂商。模型用量来自各厂商的本地记录或探针。")
+            Text("管理要显示的模型厂商。先在终端登录对应工具，再切回面板选择标签并点击「刷新」。")
                 .font(metrics.font(10))
                 .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            usageGuidanceSection
 
             if let provider = activeProviders.first(where: { $0.id == expandedCredentialProviderID && $0.requiresCredentials }) {
                 Divider()
@@ -302,6 +305,65 @@ public struct SettingsPanelView: View {
         }
     }
 
+    internal static let usageGuideHeadline = "使用说明：先在终端登录对应工具 → 选择对应标签 → 点击「刷新」"
+    internal static let usageGuideItems: [(title: String, detail: String)] = [
+        (
+            "AGY（Antigravity）",
+            "终端运行 agy acp --login（或 agy）完成浏览器 Google 登录，自动复用本机登录态，无需手动复制 OAuth token，也无需填写 Gemini 凭据。旧版升级后若缺少 AGY 标签，点击上方「添加模型厂商 → 添加 AGY」并切回面板选择 AGY 即可。"
+        ),
+        (
+            "Gemini（Gemini CLI / Code Assist）",
+            "终端运行 gemini 并选择浏览器 Google 登录，自动复用 ~/.gemini/oauth_creds.json，通常无需手动 token；点击上方 Gemini 行可展开可选高级手动覆盖（勿填 API Key）。"
+        ),
+        (
+            "Codex",
+            "先在终端运行 codex 登录并使用，以生成实时配额会话或本地记录。"
+        ),
+        (
+            "OpenCode",
+            "当前为预留标签，原生用量探针尚未接入（无需在 UsageLens 填写 token）；如暂不需要，可点击上方 OpenCode 右侧「-」按钮移除。"
+        ),
+        (
+            "DeepSeek",
+            "查询官方余额需点击上方 DeepSeek 行验证并保存 API Key；本地花费为估算值，缺少记录时不保证有数值。"
+        ),
+    ]
+
+    internal static let geminiLocalAutoReuseSummary =
+        "推荐：在终端运行 gemini 并选择浏览器 Google 登录，UsageLens 将自动只读复用 ~/.gemini/oauth_creds.json，通常无需手动寻找 OAuth token。"
+    internal static let geminiManualOverrideHeading =
+        "可选高级手动覆盖（优先级高于本机 CLI，勿填入 API Key）"
+    internal static let geminiManualOverrideCaption =
+        "仅在需要覆盖本机 Gemini CLI 账号时填写邮箱、OAuth Access Token 及可选 Google Cloud Project ID；不要填入 Gemini API Key。令牌全程以掩码输入，仅验证成功后写入本机钥匙串。"
+
+    @ViewBuilder
+    private var usageGuidanceSection: some View {
+        VStack(alignment: .leading, spacing: metrics.scaledSpacing(6)) {
+            Text(Self.usageGuideHeadline)
+                .font(metrics.font(10.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(Self.usageGuideItems, id: \.title) { item in
+                VStack(alignment: .leading, spacing: metrics.scaledSpacing(1.5)) {
+                    Text(item.title)
+                        .font(metrics.font(10, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(item.detail)
+                        .font(metrics.font(9.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(metrics.scaledSpacing(9))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: metrics.scaledSpacing(8), style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+        )
+    }
+
     private var isGeminiCredentialActive: Bool {
         switch geminiCredentialSource {
         case .manualKeychain, .localCLI:
@@ -313,6 +375,11 @@ public struct SettingsPanelView: View {
 
     @ViewBuilder
     private func geminiManualConfigForm(caption: String) -> some View {
+        Text(Self.geminiManualOverrideHeading)
+            .font(metrics.font(10.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
         TextField(
             "Gemini 账号邮箱（例如 user@gmail.com）",
             text: $geminiEmailDraft
@@ -321,7 +388,7 @@ public struct SettingsPanelView: View {
         .textFieldStyle(.roundedBorder)
 
         SecureField(
-            "粘贴 Gemini 访问令牌 (OAuth Access Token)",
+            "粘贴 Gemini OAuth Token（勿填 API Key）",
             text: $geminiTokenDraft
         )
         .font(metrics.font(12))
@@ -329,7 +396,7 @@ public struct SettingsPanelView: View {
         .onSubmit(saveGeminiAccount)
 
         TextField(
-            "项目 ID（可选，留空自动获取）",
+            "Google Cloud 项目 ID（可选，留空自动发现）",
             text: $geminiProjectIDDraft
         )
         .font(metrics.font(12))
@@ -350,14 +417,16 @@ public struct SettingsPanelView: View {
     @ViewBuilder
     private func geminiAccountSettings(for provider: Provider) -> some View {
         VStack(alignment: .leading, spacing: metrics.scaledSpacing(8)) {
-            Text("\(provider.displayName) 账号")
+            Text("\(provider.displayName) 账号（Gemini CLI / Code Assist）")
                 .font(metrics.font(13, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
 
             switch geminiCredentialSource {
             case .manualKeychain(let email):
-                Label("已手动配置账号", systemImage: "checkmark.circle.fill")
+                Label("已启用手动高级覆盖（优先于本机 CLI）", systemImage: "checkmark.circle.fill")
                     .font(metrics.font(10, weight: .medium))
                     .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 // 仅展示非敏感邮箱标签；访问令牌永不回填到 UI。
                 TextField("", text: .constant(email))
@@ -377,15 +446,16 @@ public struct SettingsPanelView: View {
                         .font(metrics.font(12))
                     Spacer(minLength: 0)
                 }
-                Text("已保存的访问令牌以掩码显示，不会读取或显示明文。")
+                Text("已保存的访问令牌以掩码显示，不会读取或显示明文；删除后将恢复自动复用本机 ~/.gemini/oauth_creds.json。")
                     .font(metrics.font(10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
             case .localCLI(let email):
-                Label("自动复用本机登录态", systemImage: "checkmark.circle.fill")
+                Label("已自动复用本机 Gemini CLI 登录态", systemImage: "checkmark.circle.fill")
                     .font(metrics.font(10, weight: .medium))
                     .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 if let email, !email.isEmpty {
                     TextField("", text: .constant(email))
@@ -395,18 +465,23 @@ public struct SettingsPanelView: View {
                         .accessibilityLabel("本机复用的 \(provider.displayName) 账号")
                 }
 
-                Text("正在只读复用本机 ~/.gemini/oauth_creds.json；如需覆盖，可在下方手动配置账号。")
+                Text("正在只读复用本机 ~/.gemini/oauth_creds.json，通常无需手动填写 token；如需覆盖，可使用下方可选高级配置。")
                     .font(metrics.font(10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 geminiManualConfigForm(
-                    caption: "手动保存的账号具有最高优先级；令牌全程以掩码输入，仅验证成功后写入本机钥匙串。"
+                    caption: Self.geminiManualOverrideCaption
                 )
 
             case .unconfigured:
+                Text(Self.geminiLocalAutoReuseSummary)
+                    .font(metrics.font(10.5))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 geminiManualConfigForm(
-                    caption: "提供 Gemini 账号以查看 5 小时与 7 天使用量；本机已登录 Gemini CLI（~/.gemini/oauth_creds.json）时也会自动复用。令牌全程以掩码输入，仅验证成功后写入本机钥匙串。"
+                    caption: Self.geminiManualOverrideCaption
                 )
             }
 
