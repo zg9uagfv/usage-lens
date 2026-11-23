@@ -224,6 +224,20 @@ final class FormattingTests: XCTestCase {
         XCTAssertEqual(UsageFormat.tokenCount(nil), "未知")
         XCTAssertEqual(UsageFormat.sourceLabel("local"), "本地统计")
     }
+
+    func testMaskedAccountLabel() {
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("user@gmail.com"), "*****@gmail.com")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("a@sub.example.org"), "*****@sub.example.org")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("  alice+tag@gmail.com \n"), "*****@gmail.com")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("org-123456"), "*****")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("Team @ Acme"), "*****")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("@gmail.com"), "*****")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("user@"), "*****")
+        XCTAssertEqual(UsageFormat.maskedAccountLabel("@"), "*****")
+        XCTAssertNil(UsageFormat.maskedAccountLabel(nil))
+        XCTAssertNil(UsageFormat.maskedAccountLabel(""))
+        XCTAssertNil(UsageFormat.maskedAccountLabel("   "))
+    }
 }
 
 final class SecretRedactorTests: XCTestCase {

@@ -129,4 +129,21 @@ public enum UsageFormat {
             .map { String($0.prefix(1)).uppercased() + String($0.dropFirst()) }
             .joined(separator: " ")
     }
+
+    public static func maskedAccountLabel(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        guard let atIndex = trimmed.lastIndex(of: "@") else {
+            return "*****"
+        }
+        let localPart = trimmed[..<atIndex]
+        let domainPart = trimmed[trimmed.index(after: atIndex)...]
+        guard !localPart.isEmpty,
+              !domainPart.isEmpty,
+              domainPart.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else {
+            return "*****"
+        }
+        return "*****@\(domainPart)"
+    }
 }

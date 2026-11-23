@@ -975,7 +975,7 @@ final class PanelRenderTests: XCTestCase {
                 )
                 assertNonBlankImage(unconfiguredImg, context: "settings-unconfigured-\(theme.rawValue)-\(label)")
 
-                // 2. Settings（已手动配置 Gemini 展开）：展示邮箱 + 固定掩码，不得回填明文令牌，且非空白
+                // 2. Settings（已手动配置 Gemini 展开）：展示脱敏邮箱 + 固定掩码，不得回填明文邮箱或令牌，且非空白
                 let configuredSettings = SettingsPanelView(
                     launchAtLogin: launchAtLogin,
                     hasSavedAPIKey: false,
@@ -991,8 +991,12 @@ final class PanelRenderTests: XCTestCase {
                     inspectView: { root in
                         let fields = self.allDescendants(ofType: NSTextField.self, in: root)
                         XCTAssertTrue(
-                            fields.contains { $0.stringValue == "user@gmail.com" },
-                            "已配置 Settings 应展示保存的账号邮箱 (\(theme.rawValue)/\(label))"
+                            fields.contains { $0.stringValue == "*****@gmail.com" },
+                            "已配置 Settings 应展示脱敏后的账号邮箱 (\(theme.rawValue)/\(label))"
+                        )
+                        XCTAssertFalse(
+                            fields.contains { $0.stringValue.contains("user@gmail.com") },
+                            "已配置 Settings 不得展示明文账号邮箱 (\(theme.rawValue)/\(label))"
                         )
                         XCTAssertTrue(
                             fields.contains { $0.stringValue == "****************" },
@@ -1002,7 +1006,7 @@ final class PanelRenderTests: XCTestCase {
                 )
                 assertNonBlankImage(configuredImg, context: "settings-configured-\(theme.rawValue)-\(label)")
 
-                // 2b. Settings（自动复用本机登录态展开）：展示检测到的本机邮箱 + 手动覆盖表单，且非空白
+                // 2b. Settings（自动复用本机登录态展开）：展示脱敏后的本机邮箱 + 手动覆盖表单，且非空白
                 let localCLISettings = SettingsPanelView(
                     launchAtLogin: launchAtLogin,
                     hasSavedAPIKey: false,
@@ -1019,8 +1023,12 @@ final class PanelRenderTests: XCTestCase {
                         XCTAssertNotNil(self.firstDescendant(ofType: NSScrollView.self, in: root))
                         let fields = self.allDescendants(ofType: NSTextField.self, in: root)
                         XCTAssertTrue(
-                            fields.contains { $0.stringValue == "local@gmail.com" },
-                            "本机复用 Settings 应展示检测到的本机账号邮箱 (\(theme.rawValue)/\(label))"
+                            fields.contains { $0.stringValue == "*****@gmail.com" },
+                            "本机复用 Settings 应展示脱敏后的本机账号邮箱 (\(theme.rawValue)/\(label))"
+                        )
+                        XCTAssertFalse(
+                            fields.contains { $0.stringValue.contains("local@gmail.com") },
+                            "本机复用 Settings 不得展示明文本机账号邮箱 (\(theme.rawValue)/\(label))"
                         )
                         let secureFields = self.allDescendants(ofType: NSSecureTextField.self, in: root)
                         XCTAssertFalse(
@@ -1431,5 +1439,77 @@ final class PanelRenderTests: XCTestCase {
                 assertNonBlankImage(geminiImg, context: "panel-gemini-guidance-\(theme.rawValue)-\(label)")
             }
         }
+    }
+
+    func testPanelViewMasksAccountLabelsAcrossProviders() async throws {
+        let metrics = DisplayScaleMetrics.make(
+            displaySize: CGSize(width: 1440, height: 900),
+            physicalSizeMM: CGSize(width: 286, height: 179)
+        )
+        let panelSize = CGSize(width: metrics.panelWidth, height: metrics.scaledDimension(340, minimum: 280))
+
+        let cases: [(name: String, provider: Provider, report: ProbeReport, expectedMasked: String, forbiddenPlaintext: [String])] = [
+            (
+                "31-panel-codex-masked",
+                ProviderCatalog.codex,
+                Fixtures.codexReport(),
+                "*****@example.com",
+                ["user@example.com", "user@gmail.com", "agy.user@example.com"]
+            ),
+            (
+                "32-panel-gemini-masked",
+                ProviderCatalog.gemini,
+                Fixtures.geminiConfiguredReport(),
+                "*****@gmail.com",
+                ["user@gmail.com", "user@example.com", "agy.user@example.com"]
+            ),
+            (
+                "33-panel-agy-masked",
+                ProviderCatalog.agy,
+                Fixtures.agyLiveReport(),
+                "*****@example.com",
+                ["agy.user@example.com", "user@gmail.com", "user@example.com"]
+            ),
+        ]
+
+        for item in cases {
+            let store = makeStore(
+                SequencedProbeProvider([item.provider: [item.report]]),
+                selected: item.provider
+            )
+            await store.refreshAll()
+
+            let state = store.state(for: item.provider)
+            let displayed = ProviderDetailView(state: state).displayedAccountText
+            XCTAssertEqual(displayed, item.expectedMasked, item.name)
+            for plaintext in item.forbiddenPlaintext {
+                XCTAssertFalse(
+                    displayed.contains(plaintext),
+                    "\(item.name) must never render plaintext account \(plaintext)"
+                )
+            }
+
+            let (_, img) = try renderHosted(
+                PanelView(store: store).environment(\.displayScaleMetrics, metrics),
+                size: panelSize,
+                appearance: NSAppearance(named: .aqua),
+                named: item.name
+            )
+            assertNonBlankImage(img, context: item.name)
+        }
+
+        let agyMissing = makeStore(
+            SequencedProbeProvider([ProviderCatalog.agy: [Fixtures.agyMissingAuthReport()]]),
+            selected: ProviderCatalog.agy
+        )
+        await agyMissing.refreshAll()
+        XCTAssertEqual(ProviderDetailView(state: agyMissing.state(for: ProviderCatalog.agy)).displayedAccountText, "未检测到 AGY 账号")
+
+        let codexEmpty = makeStore(
+            SequencedProbeProvider([ProviderCatalog.codex: [Fixtures.emptyCodexReport()]]),
+            selected: ProviderCatalog.codex
+        )
+        await codexEmpty.refreshAll()
+        XCTAssertEqual(ProviderDetailView(state: codexEmpty.state(for: ProviderCatalog.codex)).displayedAccountText, "未提供账号")
     }
 }

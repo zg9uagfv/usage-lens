@@ -211,12 +211,19 @@ struct ProviderDetailView: View {
         state.envelope?.balance != nil || state.envelope?.spend != nil || state.envelope?.usage != nil
     }
 
-    // 账号 + plan
+    private var maskedAccountLabel: String? {
+        UsageFormat.maskedAccountLabel(state.accountLabel)
+    }
+
+    internal var displayedAccountText: String {
+        maskedAccountLabel ?? (isAgyProvider ? "未检测到 AGY 账号" : "未提供账号")
+    }
+
     private var header: some View {
         HStack(spacing: metrics.scaledSpacing(6)) {
-            Text(state.accountLabel ?? (isAgyProvider ? "未检测到 AGY 账号" : "未提供账号"))
+            Text(displayedAccountText)
                 .font(metrics.font(11.5, weight: .medium))
-                .foregroundStyle(state.accountLabel == nil ? Color.secondary : Color.primary)
+                .foregroundStyle(maskedAccountLabel == nil ? Color.secondary : Color.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
 

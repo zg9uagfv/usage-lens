@@ -428,8 +428,7 @@ public struct SettingsPanelView: View {
                     .foregroundStyle(.green)
                     .fixedSize(horizontal: false, vertical: true)
 
-                // 仅展示非敏感邮箱标签；访问令牌永不回填到 UI。
-                TextField("", text: .constant(email))
+                TextField("", text: .constant(UsageFormat.maskedAccountLabel(email) ?? "*****"))
                     .font(metrics.font(12))
                     .textFieldStyle(.roundedBorder)
                     .disabled(true)
@@ -446,7 +445,7 @@ public struct SettingsPanelView: View {
                         .font(metrics.font(12))
                     Spacer(minLength: 0)
                 }
-                Text("已保存的访问令牌以掩码显示，不会读取或显示明文；删除后将恢复自动复用本机 ~/.gemini/oauth_creds.json。")
+                Text("已保存的账号与访问令牌均以掩码显示，不会读取或显示明文；删除后将恢复自动复用本机 ~/.gemini/oauth_creds.json。")
                     .font(metrics.font(10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -457,8 +456,8 @@ public struct SettingsPanelView: View {
                     .foregroundStyle(.green)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let email, !email.isEmpty {
-                    TextField("", text: .constant(email))
+                if let maskedEmail = UsageFormat.maskedAccountLabel(email) {
+                    TextField("", text: .constant(maskedEmail))
                         .font(metrics.font(12))
                         .textFieldStyle(.roundedBorder)
                         .disabled(true)
