@@ -1,3 +1,5 @@
+import LocalAuthentication
+import Security
 import XCTest
 @testable import UsageLensKit
 
@@ -717,5 +719,125 @@ final class ProbeRunnerDecodeTests: XCTestCase {
         )
         XCTAssertNil(report.envelope)
         XCTAssertEqual(report.failure, "探针没有输出内容（No such file: ~/ProviderCatalog.codex）")
+    }
+}
+
+final class KeychainInteractionGuardTests: XCTestCase {
+    func testDisableUserInteractionDisablesKeychainPrompts() {
+        XCTAssertEqual(KeychainInteractionGuard.disableUserInteraction(), errSecSuccess)
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+    }
+
+    func testAllKeychainQueriesAttachNonInteractiveLAContext() throws {
+        let queries: [(String, [String: Any])] = [
+            ("DeepSeekAPIKeyStore.buildReadQuery", DeepSeekAPIKeyStore.buildReadQuery()),
+            ("SystemGeminiKeychainStorage.buildReadQuery", SystemGeminiKeychainStorage().buildReadQuery()),
+            (
+                "SystemAgyKeychainReader.buildQuery",
+                SystemAgyKeychainReader.buildQuery(
+                    service: AgyNativeProbe.keychainService,
+                    account: AgyNativeProbe.keychainAccount
+                )
+            ),
+            (
+                "SystemAgyKeychainReader.buildUpdateQuery",
+                SystemAgyKeychainReader.buildUpdateQuery(
+                    service: AgyNativeProbe.keychainService,
+                    account: AgyNativeProbe.keychainAccount
+                )
+            ),
+        ]
+
+        for (label, query) in queries {
+            let context = try XCTUnwrap(
+                query[kSecUseAuthenticationContext as String] as? LAContext,
+                "\(label) must attach LAContext"
+            )
+            XCTAssertTrue(context.interactionNotAllowed, "\(label) must set interactionNotAllowed = true")
+        }
+    }
+
+    func testUpsertAppOwnedItemRecoversFromStaleACLByDeleteAndAdd() {
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "dev.usage-lens.test",
+            kSecAttrAccount as String: "test-account",
+        ]
+        let payload = Data("secret-value".utf8)
+
+        for staleStatus in [errSecAuthFailed, errSecInteractionNotAllowed] {
+            var steps: [String] = []
+            var addedValue: Data?
+            var addedAccessible: Any?
+            let status = KeychainInteractionGuard.upsertAppOwnedItem(
+                baseQuery: baseQuery,
+                value: payload,
+                update: { _, _ in
+                    steps.append("update")
+                    return staleStatus
+                },
+                delete: { _ in
+                    steps.append("delete")
+                    return errSecSuccess
+                },
+                add: { query in
+                    steps.append("add")
+                    let dict = query as? [String: Any]
+                    addedValue = dict?[kSecValueData as String] as? Data
+                    addedAccessible = dict?[kSecAttrAccessible as String]
+                    return errSecSuccess
+                }
+            )
+            XCTAssertEqual(status, errSecSuccess)
+            XCTAssertEqual(steps, ["update", "delete", "add"])
+            XCTAssertEqual(addedValue, payload)
+            XCTAssertEqual(addedAccessible as? String, kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
+        }
+    }
+
+    func testUpsertAppOwnedItemPropagatesDeleteAndAddFailures() {
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "dev.usage-lens.test",
+            kSecAttrAccount as String: "test-account",
+        ]
+        let payload = Data("secret-value".utf8)
+
+        var addCalled = false
+        let deleteFailed = KeychainInteractionGuard.upsertAppOwnedItem(
+            baseQuery: baseQuery,
+            value: payload,
+            update: { _, _ in errSecAuthFailed },
+            delete: { _ in errSecInteractionNotAllowed },
+            add: { _ in
+                addCalled = true
+                return errSecSuccess
+            }
+        )
+        XCTAssertEqual(deleteFailed, errSecInteractionNotAllowed)
+        XCTAssertFalse(addCalled)
+
+        let addFailed = KeychainInteractionGuard.upsertAppOwnedItem(
+            baseQuery: baseQuery,
+            value: payload,
+            update: { _, _ in errSecInteractionNotAllowed },
+            delete: { _ in errSecSuccess },
+            add: { _ in errSecDuplicateItem }
+        )
+        XCTAssertEqual(addFailed, errSecDuplicateItem)
+
+        var deleteCalled = false
+        let unexpectedUpdateError = KeychainInteractionGuard.upsertAppOwnedItem(
+            baseQuery: baseQuery,
+            value: payload,
+            update: { _, _ in errSecParam },
+            delete: { _ in
+                deleteCalled = true
+                return errSecSuccess
+            },
+            add: { _ in errSecSuccess }
+        )
+        XCTAssertEqual(unexpectedUpdateError, errSecParam)
+        XCTAssertFalse(deleteCalled)
     }
 }

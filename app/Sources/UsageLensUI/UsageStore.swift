@@ -110,7 +110,7 @@ public final class UsageStore: ObservableObject {
         loop = nil
     }
 
-    private func start() {
+    public func start() {
         guard loop == nil else { return }
         loop = Task { [weak self] in
             guard let self else { return }

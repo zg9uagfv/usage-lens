@@ -33,8 +33,8 @@ public protocol AgyKeychainWriting: Sendable {
 /// 生产环境：通过 macOS 原生 Security.SecItemCopyMatching / SecItemUpdate 读写精确白名单元组
 /// `(service: "gemini", account: "antigravity")`。
 /// - 禁止枚举钥匙串、禁止扩大 ACL、禁止删除或新建条目（仅允许对已存在精确条目执行原位原子 `SecItemUpdate`）；
-/// - 显式附加 LAContext(interactionNotAllowed: true) 以拒绝受 LAContext 约束的交互认证弹窗
-///   （传统基于文件的登录钥匙串 ACL/IPC 交互无法在进程内绝对阻止，由外层 2 秒有界超时与单飞门控兜底）。
+/// - 同时启用 `SecKeychainSetUserInteractionAllowed(false)` 与 `LAContext(interactionNotAllowed: true)`，
+///   确保钥匙串读写全程非交互并由外层 2 秒有界超时与单飞门控兜底。
 public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
     public init() {}
 
@@ -43,26 +43,22 @@ public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
     }
 
     public static func buildQuery(service: String, account: String) -> [String: Any] {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return [
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationContext as String: context,
+            kSecUseAuthenticationContext as String: KeychainInteractionGuard.nonInteractiveContext(),
         ]
     }
 
     public static func buildUpdateQuery(service: String, account: String) -> [String: Any] {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return [
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecUseAuthenticationContext as String: context,
+            kSecUseAuthenticationContext as String: KeychainInteractionGuard.nonInteractiveContext(),
         ]
     }
 
@@ -76,6 +72,7 @@ public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
         guard Self.isAllowedTuple(service: service, account: account) else {
             return .denied
         }
+        KeychainInteractionGuard.disableUserInteraction()
         let query = Self.buildQuery(service: service, account: account)
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -105,6 +102,7 @@ public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
               !data.isEmpty else {
             return .rejected
         }
+        KeychainInteractionGuard.disableUserInteraction()
         let query = Self.buildUpdateQuery(service: service, account: account)
         let attributes = Self.buildUpdateAttributes(payload: data)
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)

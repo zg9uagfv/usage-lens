@@ -23,7 +23,7 @@ struct UsageLensApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let store = UsageStore(refreshInterval: UsageStore.environmentRefreshInterval)
+    private let store = UsageStore(refreshInterval: UsageStore.environmentRefreshInterval, autoStart: false)
     private let launchAtLogin = LaunchAtLoginManager()
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
@@ -42,8 +42,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowScreenObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        KeychainInteractionGuard.disableUserInteraction()
         // 菜单栏常驻，不占 Dock。
         NSApp.setActivationPolicy(.accessory)
+        store.start()
         closeRestoredSwiftUISettingsWindow()
         // SwiftUI 的 Settings scene 可能在 didFinish 后才被窗口恢复机制创建。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in

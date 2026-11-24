@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// DeepSeek API key lives in the user's macOS login Keychain.
@@ -11,7 +12,15 @@ public enum DeepSeekAPIKeyStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            kSecUseAuthenticationContext as String: KeychainInteractionGuard.nonInteractiveContext(),
         ]
+    }
+
+    internal static func buildReadQuery() -> [String: Any] {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        return query
     }
 
     public static var hasSavedKey: Bool {
@@ -20,9 +29,8 @@ public enum DeepSeekAPIKeyStore {
 
     /// Returns the key only to the DeepSeek probe runner; callers must never log it.
     public static func load() -> String? {
-        var query = baseQuery
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        KeychainInteractionGuard.disableUserInteraction()
+        let query = buildReadQuery()
 
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
@@ -39,18 +47,11 @@ public enum DeepSeekAPIKeyStore {
         guard !key.isEmpty else { throw DeepSeekAPIKeyStoreError.emptyKey }
 
         let value = Data(key.utf8)
-        let status = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData as String: value] as CFDictionary)
-        if status == errSecItemNotFound {
-            var query = baseQuery
-            query[kSecValueData as String] = value
-            query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            try check(SecItemAdd(query as CFDictionary, nil))
-        } else {
-            try check(status)
-        }
+        try check(KeychainInteractionGuard.upsertAppOwnedItem(baseQuery: baseQuery, value: value))
     }
 
     public static func delete() throws {
+        KeychainInteractionGuard.disableUserInteraction()
         let status = SecItemDelete(baseQuery as CFDictionary)
         guard status == errSecItemNotFound else { try check(status); return }
     }

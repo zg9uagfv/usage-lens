@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Gemini 凭据来源：严格区分手动钥匙串账号、本机 CLI 只读复用与未配置状态。
@@ -51,13 +52,20 @@ public struct SystemGeminiKeychainStorage: GeminiKeychainStorage {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.service,
             kSecAttrAccount as String: Self.account,
+            kSecUseAuthenticationContext as String: KeychainInteractionGuard.nonInteractiveContext(),
         ]
     }
 
-    public func loadData() -> Data? {
+    internal func buildReadQuery() -> [String: Any] {
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        return query
+    }
+
+    public func loadData() -> Data? {
+        KeychainInteractionGuard.disableUserInteraction()
+        let query = buildReadQuery()
 
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
@@ -69,21 +77,11 @@ public struct SystemGeminiKeychainStorage: GeminiKeychainStorage {
     }
 
     public func saveData(_ data: Data) throws {
-        let status = SecItemUpdate(
-            baseQuery as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        if status == errSecItemNotFound {
-            var query = baseQuery
-            query[kSecValueData as String] = data
-            query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            try check(SecItemAdd(query as CFDictionary, nil))
-        } else {
-            try check(status)
-        }
+        try check(KeychainInteractionGuard.upsertAppOwnedItem(baseQuery: baseQuery, value: data))
     }
 
     public func deleteData() throws {
+        KeychainInteractionGuard.disableUserInteraction()
         let status = SecItemDelete(baseQuery as CFDictionary)
         guard status == errSecItemNotFound else {
             try check(status)

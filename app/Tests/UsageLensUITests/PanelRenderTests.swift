@@ -1512,4 +1512,35 @@ final class PanelRenderTests: XCTestCase {
         await codexEmpty.refreshAll()
         XCTAssertEqual(ProviderDetailView(state: codexEmpty.state(for: ProviderCatalog.codex)).displayedAccountText, "未提供账号")
     }
+
+    func testUsageStoreDeferredStartIsIdempotent() async {
+        let provider = GatedProbeProvider([
+            ProviderCatalog.codex: [Fixtures.codexReport(), Fixtures.codexReport()],
+        ])
+        let store = UsageStore(provider: provider, refreshInterval: 60, autoStart: false)
+        defer { store.stop() }
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let callsBeforeStart = await provider.calls(for: ProviderCatalog.codex)
+        XCTAssertEqual(callsBeforeStart, 0)
+
+        store.start()
+        store.start()
+
+        for _ in 0..<40 {
+            if store.state(for: ProviderCatalog.codex).hasLoaded && !store.isRefreshing {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let callsAfterDoubleStart = await provider.calls(for: ProviderCatalog.codex)
+        XCTAssertEqual(callsAfterDoubleStart, 1)
+
+        store.start()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let callsAfterThirdStart = await provider.calls(for: ProviderCatalog.codex)
+        XCTAssertEqual(callsAfterThirdStart, 1)
+    }
 }
