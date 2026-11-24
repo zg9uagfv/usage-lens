@@ -203,6 +203,13 @@ final class FormattingTests: XCTestCase {
         XCTAssertEqual(UsageFormat.updatedText(at: nil, now: now), "尚未更新")
     }
 
+    func testUpdatedClockText() throws {
+        XCTAssertEqual(UsageFormat.updatedClockText(at: nil), "尚未更新")
+        let tz = try XCTUnwrap(TimeZone(secondsFromGMT: 8 * 3600))
+        let date = try XCTUnwrap(ProbeDate.parse("2026-11-24T06:34:18Z"))
+        XCTAssertEqual(UsageFormat.updatedClockText(at: date, timeZone: tz), "14:34:18 更新")
+    }
+
     func testSourceAndBasisLabels() {
         XCTAssertEqual(UsageFormat.sourceLabel("official"), "官方")
         XCTAssertEqual(UsageFormat.sourceLabel("estimate"), "估算")

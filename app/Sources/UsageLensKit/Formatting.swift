@@ -87,6 +87,17 @@ public enum UsageFormat {
         return "\(seconds / 86_400) 天前更新"
     }
 
+    public static func updatedClockText(at date: Date?, timeZone: TimeZone = .current) -> String {
+        guard let date else { return "尚未更新" }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let components = calendar.dateComponents([.hour, .minute, .second], from: date)
+        let hour = components.hour ?? 0
+        let minute = components.minute ?? 0
+        let second = components.second ?? 0
+        return String(format: "%02d:%02d:%02d 更新", hour, minute, second)
+    }
+
     /// `¥12.34` / `$0.42` / `12.34 EUR`。
     public static func money(_ amount: Double?, currency: String?) -> String? {
         guard let amount, amount.isFinite else { return nil }

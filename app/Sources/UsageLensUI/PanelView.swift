@@ -655,6 +655,9 @@ struct FooterBar: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var launchAtLogin: LaunchAtLoginManager
     @Environment(\.displayScaleMetrics) private var metrics
+    @State private var awaitingManualRefresh = false
+    @State private var showRefreshedConfirmation = false
+    @State private var confirmationResetTask: Task<Void, Never>?
     let showSettings: () -> Void
     let showAbout: () -> Void
 
@@ -662,7 +665,7 @@ struct FooterBar: View {
         HStack(spacing: metrics.scaledSpacing(10)) {
             refreshButton
             Spacer(minLength: 0)
-            Text(UsageFormat.updatedText(at: store.state(for: store.selected).lastDataAt))
+            Text(UsageFormat.updatedClockText(at: store.state(for: store.selected).lastDataAt))
                 .font(metrics.font(10.5))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
@@ -672,6 +675,24 @@ struct FooterBar: View {
         }
         .padding(.horizontal, metrics.scaledSpacing(12))
         .padding(.vertical, metrics.scaledSpacing(8))
+        .onChange(of: store.isRefreshing) { wasRefreshing, isNowRefreshing in
+            if wasRefreshing, !isNowRefreshing, awaitingManualRefresh {
+                awaitingManualRefresh = false
+                showRefreshedConfirmation = true
+                confirmationResetTask?.cancel()
+                confirmationResetTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    guard !Task.isCancelled else { return }
+                    showRefreshedConfirmation = false
+                }
+            }
+        }
+        .onDisappear {
+            confirmationResetTask?.cancel()
+            confirmationResetTask = nil
+            awaitingManualRefresh = false
+            showRefreshedConfirmation = false
+        }
     }
 
     private var aboutButton: some View {
@@ -711,22 +732,34 @@ struct FooterBar: View {
 
     private var refreshButton: some View {
         Button {
+            confirmationResetTask?.cancel()
+            showRefreshedConfirmation = false
+            awaitingManualRefresh = true
             let allowInteractiveAgy = store.selected.id == ProviderCatalog.agy.id
                 && store.state(for: ProviderCatalog.agy).windows.isEmpty
             store.refresh(allowInteractiveAgyAuth: allowInteractiveAgy)
         } label: {
             HStack(spacing: metrics.scaledSpacing(4)) {
-                Image(systemName: "arrow.clockwise")
-                    .font(metrics.font(9.5, weight: .semibold))
-                    .rotationEffect(.degrees(store.isRefreshing ? 360 : 0))
-                    .animation(
-                        store.isRefreshing
-                            ? .linear(duration: 0.8).repeatForever(autoreverses: false)
-                            : .default,
-                        value: store.isRefreshing
-                    )
-                Text(store.isRefreshing ? "刷新中" : "刷新")
-                    .font(metrics.font(10.5, weight: .medium))
+                if showRefreshedConfirmation && !store.isRefreshing {
+                    Image(systemName: "checkmark")
+                        .font(metrics.font(9.5, weight: .semibold))
+                        .foregroundStyle(.green)
+                    Text("已刷新")
+                        .font(metrics.font(10.5, weight: .medium))
+                        .foregroundStyle(.green)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(metrics.font(9.5, weight: .semibold))
+                        .rotationEffect(.degrees(store.isRefreshing ? 360 : 0))
+                        .animation(
+                            store.isRefreshing
+                                ? .linear(duration: 0.8).repeatForever(autoreverses: false)
+                                : .default,
+                            value: store.isRefreshing
+                        )
+                    Text(store.isRefreshing ? "刷新中" : "刷新")
+                        .font(metrics.font(10.5, weight: .medium))
+                }
             }
             .padding(.horizontal, metrics.scaledSpacing(9))
             .padding(.vertical, metrics.scaledSpacing(4.5))
