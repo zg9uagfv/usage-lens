@@ -29,6 +29,7 @@ public enum DeepSeekAPIKeyStore {
 
     /// Returns the key only to the DeepSeek probe runner; callers must never log it.
     public static func load() -> String? {
+        guard !KeychainInteractionGuard.isInteractiveInProgress else { return nil }
         KeychainInteractionGuard.disableUserInteraction()
         let query = buildReadQuery()
 

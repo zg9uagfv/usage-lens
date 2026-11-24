@@ -16,6 +16,7 @@ public final class UsageStore: ObservableObject {
     private var activeRefreshTask: Task<Void, Never>?
     private var credentialGenerations: [Provider: UInt64] = [:]
     private var needsFollowUpRefresh = false
+    private var pendingInteractiveProviders: Set<Provider> = []
 
     public init(
         provider: any ProbeProviding = ProbeRunner(),
@@ -63,7 +64,10 @@ public final class UsageStore: ObservableObject {
         (mostTense?.percent ?? 0) >= 90
     }
 
-    public func refresh() {
+    public func refresh(allowInteractiveAgyAuth: Bool = false) {
+        if allowInteractiveAgyAuth {
+            pendingInteractiveProviders.insert(ProviderCatalog.agy)
+        }
         if isRefreshing {
             needsFollowUpRefresh = true
             return
@@ -79,7 +83,10 @@ public final class UsageStore: ObservableObject {
 
     /// 凭据保存或删除后调用：立即作废正在进行的旧凭据刷新结果、清空该厂商旧账号状态，
     /// 并合并触发一次使用新凭据的后续刷新，确保新凭据状态始终胜出。
-    public func credentialsDidChange(for provider: Provider) {
+    public func credentialsDidChange(for provider: Provider, allowInteractiveAuth: Bool = false) {
+        if allowInteractiveAuth && provider.id == ProviderCatalog.agy.id {
+            pendingInteractiveProviders.insert(provider)
+        }
         credentialGenerations[provider, default: 0] &+= 1
         var cleared = ProviderState(provider: provider)
         cleared.isRefreshing = true
@@ -137,6 +144,8 @@ public final class UsageStore: ObservableObject {
 
         repeat {
             needsFollowUpRefresh = false
+            let interactiveProviders = pendingInteractiveProviders
+            pendingInteractiveProviders.removeAll()
             let activeProviders = ProviderCatalog.active
             var capturedGenerations: [Provider: UInt64] = [:]
             for provider in activeProviders {
@@ -145,13 +154,26 @@ public final class UsageStore: ObservableObject {
             }
 
             let probe = self.provider
-            let reports = await withTaskGroup(of: ProbeReport.self, returning: [ProbeReport].self) { group in
-                for provider in activeProviders {
-                    group.addTask { await probe.report(for: provider) }
+            let nonInteractiveProviders = activeProviders.filter { !interactiveProviders.contains($0) }
+            let interactiveBatch = activeProviders.filter { interactiveProviders.contains($0) }
+
+            var reports: [ProbeReport] = []
+            if !nonInteractiveProviders.isEmpty {
+                let batch = await withTaskGroup(of: ProbeReport.self, returning: [ProbeReport].self) { group in
+                    for provider in nonInteractiveProviders {
+                        group.addTask {
+                            await probe.report(for: provider, allowInteractiveKeychain: false)
+                        }
+                    }
+                    var collected: [ProbeReport] = []
+                    for await report in group { collected.append(report) }
+                    return collected
                 }
-                var collected: [ProbeReport] = []
-                for await report in group { collected.append(report) }
-                return collected
+                reports.append(contentsOf: batch)
+            }
+            for provider in interactiveBatch {
+                let report = await probe.report(for: provider, allowInteractiveKeychain: true)
+                reports.append(report)
             }
 
             for report in reports {

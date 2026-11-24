@@ -24,6 +24,21 @@ public enum AgyKeychainWriteResult: Sendable, Equatable {
 
 public protocol AgyKeychainReading: Sendable {
     func readGenericPassword(service: String, account: String) -> AgyKeychainReadResult
+    func readGenericPassword(
+        service: String,
+        account: String,
+        allowUserInteraction: Bool
+    ) -> AgyKeychainReadResult
+}
+
+public extension AgyKeychainReading {
+    func readGenericPassword(
+        service: String,
+        account: String,
+        allowUserInteraction: Bool
+    ) -> AgyKeychainReadResult {
+        readGenericPassword(service: service, account: account)
+    }
 }
 
 public protocol AgyKeychainWriting: Sendable {
@@ -33,8 +48,8 @@ public protocol AgyKeychainWriting: Sendable {
 /// 生产环境：通过 macOS 原生 Security.SecItemCopyMatching / SecItemUpdate 读写精确白名单元组
 /// `(service: "gemini", account: "antigravity")`。
 /// - 禁止枚举钥匙串、禁止扩大 ACL、禁止删除或新建条目（仅允许对已存在精确条目执行原位原子 `SecItemUpdate`）；
-/// - 同时启用 `SecKeychainSetUserInteractionAllowed(false)` 与 `LAContext(interactionNotAllowed: true)`，
-///   确保钥匙串读写全程非交互并由外层 2 秒有界超时与单飞门控兜底。
+/// - 默认启用 `SecKeychainSetUserInteractionAllowed(false)` 与 `LAContext(interactionNotAllowed: true)`，
+///   仅在用户显式触发交互授权读取时临时开启交互并由外层有界超时与单飞门控兜底。
 public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
     public init() {}
 
@@ -43,14 +58,25 @@ public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
     }
 
     public static func buildQuery(service: String, account: String) -> [String: Any] {
-        [
+        buildQuery(service: service, account: account, allowUserInteraction: false)
+    }
+
+    public static func buildQuery(
+        service: String,
+        account: String,
+        allowUserInteraction: Bool
+    ) -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationContext as String: KeychainInteractionGuard.nonInteractiveContext(),
         ]
+        if !allowUserInteraction {
+            query[kSecUseAuthenticationContext as String] = KeychainInteractionGuard.nonInteractiveContext()
+        }
+        return query
     }
 
     public static func buildUpdateQuery(service: String, account: String) -> [String: Any] {
@@ -69,13 +95,32 @@ public struct SystemAgyKeychainReader: AgyKeychainReading, AgyKeychainWriting {
     }
 
     public func readGenericPassword(service: String, account: String) -> AgyKeychainReadResult {
+        readGenericPassword(service: service, account: account, allowUserInteraction: false)
+    }
+
+    public func readGenericPassword(
+        service: String,
+        account: String,
+        allowUserInteraction: Bool
+    ) -> AgyKeychainReadResult {
         guard Self.isAllowedTuple(service: service, account: account) else {
             return .denied
         }
-        KeychainInteractionGuard.disableUserInteraction()
-        let query = Self.buildQuery(service: service, account: account)
+        let query = Self.buildQuery(
+            service: service,
+            account: account,
+            allowUserInteraction: allowUserInteraction
+        )
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status: OSStatus
+        if allowUserInteraction {
+            status = KeychainInteractionGuard.withTemporaryUserInteraction {
+                SecItemCopyMatching(query as CFDictionary, &result)
+            }
+        } else {
+            KeychainInteractionGuard.disableUserInteraction()
+            status = SecItemCopyMatching(query as CFDictionary, &result)
+        }
         switch status {
         case errSecSuccess:
             guard let data = result as? Data,
@@ -278,6 +323,7 @@ public struct AgyNativeProbe: Sendable {
     public static let maxRefreshExpiresInSeconds: Int = 31_536_000
     public static let todayTokenScanFiles = 50
     public static let defaultKeychainTimeoutSeconds: TimeInterval = 2.0
+    public static let interactiveKeychainTimeoutSeconds: TimeInterval = 30.0
     private static let supportedExpiryKeys = ["expiry_date", "expiry", "expires_at"]
 
     public static let authRequiredWarning =
@@ -373,7 +419,8 @@ public struct AgyNativeProbe: Sendable {
 
     public func run(
         environment: [String: String],
-        now: Date = Date()
+        now: Date = Date(),
+        allowInteractiveKeychain: Bool = false
     ) async -> ProbeReport {
         let started = Date()
         let home = NativeProbeSupport.effectiveHomeDirectory(from: environment)
@@ -389,7 +436,11 @@ public struct AgyNativeProbe: Sendable {
             )
         }
 
-        let (maybeCreds, discovery) = await resolveCredentialsWithDiscoveryAsync(environment: environment, home: home)
+        let (maybeCreds, discovery) = await resolveCredentialsWithDiscoveryAsync(
+            environment: environment,
+            home: home,
+            allowInteractiveKeychain: allowInteractiveKeychain
+        )
         if Task.isCancelled {
             return ProbeReport(
                 provider: ProviderCatalog.agy,
@@ -743,7 +794,8 @@ public struct AgyNativeProbe: Sendable {
 
     private func resolveCredentialsWithDiscoveryAsync(
         environment: [String: String],
-        home: URL
+        home: URL,
+        allowInteractiveKeychain: Bool = false
     ) async -> (Credentials?, AgyCredentialDiscovery) {
         let prefix = resolveEnvAndFilePrefix(environment: environment, home: home)
         if let resolved = prefix.resolved {
@@ -763,7 +815,11 @@ public struct AgyNativeProbe: Sendable {
             return (nil, AgyCredentialDiscovery(attempts: attempts, outcome: outcome, detail: detail))
         }
 
-        let readResult = await readKeychainBoundedAsync(service: Self.keychainService, account: Self.keychainAccount)
+        let readResult = await readKeychainBoundedAsync(
+            service: Self.keychainService,
+            account: Self.keychainAccount,
+            allowUserInteraction: allowInteractiveKeychain
+        )
         return finalizeKeychainDiscovery(
             readResult: readResult,
             attempts: prefix.attempts,
@@ -798,9 +854,10 @@ public struct AgyNativeProbe: Sendable {
     }
 
     /// 异步有界钥匙串操作通用核心：在独立 GCD 队列执行同步 Security 调用，受限时器与 Task 取消双重约束，
-    /// 即使底层钥匙串 IPC 阻塞也绝不阻塞 Swift Concurrency 协作线程池或超过 keychainTimeoutSeconds。
+    /// 即使底层钥匙串 IPC 阻塞也绝不阻塞 Swift Concurrency 协作线程池或超过 timeoutSeconds。
     private func runKeychainBoundedAsync<ResultType: Sendable>(
         timeoutResult: ResultType,
+        timeoutSeconds: TimeInterval? = nil,
         onBeforeAttachTimer: (@Sendable () -> Void)? = nil,
         operation: @escaping @Sendable () -> ResultType
     ) async -> ResultType {
@@ -810,7 +867,7 @@ public struct AgyNativeProbe: Sendable {
         }
 
         let gate = keychainGate
-        let timeout = keychainTimeoutSeconds
+        let timeout = timeoutSeconds ?? keychainTimeoutSeconds
         let cancelBox = LockedBoundedKeychainCancelBox<ResultType>(timeoutValue: timeoutResult)
 
         return await withTaskCancellationHandler {
@@ -852,14 +909,26 @@ public struct AgyNativeProbe: Sendable {
     internal func readKeychainBoundedAsync(
         service: String,
         account: String,
+        allowUserInteraction: Bool = false,
         onBeforeAttachTimer: (@Sendable () -> Void)? = nil
     ) async -> AgyKeychainReadResult {
         guard SystemAgyKeychainReader.isAllowedTuple(service: service, account: account) else {
             return .denied
         }
         let reader = keychain
-        return await runKeychainBoundedAsync(timeoutResult: .timeout, onBeforeAttachTimer: onBeforeAttachTimer) {
-            reader.readGenericPassword(service: service, account: account)
+        let effectiveTimeout = allowUserInteraction
+            ? max(keychainTimeoutSeconds, Self.interactiveKeychainTimeoutSeconds)
+            : keychainTimeoutSeconds
+        return await runKeychainBoundedAsync(
+            timeoutResult: .timeout,
+            timeoutSeconds: effectiveTimeout,
+            onBeforeAttachTimer: onBeforeAttachTimer
+        ) {
+            reader.readGenericPassword(
+                service: service,
+                account: account,
+                allowUserInteraction: allowUserInteraction
+            )
         }
     }
 

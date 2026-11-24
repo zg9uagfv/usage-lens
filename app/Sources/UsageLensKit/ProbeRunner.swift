@@ -43,6 +43,13 @@ public struct ProbeReport: Sendable {
 /// 探针数据来源的抽象：正常运行是原生 Swift ProbeRunner，测试里可注入假实现。
 public protocol ProbeProviding: Sendable {
     func report(for provider: Provider) async -> ProbeReport
+    func report(for provider: Provider, allowInteractiveKeychain: Bool) async -> ProbeReport
+}
+
+public extension ProbeProviding {
+    func report(for provider: Provider, allowInteractiveKeychain: Bool) async -> ProbeReport {
+        await report(for: provider)
+    }
 }
 
 // MARK: - 仓库根定位（仅兼容旧工具/测试接口，原生运行时不再依赖外部 Python 脚本）
@@ -159,16 +166,23 @@ public struct ProbeRunner: ProbeProviding {
     }
 
     public func report(for provider: Provider) async -> ProbeReport {
-        await report(for: provider, environmentOverrides: [:])
+        await report(for: provider, allowInteractiveKeychain: false)
+    }
+
+    public func report(for provider: Provider, allowInteractiveKeychain: Bool) async -> ProbeReport {
+        await report(for: provider, environmentOverrides: [:], allowInteractiveKeychain: allowInteractiveKeychain)
     }
 
     /// 候选凭据验证与单测时传入仅供本次执行的隔离环境变量，绝不落盘、绝不跨厂商泄露。
     public func report(
         for provider: Provider,
-        environmentOverrides: [String: String]
+        environmentOverrides: [String: String],
+        allowInteractiveKeychain: Bool = false
     ) async -> ProbeReport {
         let started = Date()
-        let effectiveTimeout = effectiveTimeout(for: provider)
+        let allowInteractive = provider.id == ProviderCatalog.agy.id && allowInteractiveKeychain
+        let baseTimeout = effectiveTimeout(for: provider)
+        let effectiveTimeout = allowInteractive ? max(baseTimeout, 45) : baseTimeout
         let scopedEnv = buildEnvironment(
             baseEnvironment: baseEnvironmentProvider(),
             for: provider,
@@ -176,20 +190,28 @@ public struct ProbeRunner: ProbeProviding {
         )
 
         let report = await runWithTimeout(seconds: effectiveTimeout, provider: provider, started: started) {
-            await self.dispatchNativeProbe(for: provider, environment: scopedEnv)
+            await self.dispatchNativeProbe(
+                for: provider,
+                environment: scopedEnv,
+                allowInteractiveKeychain: allowInteractive
+            )
         }
         return report
     }
 
     private func dispatchNativeProbe(
         for provider: Provider,
-        environment: [String: String]
+        environment: [String: String],
+        allowInteractiveKeychain: Bool
     ) async -> ProbeReport {
         switch provider.id {
         case ProviderCatalog.codex.id:
             return await codexProbe.run(environment: environment)
         case ProviderCatalog.agy.id:
-            return await agyProbe.run(environment: environment)
+            return await agyProbe.run(
+                environment: environment,
+                allowInteractiveKeychain: allowInteractiveKeychain
+            )
         case ProviderCatalog.gemini.id:
             return await geminiProbe.run(environment: environment)
         case ProviderCatalog.deepseek.id:

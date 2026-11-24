@@ -64,6 +64,7 @@ public struct SystemGeminiKeychainStorage: GeminiKeychainStorage {
     }
 
     public func loadData() -> Data? {
+        guard !KeychainInteractionGuard.isInteractiveInProgress else { return nil }
         KeychainInteractionGuard.disableUserInteraction()
         let query = buildReadQuery()
 

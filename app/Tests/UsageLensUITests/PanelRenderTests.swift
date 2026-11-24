@@ -1543,4 +1543,108 @@ final class PanelRenderTests: XCTestCase {
         let callsAfterThirdStart = await provider.calls(for: ProviderCatalog.codex)
         XCTAssertEqual(callsAfterThirdStart, 1)
     }
+
+    func testInteractiveKeychainFlagOnlyEnabledForExplicitAgyTriggers() async {
+        actor RecordingInteractiveProbeProvider: ProbeProviding {
+            struct Call: Equatable, Sendable {
+                let providerID: String
+                let allowInteractiveKeychain: Bool
+            }
+
+            private var recordedCalls: [Call] = []
+
+            func report(for provider: Provider) async -> ProbeReport {
+                await report(for: provider, allowInteractiveKeychain: false)
+            }
+
+            func report(for provider: Provider, allowInteractiveKeychain: Bool) async -> ProbeReport {
+                recordedCalls.append(Call(providerID: provider.id, allowInteractiveKeychain: allowInteractiveKeychain))
+                switch provider.id {
+                case ProviderCatalog.agy.id:
+                    return Fixtures.agyMissingAuthReport()
+                case ProviderCatalog.codex.id:
+                    return Fixtures.codexReport()
+                case ProviderCatalog.gemini.id:
+                    return Fixtures.geminiConfiguredReport()
+                case ProviderCatalog.deepseek.id:
+                    return Fixtures.deepseekReport()
+                default:
+                    return ProbeReport(provider: provider, isMissingProbe: true)
+                }
+            }
+
+            func drainCalls() -> [Call] {
+                let snapshot = recordedCalls
+                recordedCalls.removeAll()
+                return snapshot
+            }
+        }
+
+        let activeIDs = [
+            ProviderCatalog.codex.id,
+            ProviderCatalog.agy.id,
+            ProviderCatalog.gemini.id,
+            ProviderCatalog.deepseek.id,
+        ]
+        UserDefaults.standard.set(activeIDs.joined(separator: ","), forKey: "usageLens.providers")
+
+        let probe = RecordingInteractiveProbeProvider()
+        let store = UsageStore(provider: probe, refreshInterval: 3600, selected: ProviderCatalog.agy, autoStart: false)
+
+        // 1. Background refreshAll(): strictly non-interactive for all providers.
+        await store.refreshAll()
+        let bgCalls = await probe.drainCalls()
+        XCTAssertEqual(bgCalls.count, 4)
+        XCTAssertTrue(bgCalls.allSatisfy { !$0.allowInteractiveKeychain })
+
+        // 2. Explicit credentialsDidChange(for: .agy, allowInteractiveAuth: true): AGY only.
+        store.credentialsDidChange(for: ProviderCatalog.agy, allowInteractiveAuth: true)
+        var credChangeCalls: [RecordingInteractiveProbeProvider.Call] = []
+        for _ in 0..<40 {
+            if !store.isRefreshing {
+                let current = await probe.drainCalls()
+                if !current.isEmpty {
+                    credChangeCalls = current
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        XCTAssertEqual(credChangeCalls.count, 4)
+        XCTAssertEqual(
+            credChangeCalls.filter { $0.providerID == ProviderCatalog.agy.id }.map(\.allowInteractiveKeychain),
+            [true]
+        )
+        XCTAssertTrue(
+            credChangeCalls.filter { $0.providerID != ProviderCatalog.agy.id }.allSatisfy { !$0.allowInteractiveKeychain }
+        )
+
+        // 3. Explicit refresh(allowInteractiveAgyAuth: true): AGY only.
+        store.refresh(allowInteractiveAgyAuth: true)
+        var refreshCalls: [RecordingInteractiveProbeProvider.Call] = []
+        for _ in 0..<40 {
+            if !store.isRefreshing {
+                let current = await probe.drainCalls()
+                if !current.isEmpty {
+                    refreshCalls = current
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        XCTAssertEqual(refreshCalls.count, 4)
+        XCTAssertEqual(
+            refreshCalls.filter { $0.providerID == ProviderCatalog.agy.id }.map(\.allowInteractiveKeychain),
+            [true]
+        )
+        XCTAssertTrue(
+            refreshCalls.filter { $0.providerID != ProviderCatalog.agy.id }.allSatisfy { !$0.allowInteractiveKeychain }
+        )
+
+        // 4. Subsequent background refreshAll(): returns to non-interactive for all providers.
+        await store.refreshAll()
+        let nextBgCalls = await probe.drainCalls()
+        XCTAssertEqual(nextBgCalls.count, 4)
+        XCTAssertTrue(nextBgCalls.allSatisfy { !$0.allowInteractiveKeychain })
+    }
 }

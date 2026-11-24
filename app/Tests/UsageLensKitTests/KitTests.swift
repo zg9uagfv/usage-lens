@@ -726,6 +726,7 @@ final class KeychainInteractionGuardTests: XCTestCase {
     func testDisableUserInteractionDisablesKeychainPrompts() {
         XCTAssertEqual(KeychainInteractionGuard.disableUserInteraction(), errSecSuccess)
         XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+        XCTAssertFalse(KeychainInteractionGuard.isInteractiveInProgress)
     }
 
     func testAllKeychainQueriesAttachNonInteractiveLAContext() throws {
@@ -839,5 +840,74 @@ final class KeychainInteractionGuardTests: XCTestCase {
         )
         XCTAssertEqual(unexpectedUpdateError, errSecParam)
         XCTAssertFalse(deleteCalled)
+    }
+
+    func testWithTemporaryUserInteractionEnablesInsideAndRestoresDisabledAfterward() {
+        enum SampleError: Error { case boom }
+
+        KeychainInteractionGuard.disableUserInteraction()
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+
+        let insideNormal = KeychainInteractionGuard.withTemporaryUserInteraction {
+            KeychainInteractionGuard.isUserInteractionAllowed()
+        }
+        XCTAssertEqual(insideNormal, true)
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+
+        var insideThrowing: Bool?
+        XCTAssertThrowsError(
+            try KeychainInteractionGuard.withTemporaryUserInteraction {
+                insideThrowing = KeychainInteractionGuard.isUserInteractionAllowed()
+                throw SampleError.boom
+            }
+        )
+        XCTAssertEqual(insideThrowing, true)
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+        XCTAssertFalse(KeychainInteractionGuard.isInteractiveInProgress)
+    }
+
+    func testDisableUserInteractionDoesNotBlockDuringInteractiveScope() {
+        XCTAssertEqual(KeychainInteractionGuard.disableUserInteraction(), errSecSuccess)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            KeychainInteractionGuard.withTemporaryUserInteraction {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            finished.signal()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(KeychainInteractionGuard.isInteractiveInProgress)
+        XCTAssertEqual(KeychainInteractionGuard.disableUserInteraction(), errSecSuccess)
+        XCTAssertTrue(KeychainInteractionGuard.isInteractiveInProgress)
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), true)
+
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertFalse(KeychainInteractionGuard.isInteractiveInProgress)
+        XCTAssertEqual(KeychainInteractionGuard.isUserInteractionAllowed(), false)
+    }
+
+    func testAgyBuildQueryTogglesNonInteractiveContext() throws {
+        let nonInteractive = SystemAgyKeychainReader.buildQuery(
+            service: AgyNativeProbe.keychainService,
+            account: AgyNativeProbe.keychainAccount,
+            allowUserInteraction: false
+        )
+        let context = try XCTUnwrap(nonInteractive[kSecUseAuthenticationContext as String] as? LAContext)
+        XCTAssertTrue(context.interactionNotAllowed)
+
+        let interactive = SystemAgyKeychainReader.buildQuery(
+            service: AgyNativeProbe.keychainService,
+            account: AgyNativeProbe.keychainAccount,
+            allowUserInteraction: true
+        )
+        XCTAssertNil(interactive[kSecUseAuthenticationContext as String])
+        XCTAssertEqual(interactive[kSecAttrService as String] as? String, AgyNativeProbe.keychainService)
+        XCTAssertEqual(interactive[kSecAttrAccount as String] as? String, AgyNativeProbe.keychainAccount)
     }
 }

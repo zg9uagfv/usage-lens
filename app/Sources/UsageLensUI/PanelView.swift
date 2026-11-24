@@ -34,7 +34,10 @@ public struct PanelView: View {
                 state: store.state(for: store.selected),
                 showSettings: showSettings,
                 refreshProvider: { provider in
-                    store.credentialsDidChange(for: provider)
+                    store.credentialsDidChange(
+                        for: provider,
+                        allowInteractiveAuth: provider.id == ProviderCatalog.agy.id
+                    )
                 }
             )
                 .padding(.horizontal, metrics.scaledSpacing(14))
@@ -708,7 +711,9 @@ struct FooterBar: View {
 
     private var refreshButton: some View {
         Button {
-            store.refresh()
+            let allowInteractiveAgy = store.selected.id == ProviderCatalog.agy.id
+                && store.state(for: ProviderCatalog.agy).windows.isEmpty
+            store.refresh(allowInteractiveAgyAuth: allowInteractiveAgy)
         } label: {
             HStack(spacing: metrics.scaledSpacing(4)) {
                 Image(systemName: "arrow.clockwise")
