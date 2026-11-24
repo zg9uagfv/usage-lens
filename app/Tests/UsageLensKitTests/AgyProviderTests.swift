@@ -912,4 +912,115 @@ final class AgyProviderTests: XCTestCase {
         XCTAssertTrue(roReport.failure?.contains("写回钥匙串校验未通过") ?? false)
         XCTAssertEqual(roTransport.calls.count, 1)
     }
+
+    func testAgyKeychainCredentialsCachedAcrossAutoRefreshesAndEvictedOnAuthFailure() async throws {
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-lens-agy-cache-\(UUID().uuidString)", isDirectory: true)
+        let isolatedHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-lens-agy-isolated-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: isolatedHome, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempHome)
+            try? FileManager.default.removeItem(at: isolatedHome)
+        }
+
+        let baseNow = Date(timeIntervalSince1970: 1_763_800_000)
+        let expiryISO = ISO8601DateFormatter().string(from: baseNow.addingTimeInterval(3600))
+        let reset5h = ISO8601DateFormatter().string(from: baseNow.addingTimeInterval(7200))
+        let reset7d = ISO8601DateFormatter().string(from: baseNow.addingTimeInterval(5 * 86_400))
+
+        func quotaSuccessResponses() -> [Result<NativeHTTPResponse, Error>] {
+            [
+                jsonResponse(["cloudaicompanionProject": "proj-cache-1", "paidTier": ["name": "Pro"]], url: AgyNativeProbe.loadCodeAssistURL),
+                jsonResponse(["groups": [["buckets": [
+                    ["window": "5h", "remainingFraction": 0.75, "resetTime": reset5h],
+                    ["window": "weekly", "remainingFraction": 0.90, "resetTime": reset7d],
+                ]]]], url: AgyNativeProbe.retrieveQuotaSummaryURL),
+                jsonResponse(["buckets": []], url: AgyNativeProbe.retrieveQuotaURL),
+            ]
+        }
+
+        let initialPayload = makeKeyringPayload(
+            accessToken: fakeToken,
+            refreshToken: fakeRefresh,
+            expiry: expiryISO,
+            email: fakeEmail,
+            clientID: fakeClientID
+        )
+        let store = InMemoryAgyKeychainStore(initialPayload: initialPayload)
+        let transport = MockNativeHTTPTransport(
+            responses:
+                // 1. First probe (reads Keychain)
+                quotaSuccessResponses()
+                // 2. Second probe 60s later (hits cache)
+                + quotaSuccessResponses()
+                // 3. Third probe past expiry (proactive refresh + write-back + cache update)
+                + [jsonResponse(["access_token": fakeNewToken, "expires_in": 3600], url: AgyNativeProbe.oauthTokenURL)]
+                + quotaSuccessResponses()
+                // 4. Fourth probe 60s later (uses updated cached token, zero Keychain reads/writes)
+                + quotaSuccessResponses()
+                // 5. Fifth probe gets HTTP 403 -> evicts cache
+                + [jsonResponse(["error": "forbidden"], url: AgyNativeProbe.loadCodeAssistURL, status: 403)]
+                // 6. Sixth probe re-reads Keychain after eviction
+                + quotaSuccessResponses()
+        )
+
+        let probe = AgyNativeProbe(transport: transport, keychain: store, realUserHomeOverride: tempHome)
+        let env = ["HOME": tempHome.path]
+
+        // 1. First run reads Keychain once and returns 2 windows
+        let r1 = await probe.run(environment: env, now: baseNow)
+        XCTAssertNil(r1.failure, r1.failure ?? "")
+        XCTAssertEqual(r1.envelope?.windows.count, 2)
+        XCTAssertEqual(store.readQueries.count, 1)
+        XCTAssertEqual(store.writeCalls.count, 0)
+        XCTAssertEqual(transport.calls[0].headers["Authorization"], "Bearer \(fakeToken)")
+
+        // 2. Second run (60s auto-refresh) reuses in-memory cache without touching Keychain
+        let r2 = await probe.run(environment: env, now: baseNow.addingTimeInterval(60))
+        XCTAssertNil(r2.failure, r2.failure ?? "")
+        XCTAssertEqual(r2.envelope?.windows.count, 2)
+        XCTAssertEqual(store.readQueries.count, 1)
+        XCTAssertEqual(store.writeCalls.count, 0)
+        XCTAssertEqual(transport.calls[3].headers["Authorization"], "Bearer \(fakeToken)")
+
+        // 3. Advancing past expiry refreshes OAuth once, writes back, and updates cache
+        let expiredNow = baseNow.addingTimeInterval(3700)
+        let r3 = await probe.run(environment: env, now: expiredNow)
+        XCTAssertNil(r3.failure, r3.failure ?? "")
+        XCTAssertEqual(r3.envelope?.windows.count, 2)
+        XCTAssertEqual(store.readQueries.count, 1)
+        XCTAssertEqual(store.writeCalls.count, 1)
+        XCTAssertEqual(transport.calls[6].url, AgyNativeProbe.oauthTokenURL)
+        XCTAssertEqual(transport.calls[7].headers["Authorization"], "Bearer \(fakeNewToken)")
+
+        // 4. Following run uses updated cached token with no Keychain read or write
+        let r4 = await probe.run(environment: env, now: expiredNow.addingTimeInterval(60))
+        XCTAssertNil(r4.failure, r4.failure ?? "")
+        XCTAssertEqual(r4.envelope?.windows.count, 2)
+        XCTAssertEqual(store.readQueries.count, 1)
+        XCTAssertEqual(store.writeCalls.count, 1)
+        XCTAssertEqual(transport.calls[10].headers["Authorization"], "Bearer \(fakeNewToken)")
+
+        // 5. Auth error (HTTP 403) evicts cache; subsequent run re-reads Keychain
+        let r5 = await probe.run(environment: env, now: expiredNow.addingTimeInterval(120))
+        XCTAssertNotNil(r5.failure)
+        XCTAssertTrue(r5.failure?.contains("HTTP 403") ?? false)
+        XCTAssertEqual(store.readQueries.count, 1)
+
+        let r6 = await probe.run(environment: env, now: expiredNow.addingTimeInterval(180))
+        XCTAssertNil(r6.failure, r6.failure ?? "")
+        XCTAssertEqual(r6.envelope?.windows.count, 2)
+        XCTAssertEqual(store.readQueries.count, 2)
+        XCTAssertEqual(transport.calls[14].headers["Authorization"], "Bearer \(fakeNewToken)")
+
+        // 6. Isolated HOME never reads cached credentials from realUserHomeOverride
+        let callsBeforeIsolated = transport.calls.count
+        let isolatedReport = await probe.run(environment: ["HOME": isolatedHome.path], now: expiredNow.addingTimeInterval(240))
+        XCTAssertNil(isolatedReport.failure)
+        XCTAssertTrue(isolatedReport.warnings.contains { $0.contains("隔离主目录环境") })
+        XCTAssertEqual(store.readQueries.count, 2)
+        XCTAssertEqual(transport.calls.count, callsBeforeIsolated)
+    }
 }

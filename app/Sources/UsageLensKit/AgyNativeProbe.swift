@@ -381,6 +381,30 @@ public struct AgyNativeProbe: Sendable {
         var keychainEnvelope: KeychainPayloadEnvelope?
     }
 
+    private final class LockedAgyCredentialCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entry: (homePath: String, creds: Credentials)?
+
+        func get(forHomePath homePath: String) -> Credentials? {
+            lock.withLock {
+                guard let entry, entry.homePath == homePath else { return nil }
+                return entry.creds
+            }
+        }
+
+        func set(_ creds: Credentials, forHomePath homePath: String) {
+            lock.withLock {
+                entry = (homePath, creds)
+            }
+        }
+
+        func clear() {
+            lock.withLock {
+                entry = nil
+            }
+        }
+    }
+
     private struct RefreshedOAuthToken: Sendable {
         var accessToken: String
         var refreshToken: String?
@@ -398,6 +422,7 @@ public struct AgyNativeProbe: Sendable {
     private let maxScanBytes: Int
     private let keychainTimeoutSeconds: TimeInterval
     private let keychainGate = AgyKeychainSingleFlightGate()
+    private let credentialCache = LockedAgyCredentialCache()
 
     public init(
         transport: any NativeHTTPTransport = PinnedURLSessionTransport(),
@@ -531,6 +556,7 @@ public struct AgyNativeProbe: Sendable {
                 let (refreshed, refreshErr) = await refreshAndPersistAccessToken(
                     creds: creds,
                     environment: environment,
+                    homePath: home.path,
                     now: now
                 )
                 if let refreshErr {
@@ -542,6 +568,9 @@ public struct AgyNativeProbe: Sendable {
         }
 
         guard var currentToken = accessToken else {
+            if creds.origin == .keychain {
+                credentialCache.clear()
+            }
             return failReport("本机 AGY 登录态已过期，请先运行 agy 重新登录后刷新")
         }
 
@@ -553,6 +582,7 @@ public struct AgyNativeProbe: Sendable {
                 let (refreshed, refreshErr) = await refreshAndPersistAccessToken(
                     creds: creds,
                     environment: environment,
+                    homePath: home.path,
                     now: now
                 )
                 if let refreshErr {
@@ -561,9 +591,15 @@ public struct AgyNativeProbe: Sendable {
                 if let newToken = refreshed?.accessToken {
                     currentToken = newToken
                     refreshedOnce = true
-                    let (retryData, retryErr, _) = await postJSON(url: url, accessToken: currentToken, bodyObj: bodyObj, source: source)
+                    let (retryData, retryErr, retryStatus) = await postJSON(url: url, accessToken: currentToken, bodyObj: bodyObj, source: source)
+                    if creds.origin == .keychain, let retryStatus, [401, 403].contains(retryStatus) {
+                        credentialCache.clear()
+                    }
                     return (retryData, retryErr, false)
                 }
+            }
+            if creds.origin == .keychain, let status, [401, 403].contains(status) {
+                credentialCache.clear()
             }
             return (data, err, false)
         }
@@ -815,12 +851,20 @@ public struct AgyNativeProbe: Sendable {
             return (nil, AgyCredentialDiscovery(attempts: attempts, outcome: outcome, detail: detail))
         }
 
+        if !allowInteractiveKeychain, var cached = credentialCache.get(forHomePath: home.path) {
+            cached.email = prefix.envEmail ?? cached.email
+            cached.projectID = prefix.envProject
+            var attempts = prefix.attempts
+            attempts.append(AgySourceAttempt(source: "keychain", outcome: "available"))
+            return (cached, AgyCredentialDiscovery(attempts: attempts, outcome: "available", selectedSource: "keychain"))
+        }
+
         let readResult = await readKeychainBoundedAsync(
             service: Self.keychainService,
             account: Self.keychainAccount,
             allowUserInteraction: allowInteractiveKeychain
         )
-        return finalizeKeychainDiscovery(
+        let resolved = finalizeKeychainDiscovery(
             readResult: readResult,
             attempts: prefix.attempts,
             fileAttempt: prefix.fileAttempt,
@@ -828,6 +872,10 @@ public struct AgyNativeProbe: Sendable {
             envProject: prefix.envProject,
             environment: environment
         )
+        if let kc = resolved.0, kc.origin == .keychain {
+            credentialCache.set(kc, forHomePath: home.path)
+        }
+        return resolved
     }
 
     private func mapKeychainReadResult(
@@ -1232,13 +1280,20 @@ public struct AgyNativeProbe: Sendable {
     private func refreshAndPersistAccessToken(
         creds: Credentials,
         environment: [String: String],
+        homePath: String,
         now: Date
     ) async -> (RefreshedOAuthToken?, String?) {
         let (refreshed, refreshErr) = await refreshAccessToken(creds: creds, now: now)
         if let refreshErr {
+            if creds.origin == .keychain {
+                credentialCache.clear()
+            }
             return (nil, refreshErr)
         }
         guard let refreshed else {
+            if creds.origin == .keychain {
+                credentialCache.clear()
+            }
             return (nil, "刷新本机 AGY 登录态失败：接口未返回有效访问令牌")
         }
 
@@ -1251,32 +1306,44 @@ public struct AgyNativeProbe: Sendable {
             return (nil, "刷新本机 AGY 登录态失败：请求超时或中断")
         }
         guard let envelope = creds.keychainEnvelope,
-              let updatedPayload = buildUpdatedKeychainPayload(
+              let updated = buildUpdatedKeychainPayload(
                   envelope: envelope,
                   refreshed: refreshed,
                   environment: environment,
                   now: now
               ) else {
+            credentialCache.clear()
             return (nil, Self.keychainWriteRejectedError)
         }
 
         let writeResult = await updateKeychainBoundedAsync(
             service: Self.keychainService,
             account: Self.keychainAccount,
-            payload: updatedPayload
+            payload: updated.payload
         )
         switch writeResult {
         case .updated:
+            var updatedCreds = creds
+            updatedCreds.accessToken = refreshed.accessToken
+            updatedCreds.refreshToken = refreshed.refreshToken ?? creds.refreshToken
+            updatedCreds.expiryEpoch = refreshed.expiryEpoch
+            updatedCreds.keychainEnvelope = updated.envelope
+            credentialCache.set(updatedCreds, forHomePath: homePath)
             return (refreshed, nil)
         case .missing:
+            credentialCache.clear()
             return (nil, Self.keychainWriteMissingError)
         case .denied:
+            credentialCache.clear()
             return (nil, Self.keychainWriteDeniedError)
         case .timeout:
+            credentialCache.clear()
             return (nil, Self.keychainWriteTimeoutError)
         case .nonzero:
+            credentialCache.clear()
             return (nil, Self.keychainWriteNonzeroError)
         case .rejected:
+            credentialCache.clear()
             return (nil, Self.keychainWriteRejectedError)
         }
     }
@@ -1410,7 +1477,7 @@ public struct AgyNativeProbe: Sendable {
         refreshed: RefreshedOAuthToken,
         environment: [String: String],
         now: Date
-    ) -> String? {
+    ) -> (payload: String, envelope: KeychainPayloadEnvelope)? {
         guard let parsed = try? JSONSerialization.jsonObject(with: envelope.rawJSONData),
               var root = parsed as? [String: Any] else {
             return nil
@@ -1507,7 +1574,13 @@ public struct AgyNativeProbe: Sendable {
             guard verified.refreshToken != nil else { return nil }
         }
 
-        return candidate
+        return (
+            payload: candidate,
+            envelope: KeychainPayloadEnvelope(
+                wrappedWithGoKeyringBase64: envelope.wrappedWithGoKeyringBase64,
+                rawJSONData: encodedData
+            )
+        )
     }
 
     private func executePinnedJSON(
